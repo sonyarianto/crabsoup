@@ -52,7 +52,7 @@ struct LameFlagsRaw {
 }
 
 #[link(name = "mp3lame")]
-extern "C" {
+unsafe extern "C" {
     fn lame_init() -> *mut LameFlagsRaw;
     fn lame_close(gf: *mut LameFlagsRaw);
     fn lame_set_in_samplerate(gf: *mut LameFlagsRaw, rate: c_int) -> c_int;

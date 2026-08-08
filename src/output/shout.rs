@@ -27,7 +27,7 @@ struct ShoutMetadataRaw {
 }
 
 #[link(name = "shout")]
-extern "C" {
+unsafe extern "C" {
     fn shout_init();
     fn shout_new() -> *mut ShoutRaw;
     fn shout_free(self_: *mut ShoutRaw);
