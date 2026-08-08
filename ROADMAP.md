@@ -52,8 +52,43 @@
 - Icecast 2.4.4 shows no Opus titles (see Done section); 2.5+ shows the
   stream-start title only.
 
-## Next up
-- [ ] Preview mode via `--preview`? (currently only by omitting `output.icecast` in the script)
+## Next up: Lua spec parity with Liquidsoap (.lua on par with .liq)
+
+Goal: close the gap between what a production `.liq` script expresses and what
+`crabsoup.lua` can do. Each phase ships independently and is verified live or
+via inline tests before the next starts.
+
+### Phase 1 — parity map + ops primitives (small)
+- [ ] README appendix: "Liquidsoap .liq -> Crabsoup .lua" mapping table
+      (covers the harbor-ducking and one-shot-jingle behavior that .liq gets
+      via `switch`/`mksafe` + request scheduling).
+- [ ] Test sources `blank`, `sine`; operator `amplify(source, gain)`.
+- [ ] Telnet commands `skip`, `status`/`uptime`.
+
+### Phase 2 — queue/requests (main ops win)
+- [ ] `request`-style queue source: FIFO of paths pushed at runtime, plays when
+      non-empty, exhausts when empty (composes in `fallback` before the
+      playlist, like `request.queue`).
+- [ ] Telnet `queue.push <path>`, `queue.list`, `queue.clear`; `skip` wired to
+      the current track (playlist skip).
+- [ ] `server.register` (Lua API to register custom telnet commands).
+
+### Phase 3 — scheduling (dayparting)
+- [ ] `switch` source with time-based brackets (liq `switch` semantics:
+      weekday/hour ranges, default child).
+- [ ] `rotate` source (sequential/even rotation over children).
+
+### Phase 4 — metadata hooks
+- [ ] `on_metadata(callback)` source wrapper invoking a Lua function per track
+      start with a metadata table (title, duration, path).
+
+### Phase 5 — recording
+- [ ] `output.file({path=..., format=...}, src)` reusing the mp3/opus encoders
+      with a file sink; live-verified by decoding the recorded file.
+
+## Done (cont.)
+- [x] Preview mode via `--preview` (forced even with `output.icecast`,
+      combines with `--check`; verified live).
 - [x] Opus resampler upgraded: 16-tap Hann-windowed sinc polyphase FIR (256 phases),
       DC-normalized per output sample so chunk edges and stream edges stay
       unity-gain; `PcmConverter` (bus normalization) uses the same filter.
