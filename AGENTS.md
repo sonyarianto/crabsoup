@@ -15,14 +15,14 @@ cargo build                    # debug build
 cargo build --release          # release build
 cargo test --lib               # run all tests (inline #[cfg(test)] modules)
 cargo clippy -- -D warnings    # lint
-./target/release/crabsoup -c crabsoup.yaml          # run
-./target/release/crabsoup --check                  # validate config and exit
+./target/release/crabsoup -c crabsoup.lua          # run
+./target/release/crabsoup --check                  # evaluate script, print config, exit
 RUST_LOG=crabsoup=info ./target/release/crabsoup   # run with logging
 ```
 
-`crabsoup.yaml` is gitignored; `crabsoup.yaml.example` is the tracked
-reference config. `media/` and `jingles/` are gitignored — audio files stay
-local, tests that use them skip when absent.
+`crabsoup.lua` is gitignored; `crabsoup.lua.example` is the tracked reference
+script. `media/` and `jingles/` are gitignored — audio files stay local, tests
+that use them skip when absent.
 
 ## Conventions
 
@@ -42,9 +42,23 @@ local, tests that use them skip when absent.
 ## Architecture notes
 
 Pipeline: `Playlist -> CrossfadeMixer -> PriorityMixer -> Encoder -> libshout
--> Icecast`. All sources are normalised to the PCM bus (`stream.sample_rate`,
-`stream.channels`, `frames_per_buffer`).
+-> Icecast`. The `.lua` script's root source (e.g. `fallback({j, live, pl})`)
+is that Playlist input; all sources are normalised to the PCM bus
+(`set("sample_rate", ...)`, `set("channels", ...)`, `frames_per_buffer`).
 
+- `src/script.rs` registers the Liquidsoap-flavoured Lua stdlib
+  (`playlist`, `single`, `jingles`, `fallback`/`sequence`/`random`,
+  `input.harbor`, `output.icecast`, `output.preview`, `server.telnet`, `set`,
+  `log`). Sources are Lua userdata wrapping `Arc<Mutex<Box<dyn AudioSource>>>`
+  so they can be composed; `LuaSource::into_inner` steals the box via
+  `mem::replace` (mlua keeps a clone on the stack during the call, so
+  `Arc::try_unwrap` would fail).
+- `src/script.rs` returns `mlua::Result` — `mlua::Error` is `!Send`, so the
+  crate `Result` alias cannot hold it; main maps it to a string.
+- `set` keys: `sample_rate`, `channels`, `frames_per_buffer`,
+  `crossfade_seconds`, `fade_curve`, `duck_seconds`.
+- The engine is single-chain: one `output.icecast` per script; without it,
+  `output.preview` (or preview mode in main.rs).
 - `MixCommand` (`src/engine/mixer.rs`) is the mixer control channel
   (`SetLive`, `ClearLive`, `PlayJingle(PathBuf)`, `Shutdown`) over
   `std::sync::mpsc`. The harbor and control port send into it.

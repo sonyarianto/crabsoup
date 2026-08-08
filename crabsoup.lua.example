@@ -1,0 +1,42 @@
+-- Crabsoup example script.
+--
+-- Copy to `crabsoup.liq` (the default path) and adjust to taste.
+-- This is plain Lua with Liquidsoap-flavoured names; `{key = value}`
+-- tables are how named options are passed.
+
+-- The PCM bus: every source is resampled/converted to this spec before mixing.
+set("sample_rate", 44100)
+set("channels", 2)
+set("frames_per_buffer", 4096)   -- ~93 ms at 44100 Hz
+
+-- Crossfade and ducking behaviour.
+set("crossfade_seconds", 3.0)    -- track-to-track overlap window
+set("fade_curve", 1.0)           -- 1.0 = linear, 2.0 = equal-ish power
+set("duck_seconds", 1.5)         -- fade time into/out of a live DJ
+
+-- Local media playback: recursively scanned directory and/or explicit files.
+pl = playlist({directory = "./media", shuffle = false, loop = true})
+
+-- One-shot jingles, playable from the telnet control port (`jingles.play`).
+j = jingles({directory = "./jingles"})
+
+-- Live DJ harbor (Icecast source protocol): DJs PUT to this mount and the
+-- playlist is ducked while they are live. The value composes as a marker.
+live = input.harbor({host = "0.0.0.0", port = 8005,
+                     mount = "/live", password = "dj"})
+
+-- Telnet control port (jingles.list / jingles.play / shutdown / ...).
+server.telnet({host = "127.0.0.1", port = 1234})
+
+-- The broadcast: `format` is "mp3" or "opus". The first source argument is
+-- the engine's root; `fallback({...})` switches to the first child that
+-- still has audio.
+output.icecast({host = "localhost", port = 8000,
+                mount = "/crabsoup.opus", format = "opus", bitrate = 128000,
+                source_user = "source", source_password = "hackme",
+                name = "Crabsoup", description = "Crabsoup stream",
+                genre = "Various", reconnect = 5},
+               fallback({j, live, pl}))
+
+-- Decode + mix locally without broadcasting (instead of output.icecast):
+-- output.preview(fallback({j, live, pl}))

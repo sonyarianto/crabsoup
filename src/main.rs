@@ -6,20 +6,19 @@ use std::time::Duration;
 
 use clap::Parser;
 
-use crabsoup::config::Config;
-use crabsoup::engine::mixer::{CrossfadeMixer, MixCommand, PriorityMixer};
+use crabsoup::engine::mixer::{MixCommand, PriorityMixer};
 use crabsoup::live::harbor::Harbor;
 use crabsoup::output::icecast::IcecastOutput;
-use crabsoup::source::playlist::Playlist;
+use crabsoup::script::{self, ScriptResult};
 use crabsoup::source::AudioSource;
 
 #[derive(Parser)]
 #[command(name = "crabsoup", version, about = "Liquidsoap-inspired audio streaming engine")]
 struct Cli {
-    /// Path to the YAML configuration file.
-    #[arg(short, long, default_value = "crabsoup.yaml")]
+    /// Path to the .lua script (Lua).
+    #[arg(short, long, default_value = "crabsoup.lua")]
     config: PathBuf,
-    /// Validate the configuration and exit.
+    /// Evaluate the script, print the resulting configuration, and exit.
     #[arg(long)]
     check: bool,
 }
@@ -28,35 +27,27 @@ fn main() -> crabsoup::Result<()> {
     env_logger::init();
     let cli = Cli::parse();
 
-    let config = Config::load(&cli.config)?;
+    let src = std::fs::read_to_string(&cli.config)
+        .map_err(|e| format!("failed to read script {}: {e}", cli.config.display()))?;
+    let mut result = script::run(&src).map_err(|e| format!("script error: {e}"))?;
+
     if cli.check {
-        println!("{config:#?}");
+        print_result(&result);
         return Ok(());
     }
 
-    let media = config.media_files();
-    if media.is_empty() {
-        return Err("playlist is empty: no audio files configured".into());
-    }
-    log::info!("loaded {} media file(s)", media.len());
-
-    let spec = config.signal_spec();
+    let spec = result.stream.signal_spec();
     let chans = spec.channels.count();
-    let fpb = config.stream.frames_per_buffer;
+    let fpb = result.stream.frames_per_buffer;
 
-    // Playlist -> crossfade mixer -> priority (live/jingle) mixer.
-    let playlist = Playlist::new(
-        media,
-        config.playlist.shuffle,
-        config.playlist.loop_playlist,
-        spec,
-        fpb,
-        None,
-    );
-    let crossfade = CrossfadeMixer::new(Box::new(playlist), &config.mixer, spec.rate, chans);
-
+    // Root source -> priority mixer (live DJ ducking / jingle overrides).
+    let root_source = result
+        .root
+        .take()
+        .or_else(|| result.preview.take())
+        .expect("script output checked by run()");
     let (tx, rx) = mpsc::channel();
-    let pm = PriorityMixer::new(Box::new(crossfade), rx, &config.mixer, spec, fpb);
+    let pm = PriorityMixer::new(root_source, rx, &result.mixer, spec, fpb);
     let mut root: Box<dyn AudioSource> = Box::new(pm);
 
     // Background tokio runtime: live harbor listener + Ctrl-C handler.
@@ -64,13 +55,13 @@ fn main() -> crabsoup::Result<()> {
         .enable_all()
         .build()?;
 
-    if let Some(live_cfg) = &config.live {
+    if let Some(live_cfg) = &result.harbor {
         let harbor = Harbor::new(live_cfg.clone(), spec, tx.clone());
         rt.spawn(async move { harbor.run().await });
     }
 
-    if let Some(ctl_cfg) = &config.control {
-        let jingles = config.jingle_files();
+    if let Some(ctl_cfg) = &result.control {
+        let jingles = result.jingles.clone();
         let server = crabsoup::control::ControlServer::new(ctl_cfg.clone(), jingles, tx.clone());
         rt.spawn(async move { server.run().await });
     }
@@ -85,7 +76,7 @@ fn main() -> crabsoup::Result<()> {
         let _ = ctrl_tx.send(MixCommand::Shutdown);
     });
 
-    match &config.output {
+    match &result.output {
         Some(out_cfg) => {
             let mut output =
                 IcecastOutput::new(out_cfg.clone(), root, spec.rate, chans, fpb);
@@ -109,11 +100,39 @@ fn main() -> crabsoup::Result<()> {
         }
         None => {
             log::warn!(
-                "no `output` section in config; running in preview mode \
+                "no output.icecast in script; running in preview mode \
                  (decoding but not broadcasting)"
             );
             run_preview(&mut *root, spec.rate, chans, fpb, shutdown)
         }
+    }
+}
+
+/// `--check` output: a human-readable summary of the script result.
+fn print_result(result: &ScriptResult) {
+    let stream = &result.stream;
+    let mixer = &result.mixer;
+    println!(
+        "stream: {} Hz, {} ch, {} frames/buffer",
+        stream.sample_rate, stream.channels, stream.frames_per_buffer
+    );
+    println!(
+        "mixer: crossfade {:.1}s, curve {}, duck {:.1}s",
+        mixer.crossfade_seconds, mixer.fade_curve, mixer.duck_seconds
+    );
+    println!("jingles: {} file(s)", result.jingles.len());
+    if let Some(h) = &result.harbor {
+        println!("harbor: {}:{}{}", h.host, h.port, h.mount);
+    }
+    if let Some(c) = &result.control {
+        println!("telnet: {}:{}", c.host, c.port);
+    }
+    match &result.output {
+        Some(out) => println!(
+            "output: {:?} to {}:{}{}",
+            out.format, out.host, out.port, out.mount
+        ),
+        None => println!("output: preview only"),
     }
 }
 

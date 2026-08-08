@@ -13,9 +13,6 @@ base64 = "0.22"
 # Concurrency & async (live harbor)
 tokio = { version = "1.0", features = ["full"] }
 parking_lot = "0.12"
-# Configuration parsing
-serde = { version = "1.0", features = ["derive"] }
-serde_yaml = "0.9"
 # Terminal interface
 clap = { version = "4.0", features = ["derive"] }
 # Logging
@@ -26,6 +23,9 @@ rand = { version = "0.8", features = ["small_rng"] }
 # Opus encoding (libopus FFI) + Ogg muxing
 audiopus = "0.3.0-rc.0"
 ogg = "0.9"
+# .liq scripting (Liquidsoap-style config in Lua); vendored Lua 5.4,
+# no `send` feature: sources are Rc-based and stay on the main thread.
+mlua = { version = "0.10", default-features = false, features = ["lua54", "vendored"] }
 
 [profile.release]
 lto = true

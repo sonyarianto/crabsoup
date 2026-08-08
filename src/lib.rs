@@ -1,8 +1,8 @@
 //! Crabsoup — a Liquidsoap-inspired audio streaming engine.
 //!
-//! Reads a YAML configuration, schedules a gapless playlist, mixes it with
-//! live DJ input and jingles using crossfades, and pushes the encoded result
-//! (MP3 or Opus) to an Icecast server.
+//! Evaluates a `.lua` script (Lua) that builds a source graph and configures
+//! services: gapless playlist, crossfades, live DJ ducking, jingles, and MP3 /
+//! Opus broadcasting to an Icecast server.
 
 pub mod config;
 pub mod control;
@@ -10,6 +10,7 @@ pub mod engine;
 pub mod live;
 pub mod output;
 pub mod resample;
+pub mod script;
 pub mod source;
 
 /// Shorthand for the crate-wide error type.

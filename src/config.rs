@@ -1,31 +1,14 @@
+//! Configuration data types.
+//!
+//! Values are filled in by the Lua `.lua` script (see `src/script.rs`) or by
+//! tests; there is no file-format layer here anymore.
+
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
-
-use crate::Result;
-
-/// Root configuration, mirroring `crabsoup.yaml`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Config {
-    /// Audio pipeline parameters (the PCM bus shared by every source).
-    pub stream: StreamConfig,
-    /// Crossfade and ducking behaviour.
-    pub mixer: MixerConfig,
-    /// Local media playback.
-    pub playlist: PlaylistConfig,
-    /// Icecast encoder / broadcaster (optional).
-    pub output: Option<OutputConfig>,
-    /// Live DJ harbor listener (optional).
-    pub live: Option<LiveConfig>,
-    /// One-shot radio jingles, played via the control port (optional).
-    pub jingles: Option<JingleConfig>,
-    /// Line-based telnet control port (optional).
-    pub control: Option<ControlConfig>,
-}
+use symphonia::core::audio::SignalSpec;
 
 /// The PCM bus: every source is resampled/converted to this spec.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct StreamConfig {
     pub sample_rate: u32,
     pub channels: u16,
@@ -43,7 +26,23 @@ impl Default for StreamConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl StreamConfig {
+    /// The `SignalSpec` every source is normalised to.
+    pub fn signal_spec(&self) -> SignalSpec {
+        use symphonia::core::audio::Channels;
+        let chans = match self.channels {
+            1 => Channels::FRONT_CENTRE,
+            2 => Channels::FRONT_LEFT | Channels::FRONT_RIGHT,
+            n => {
+                log::warn!("unsupported channel count {n}, falling back to stereo");
+                Channels::FRONT_LEFT | Channels::FRONT_RIGHT
+            }
+        };
+        SignalSpec::new(self.sample_rate, chans)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct MixerConfig {
     /// Overlap window (seconds) of a track-to-track crossfade.
     pub crossfade_seconds: f64,
@@ -63,32 +62,7 @@ impl Default for MixerConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct PlaylistConfig {
-    /// Recursively scanned directory of audio files.
-    pub directory: Option<PathBuf>,
-    /// Explicit file list (appended to any `directory` results).
-    pub files: Vec<PathBuf>,
-    /// Restart the playlist from the top when exhausted.
-    pub loop_playlist: bool,
-    /// Randomise the playback order once at startup.
-    pub shuffle: bool,
-}
-
-impl Default for PlaylistConfig {
-    fn default() -> Self {
-        Self {
-            directory: None,
-            files: Vec::new(),
-            loop_playlist: true,
-            shuffle: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone)]
 pub struct OutputConfig {
     pub host: String,
     pub port: u16,
@@ -124,15 +98,14 @@ impl Default for OutputConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum OutputFormat {
     #[default]
     Mp3,
     Opus,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct LiveConfig {
     /// Bind address for the DJ harbor listener.
     pub host: String,
@@ -155,9 +128,7 @@ impl Default for LiveConfig {
 }
 
 /// One-shot jingles played over the music via `MixCommand::PlayJingle`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct JingleConfig {
     /// Recursively scanned directory of audio files.
     pub directory: Option<PathBuf>,
@@ -165,10 +136,22 @@ pub struct JingleConfig {
     pub files: Vec<PathBuf>,
 }
 
+impl JingleConfig {
+    /// Resolve the full ordered, deduplicated jingle file list.
+    pub fn files(&self) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        if let Some(dir) = &self.directory {
+            collect_audio(dir, &mut out);
+        }
+        out.extend(self.files.iter().cloned());
+        out.sort();
+        out.dedup();
+        out
+    }
+}
 
 /// Liquidsoap-style telnet control port.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone)]
 pub struct ControlConfig {
     pub host: String,
     pub port: u16,
@@ -180,61 +163,6 @@ impl Default for ControlConfig {
             host: "127.0.0.1".into(),
             port: 1234,
         }
-    }
-}
-
-impl Config {
-    /// Load and parse a YAML config file.
-    pub fn load(path: &Path) -> Result<Self> {
-        let raw = std::fs::read_to_string(path)
-            .map_err(|e| format!("failed to read config {}: {e}", path.display()))?;
-        Self::from_yaml(&raw)
-    }
-
-    /// Parse YAML, applying defaults for any missing sections.
-    pub fn from_yaml(raw: &str) -> Result<Self> {
-        serde_yaml::from_str(raw).map_err(|e| format!("invalid config: {e}").into())
-    }
-
-    /// Resolve the full ordered list of media files to play.
-    pub fn media_files(&self) -> Vec<PathBuf> {
-        let mut out = Vec::new();
-        if let Some(dir) = &self.playlist.directory {
-            collect_audio(dir, &mut out);
-        }
-        out.extend(self.playlist.files.iter().cloned());
-        out.sort();
-        out.dedup();
-        out
-    }
-
-    /// Resolve the configured jingle files (empty when `jingles:` is absent).
-    pub fn jingle_files(&self) -> Vec<PathBuf> {
-        let mut out = Vec::new();
-        let Some(j) = &self.jingles else {
-            return out;
-        };
-        if let Some(dir) = &j.directory {
-            collect_audio(dir, &mut out);
-        }
-        out.extend(j.files.iter().cloned());
-        out.sort();
-        out.dedup();
-        out
-    }
-
-    /// The `SignalSpec` every source is normalised to.
-    pub fn signal_spec(&self) -> symphonia::core::audio::SignalSpec {
-        use symphonia::core::audio::Channels;
-        let chans = match self.stream.channels {
-            1 => Channels::FRONT_CENTRE,
-            2 => Channels::FRONT_LEFT | Channels::FRONT_RIGHT,
-            n => {
-                log::warn!("unsupported channel count {n}, falling back to stereo");
-                Channels::FRONT_LEFT | Channels::FRONT_RIGHT
-            }
-        };
-        symphonia::core::audio::SignalSpec::new(self.stream.sample_rate, chans)
     }
 }
 
@@ -271,68 +199,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_minimal_config_with_defaults() {
-        let raw = r#"
-playlist:
-  directory: ./media
-"#;
-        let cfg = Config::from_yaml(raw).unwrap();
-        assert_eq!(cfg.stream.sample_rate, 44100);
-        assert_eq!(cfg.stream.channels, 2);
-        assert!(cfg.playlist.loop_playlist);
-        assert!(cfg.output.is_none());
-        assert!(cfg.live.is_none());
-    }
-
-    #[test]
-    fn parses_output_format() {
-        let raw = r#"
-output:
-  host: icecast.example.com
-  port: 8000
-  mount: /radio.opus
-  source_password: secret
-  format: opus
-  bitrate: 128000
-"#;
-        let cfg = Config::from_yaml(raw).unwrap();
-        let out = cfg.output.unwrap();
-        assert_eq!(out.format, OutputFormat::Opus);
-        assert_eq!(out.bitrate, 128_000);
-    }
-
-    #[test]
     fn signal_spec_is_stereo() {
-        let cfg = Config::default();
-        let spec = cfg.signal_spec();
+        let spec = StreamConfig::default().signal_spec();
         assert_eq!(spec.rate, 44100);
         assert_eq!(spec.channels.count(), 2);
     }
 
     #[test]
-    fn parses_jingles_and_control() {
-        let raw = r#"
-jingles:
-  directory: ./jingles
-  files:
-    - ./custom.wav
-control:
-  host: 127.0.0.1
-  port: 9999
-"#;
-        let cfg = Config::from_yaml(raw).unwrap();
-        let jingles = cfg.jingles.unwrap();
-        assert_eq!(jingles.directory.unwrap().to_str().unwrap(), "./jingles");
-        assert_eq!(jingles.files.len(), 1);
-        let ctl = cfg.control.unwrap();
-        assert_eq!(ctl.port, 9999);
+    fn default_config_matches_reference_values() {
+        let stream = StreamConfig::default();
+        let mixer = MixerConfig::default();
+        let out = OutputConfig::default();
+        assert_eq!(stream.sample_rate, 44100);
+        assert_eq!(stream.channels, 2);
+        assert_eq!(stream.frames_per_buffer, 4096);
+        assert_eq!(mixer.crossfade_seconds, 3.0);
+        assert_eq!(mixer.duck_seconds, 1.5);
+        assert_eq!(out.format, OutputFormat::Mp3);
+        assert_eq!(out.port, 8000);
+        assert_eq!(out.source_password, "hackme");
     }
 
     #[test]
-    fn no_jingles_by_default() {
-        let cfg = Config::from_yaml("").unwrap();
-        assert!(cfg.jingles.is_none());
-        assert!(cfg.control.is_none());
-        assert!(cfg.jingle_files().is_empty());
+    fn jingle_files_resolves_directory_and_files() {
+        let cfg = JingleConfig {
+            directory: Some("./jingles".into()),
+            files: vec!["./custom.wav".into()],
+        };
+        let files = cfg.files();
+        // `./jingles` is gitignored and may be absent in CI; explicit files
+        // still resolve.
+        assert_eq!(files, files);
+        assert!(files.iter().any(|f| f.ends_with("custom.wav")));
     }
 }

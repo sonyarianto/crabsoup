@@ -1,9 +1,13 @@
 # Crabsoup
 
-A Liquidsoap-inspired audio streaming engine in Rust: schedules a gapless
-playlist, mixes it with live DJ input and one-shot jingles using crossfades,
-and broadcasts the result (MP3 or Opus) to an Icecast server.
+A Liquidsoap-inspired audio streaming engine in Rust: evaluates a `.lua`
+script (Liquidsoap-flavoured Lua) that builds a source graph, mixes in live DJ
+input and one-shot jingles with crossfades, and broadcasts the result (MP3 or
+Opus) to an Icecast server.
 
+- `.lua` scripting: real Lua with Liquidsoap-style functions — `playlist`,
+  `single`, `fallback`, `sequence`, `random`, `jingles`, `input.harbor`,
+  `output.icecast`, `output.preview`, `server.telnet`, `set`, `log`
 - Playlist scheduling: recursive directory scan, explicit file lists, loop and shuffle
 - Gapless crossfades with configurable overlap and fade curve
 - Live DJ harbor: an Icecast source-protocol listener (`PUT /live`); the
@@ -12,7 +16,7 @@ and broadcasts the result (MP3 or Opus) to an Icecast server.
   Liquidsoap-style telnet control port
 - Output: MP3 (via LAME) or Ogg/Opus (via libopus + a built-in Ogg muxer with
   spec-correct CRC-32)
-- YAML configuration, graceful Ctrl-C shutdown
+- Graceful Ctrl-C shutdown
 
 ## Architecture
 
@@ -25,18 +29,21 @@ Playlist ──► CrossfadeMixer ──► PriorityMixer ──► Encoder ─�
                                  override)        libopus+Ogg)  protocol)
 ```
 
-Every source is resampled/converted to a shared PCM bus (`stream.sample_rate`,
-`stream.channels`). The `PriorityMixer` fades from the playlist to an override
-(live DJ or jingle) over `duck_seconds`; a live DJ always wins over a jingle.
+The script's root source (e.g. `fallback({jingle, live, playlist})`) becomes
+the crossfade+priority chain's input. Every source is resampled/converted to a
+shared PCM bus (`set("sample_rate", ...)`, `set("channels", ...)`). The
+`PriorityMixer` fades from the main source to an override (live DJ or jingle)
+over `duck_seconds`; a live DJ always wins over a jingle.
 
 Source layout:
 
 | Path | Purpose |
 | --- | --- |
 | `src/main.rs` | CLI, wiring, preview mode |
-| `src/config.rs` | YAML config types + file resolution |
+| `src/script.rs` | Lua stdlib + script evaluation |
+| `src/config.rs` | Configuration data types (filled by the script) |
 | `src/control.rs` | Telnet control port (jingles, shutdown) |
-| `src/source/` | `FileSource`, `Playlist` (scheduling), `PcmConverter` |
+| `src/source/` | `FileSource`, `Playlist` (scheduling), source composition |
 | `src/engine/` | `CrossfadeMixer`, `PriorityMixer`, `MixCommand` |
 | `src/live/` | DJ harbor (Icecast source protocol listener) |
 | `src/output/` | `encoder.rs` (LAME/libopus), `ogg_mux.rs`, `shout.rs` (libshout FFI), `icecast.rs` (pump + reconnect) |
@@ -50,58 +57,43 @@ sudo apt install libmp3lame-dev libopus-dev   # Debian/Ubuntu
 cargo build --release
 ```
 
+Lua 5.4 is vendored and compiled at build time (needs a C compiler).
+
 ## Running
 
 ```sh
-cp crabsoup.yaml.example crabsoup.yaml   # or write your own (see below)
-RUST_LOG=crabsoup=info ./target/release/crabsoup -c crabsoup.yaml
+cp crabsoup.lua.example crabsoup.lua   # or write your own (see below)
+RUST_LOG=crabsoup=info ./target/release/crabsoup -c crabsoup.lua
 ```
 
-With an `output:` section it connects to Icecast as a source. Without one it
-runs in preview mode (decodes and mixes, no broadcast). `crabsoup --check`
-validates and prints the resolved config.
+With an `output.icecast` call it connects to Icecast as a source. Without one
+it runs in preview mode (decodes and mixes, no broadcast). `crabsoup --check`
+evaluates the script, prints the resolved configuration, and exits.
 
-### Example config
+### Example script
 
-```yaml
-stream:
-  sample_rate: 44100
-  channels: 2
-  frames_per_buffer: 4096
+```lua
+set("sample_rate", 44100)
+set("channels", 2)
+set("crossfade_seconds", 3.0)    -- track-to-track overlap
+set("fade_curve", 1.0)           -- 1.0 linear, 2.0 equal-ish power
+set("duck_seconds", 1.5)         -- live DJ / jingle fade time
 
-mixer:
-  crossfade_seconds: 3.0    # track-to-track overlap
-  fade_curve: 1.0           # 1.0 linear, 2.0 equal-ish power
-  duck_seconds: 1.5         # live DJ / jingle fade time
+pl = playlist({directory = "./media", shuffle = false, loop = true})
+j  = jingles({directory = "./jingles"})        -- telnet-triggered clips
+live = input.harbor({port = 8005, mount = "/live", password = "dj"})
+server.telnet({host = "127.0.0.1", port = 1234})
 
-playlist:
-  directory: ./media
-  loop_playlist: true
-  shuffle: false
-
-output:
-  host: localhost
-  port: 8000
-  mount: /crabsoup.ogg
-  source_user: source
-  source_password: hackme
-  format: opus              # mp3 | opus
-  bitrate: 128000
-  name: Crabsoup
-
-live:                       # optional DJ harbor
-  host: 0.0.0.0
-  port: 8005
-  mount: /live
-  password: dj
-
-jingles:                    # optional one-shot clips
-  directory: ./jingles
-
-control:                    # optional telnet port
-  host: 127.0.0.1
-  port: 1234
+output.icecast({host = "localhost", port = 8000,
+                mount = "/crabsoup.opus", format = "opus", bitrate = 128000,
+                source_password = "hackme", name = "Crabsoup"},
+               fallback({j, live, pl}))
 ```
+
+Named options are passed as Lua tables; most have defaults. `format` is
+`"mp3"` or `"opus"`. Composable sources: `playlist`, `single`, `jingles`,
+`fallback`/`sequence`, `random` (non-repeating shuffle). `output.preview(...)`
+runs without broadcasting.
 
 ### Control port
 
