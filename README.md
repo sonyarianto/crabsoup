@@ -66,6 +66,14 @@ cp crabsoup.lua.example crabsoup.lua   # or write your own (see below)
 RUST_LOG=crabsoup=info ./target/release/crabsoup -c crabsoup.lua
 ```
 
+Per-format test scripts live in `examples/`:
+
+```sh
+./target/release/crabsoup -c examples/crabsoup.opus.lua    # Opus -> /crabsoup.opus
+./target/release/crabsoup -c examples/crabsoup.mp3.lua     # MP3  -> /crabsoup.mp3
+./target/release/crabsoup -c examples/crabsoup.preview.lua # no broadcast
+```
+
 With an `output.icecast` call it connects to Icecast as a source. Without one
 it runs in preview mode (decodes and mixes, no broadcast). `crabsoup --check`
 evaluates the script, prints the resolved configuration, and exits.

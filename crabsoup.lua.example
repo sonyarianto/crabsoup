@@ -3,6 +3,9 @@
 -- Copy to `crabsoup.lua` (the default path) and adjust to taste.
 -- This is plain Lua with Liquidsoap-flavoured names; `{key = value}`
 -- tables are how named options are passed.
+--
+-- Minimal per-format test scripts live in `examples/`
+-- (`crabsoup.opus.lua`, `crabsoup.mp3.lua`, `crabsoup.preview.lua`).
 
 -- The PCM bus: every source is resampled/converted to this spec before mixing.
 set("sample_rate", 44100)
