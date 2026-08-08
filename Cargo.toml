@@ -1,0 +1,31 @@
+[package]
+name = "crabsoup"
+version = "0.1.0"
+edition = "2021"
+description = "Liquidsoap-inspired audio streaming engine: playlist scheduling, crossfades, live DJ ducking, Icecast output (MP3/Opus)"
+license = "MIT"
+
+[dependencies]
+# Audio decoding + resampling
+symphonia = { version = "0.5", features = ["all"] }
+# Basic auth decoding for the live harbor
+base64 = "0.22"
+# Concurrency & async (live harbor)
+tokio = { version = "1.0", features = ["full"] }
+parking_lot = "0.12"
+# Configuration parsing
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+# Terminal interface
+clap = { version = "4.0", features = ["derive"] }
+# Logging
+log = "0.4"
+env_logger = "0.11"
+# Track ordering randomness
+rand = { version = "0.8", features = ["small_rng"] }
+# Opus encoding (libopus FFI) + Ogg muxing
+audiopus = "0.3.0-rc.0"
+ogg = "0.9"
+
+[profile.release]
+lto = true
