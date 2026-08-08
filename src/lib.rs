@@ -5,6 +5,7 @@
 //! (MP3 or Opus) to an Icecast server.
 
 pub mod config;
+pub mod control;
 pub mod engine;
 pub mod live;
 pub mod output;

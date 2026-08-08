@@ -91,27 +91,43 @@ impl CrossfadeMixer {
 
 impl AudioSource for CrossfadeMixer {
     fn next_buffer(&mut self, buffer: &mut [f32]) -> usize {
-        self.ensure_started();
+        loop {
+            self.ensure_started();
 
-        // Preload the next source once the active track nears its end.
-        if self.next.is_none() {
-            let due = match self.active.remaining_seconds() {
-                Some(rem) => rem <= self.crossfade_seconds,
-                None => self.active.is_exhausted(),
-            };
-            if due {
-                self.preload_next();
+            // Preload the next source once the active track nears its end.
+            if self.next.is_none() {
+                let due = match self.active.remaining_seconds() {
+                    Some(rem) => rem <= self.crossfade_seconds,
+                    None => self.active.is_exhausted(),
+                };
+                if due {
+                    self.preload_next();
+                }
             }
-        }
 
-        let wanted = buffer.len();
-        let mut a = vec![0f32; wanted];
-        let mut b = vec![0f32; wanted];
-        let n_a = self.active.next_buffer(&mut a);
+            let wanted = buffer.len();
+            let mut a = vec![0f32; wanted];
+            let mut b = vec![0f32; wanted];
+            let n_a = self.active.next_buffer(&mut a);
+
+            // The active track ended before a successor was preloaded (e.g. it
+            // consumed its last data mid-fade or `remaining_seconds` was
+            // unavailable). Pull the next track immediately instead of
+            // stalling on silence.
+            if n_a == 0 && self.active.is_exhausted() && self.next.is_none() {
+                if self.provider.has_next() {
+                    let (src, label) = self.provider.next_source();
+                    log::info!("crossfade: track ended early, advancing to {label}");
+                    self.active = src;
+                    self.active_label = label;
+                    continue;
+                }
+                return 0;
+            }
 
         // Tail ramp: a crossfade was promoted mid-way; keep fading the new
-        // active source in to full gain, frame by frame.
-        if let Some(tail) = self.tail.as_mut() {
+            // active source in to full gain, frame by frame.
+            if let Some(tail) = self.tail.as_mut() {
             let chans = self.channels;
             let frames = n_a / chans;
             for f in 0..frames {
@@ -129,10 +145,10 @@ impl AudioSource for CrossfadeMixer {
         }
 
         if let Some(next) = self.next.as_mut() {
-            let n_b = next.next_buffer(&mut b);
+                let n_b = next.next_buffer(&mut b);
 
             let out_len = n_a.max(n_b);
-            let chans = self.channels;
+                let chans = self.channels;
             let frames_out = out_len / chans;
             let cf = self.crossfade_frames.max(1) as f64;
             for i in 0..out_len {
@@ -144,27 +160,28 @@ impl AudioSource for CrossfadeMixer {
             }
             self.fade_pos += frames_out;
 
-            if self.active.is_exhausted() {
-                let promoted = self.next.take().expect("next must exist");
+                if self.active.is_exhausted() {
+                    let promoted = self.next.take().expect("next must exist");
                 self.active = promoted;
                 self.active_label = self.next_label.take().unwrap_or_default();
                 if self.fade_pos < self.crossfade_frames {
-                    let remaining = self.crossfade_frames - self.fade_pos;
-                    let t_end = self.fade_pos as f64 / cf;
-                    let gain_b = t_end.powf(self.curve);
-                    self.tail = Some(Tail {
-                        start_gain: gain_b,
-                        remaining,
-                        total: remaining,
-                    });
+                        let remaining = self.crossfade_frames - self.fade_pos;
+                        let t_end = self.fade_pos as f64 / cf;
+                        let gain_b = t_end.powf(self.curve);
+                        self.tail = Some(Tail {
+                            start_gain: gain_b,
+                            remaining,
+                            total: remaining,
+                        });
+                    }
                 }
+                return out_len;
             }
-            return out_len;
-        }
 
-        // No crossfade in progress: plain passthrough.
-        buffer[..n_a].copy_from_slice(&a[..n_a]);
-        n_a
+            // No crossfade in progress: plain passthrough.
+            buffer[..n_a].copy_from_slice(&a[..n_a]);
+            return n_a;
+        }
     }
 
     fn is_exhausted(&self) -> bool {
@@ -553,5 +570,102 @@ mod tests {
         assert!((buf[0] - 3.0).abs() < 1e-6);
         pm.next_buffer(&mut buf);
         assert!((buf[0] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn plays_a_real_jingle_file() {
+
+        use std::path::PathBuf;
+        let jingle = PathBuf::from("jingles/mrwashingt0n-radio-for-all-trance-505921.mp3");
+        if !jingle.exists() {
+            return; // not available in CI-less env; skip
+        }
+        let provider = Box::new(FakeProvider::new(vec![(0.5, 100000)]));
+        let cfg = mixer_config(0.2);
+        let cross = CrossfadeMixer::new(provider, &cfg, RATE as u32, CHANS);
+        let (tx, rx) = mpsc::channel();
+        let spec = symphonia::core::audio::SignalSpec::new(RATE as u32, symphonia::core::audio::Channels::FRONT_LEFT | symphonia::core::audio::Channels::FRONT_RIGHT);
+        let mut pm = PriorityMixer::new(Box::new(cross), rx, &cfg, spec, 100);
+        tx.send(MixCommand::PlayJingle(jingle)).unwrap();
+        // Duck ramp is 1.0s (10 buffers), jingle is ~12s (124 buffers):
+        // buffers 20..120 are pure jingle (music fully ducked).
+        let mut buf = vec![0f32; 100 * CHANS];
+        let mut seen_label = false;
+        for i in 0..140 {
+            pm.next_buffer(&mut buf);
+            if let Some(l) = pm.label() {
+                if l.contains("mrwashingt0n") {
+                    seen_label = true;
+                }
+            }
+            if (20..120).contains(&i) {
+                let e: f32 = buf.iter().map(|v| v * v).sum::<f32>() / buf.len() as f32;
+                if i == 40 {
+                    assert!(e > 0.01, "jingle window silent (energy {e})");
+                }
+            }
+        }
+        assert!(seen_label, "mixer never reached jingle label");
+    }
+
+    #[test]
+    fn jingle_reaches_the_opus_encoder_end_to_end() {
+        use std::path::PathBuf;
+        let jingle = PathBuf::from("jingles/mrwashingt0n-radio-for-all-trance-505921.mp3");
+        if !jingle.exists() {
+            return; // repo-checkout only
+        }
+        // Playlist of the real media dir -> crossfade -> priority mixer -> opus.
+        let spec = symphonia::core::audio::SignalSpec::new(
+            44100,
+            symphonia::core::audio::Channels::FRONT_LEFT
+                | symphonia::core::audio::Channels::FRONT_RIGHT,
+        );
+        let media = std::path::Path::new("media");
+        let mut files: Vec<_> = std::fs::read_dir(media)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|x| x == "mp3").unwrap_or(false))
+            .collect();
+        files.sort();
+        let playlist =
+            crate::source::playlist::Playlist::new(files, false, true, spec, 4096, None);
+        let cfg = mixer_config(0.2);
+        let cross = CrossfadeMixer::new(Box::new(playlist), &cfg, 44100, 2);
+        let (tx, rx) = mpsc::channel();
+        let mut pm = PriorityMixer::new(Box::new(cross), rx, &cfg, spec, 4096);
+        tx.send(MixCommand::PlayJingle(jingle)).unwrap();
+
+        let mut enc =
+            crate::output::encoder::create_encoder(crate::config::OutputFormat::Opus, 44100, 2, 128_000, "e2e")
+                .unwrap();
+        let mut buf = vec![0f32; 4096 * 2];
+        let mut all = Vec::new();
+        let mut jingle_audio = false;
+        for _ in 0..600 {
+            pm.next_buffer(&mut buf);
+            let out = enc.encode(&buf);
+            if out.is_empty() {
+                continue;
+            }
+            let jingle_active = pm
+                .label()
+                .map(|l| l.contains("mrwashingt0n"))
+                .unwrap_or(false);
+            if jingle_active {
+                let e: f32 = buf.iter().map(|v| v * v).sum::<f32>() / buf.len() as f32;
+                if e > 0.005 {
+                    jingle_audio = true;
+                }
+            }
+            all.extend_from_slice(&out);
+        }
+        all.extend_from_slice(&enc.finish());
+        assert!(jingle_audio, "no audible jingle audio reached the encoder");
+        assert!(all.len() > 100_000);
+        if let Some(out) = std::env::var_os("CRABSOUP_DUMP") {
+            std::fs::write(out, &all).unwrap();
+        }
     }
 }

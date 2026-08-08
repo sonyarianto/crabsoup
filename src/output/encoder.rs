@@ -242,6 +242,9 @@ impl OpusEncoder {
             if written > 0 {
                 self.granule += OPUS_FRAME_SAMPLES as i64;
                 self.mux.write_packet(&encode_buf[..written], self.granule);
+                // One page per 20 ms packet so encoded audio reaches the
+                // server promptly instead of accumulating in the page buffer.
+                self.mux.flush();
             }
             self.pcm.drain(..need);
         }
@@ -313,5 +316,55 @@ mod tests {
         let s = String::from_utf8_lossy(&bytes);
         assert!(s.contains("OpusHead"));
         assert!(s.contains("OpusTags"));
+    }
+}
+
+#[test]
+fn opus_streams_a_real_48k_mp3_file() {
+    // Decode the repo's 48 kHz MP3 through FileSource, encode to Opus, and
+    // verify the whole-file stream is valid Ogg/Opus. This exercises the
+    // FileSource->OpusEncoder path (downsample 48k -> 44.1k, then upsample
+    // 44.1k -> 48k) across many packets.
+    let media = std::path::Path::new("media");
+    if !media.is_dir() {
+        return; // media/ only exists in the repo checkout
+    }
+    use crate::source::AudioSource;
+    let mut files: Vec<_> = std::fs::read_dir(media)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().map(|x| x == "mp3").unwrap_or(false))
+        .collect();
+    files.sort();
+    let Some(file) = files.first() else { return };
+
+    let spec = symphonia::core::audio::SignalSpec::new(
+        44100,
+        symphonia::core::audio::Channels::FRONT_LEFT | symphonia::core::audio::Channels::FRONT_RIGHT,
+    );
+    let mut src = crate::source::file::FileSource::open(&file, spec, 4096).unwrap();
+    let mut enc = OpusEncoder::new(44100, 2, 128_000, "test").unwrap();
+    let mut buf = vec![0f32; 4096 * 2];
+    let mut all = Vec::new();
+    let mut guards = 0u32;
+    while guards < 1_000_000 {
+        let n = src.next_buffer(&mut buf);
+        if n == 0 {
+            assert!(src.is_exhausted(), "0 before EOF");
+            break;
+        }
+        all.extend_from_slice(&enc.encode(&buf[..n]));
+        guards += 1;
+    }
+    all.extend_from_slice(&enc.finish());
+    // 191+ seconds at 128 kbps is ~3 MB; assert we got a real stream.
+    assert!(all.len() > 500_000, "only {} bytes encoded", all.len());
+    // The stream must begin with OggS and an OpusHead page.
+    assert_eq!(&all[0..4], b"OggS");
+    assert!(String::from_utf8_lossy(&all).contains("OpusHead"));
+    // Persist for manual inspection with external tools (ffprobe, curl -T).
+    if let Some(out) = std::env::var_os("CRABSOUP_DUMP") {
+        std::fs::write(out, &all).unwrap();
     }
 }

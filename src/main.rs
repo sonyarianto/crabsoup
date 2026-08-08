@@ -69,6 +69,12 @@ fn main() -> crabsoup::Result<()> {
         rt.spawn(async move { harbor.run().await });
     }
 
+    if let Some(ctl_cfg) = &config.control {
+        let jingles = config.jingle_files();
+        let server = crabsoup::control::ControlServer::new(ctl_cfg.clone(), jingles, tx.clone());
+        rt.spawn(async move { server.run().await });
+    }
+
     let shutdown = Arc::new(AtomicBool::new(false));
     let ctrl_shutdown = shutdown.clone();
     let ctrl_tx = tx.clone();

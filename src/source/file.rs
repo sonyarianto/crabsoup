@@ -81,7 +81,7 @@ impl FileSource {
         use symphonia::core::audio::SampleBuffer;
         use symphonia::core::errors::Error as SErr;
 
-        let to_ch = self.converter.target_channels();
+let to_ch = self.converter.target_channels();
         while self.buf.len() - self.pos < needed && !self.eof {
             let packet = match self.format.next_packet() {
                 Ok(p) => p,
@@ -136,6 +136,14 @@ impl AudioSource for FileSource {
         let n = available.min(buffer.len());
         buffer[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
         self.pos += n;
+        if n == 0 {
+            log::debug!(
+                "filesource: next_buffer returned 0 (eof={}, buf={}, pos={})",
+                self.eof,
+                self.buf.len(),
+                self.pos
+            );
+        }
 
         // Compact once a full buffer has been consumed.
         if self.pos >= want {

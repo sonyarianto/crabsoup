@@ -15,8 +15,10 @@ pub struct LinearResampler {
     /// Last input frame, kept across chunks so interpolation is seamless.
     prev: Vec<f32>,
     has_prev: bool,
-    /// Input-sample position of the next output sample.
+    /// Input-sample position (global) of the next output sample.
     pos: f64,
+    /// Global input-frame index of the first frame of the current chunk.
+    base: f64,
     outbuf: Vec<f32>,
 }
 
@@ -31,6 +33,7 @@ impl LinearResampler {
             prev: vec![0.0; nch],
             has_prev: false,
             pos: 0.0,
+            base: 0.0,
             outbuf: Vec::new(),
         }
     }
@@ -46,6 +49,7 @@ impl LinearResampler {
 
         let ratio = self.in_rate as f64 / self.out_rate as f64;
         let frames = input.len() / nch;
+        let base = self.base;
 
         for j in 0..frames {
             let cur = &input[j * nch..(j + 1) * nch];
@@ -54,11 +58,14 @@ impl LinearResampler {
                 self.has_prev = true;
                 continue;
             }
-            // Produce output samples while the interpolation window
-            // (prev == frame j-1, cur == frame j) covers `pos`.
-            while (self.pos.floor() as usize) < j {
-                let k = self.pos.floor() as usize;
-                let f = self.pos - k as f64;
+            // Emit output samples while the interpolation window
+            // (prev == frame base+j-1, cur == frame base+j) covers `pos`.
+            // `pos` is a *global* input position, so compare it against the
+            // global index of this window's right edge.
+            let global_j = base + j as f64;
+            while self.pos < global_j {
+                let k = self.pos.floor();
+                let f = self.pos - k;
                 for (ch, &r) in cur.iter().enumerate() {
                     let l = self.prev[ch] as f64;
                     self.outbuf.push((l + (r as f64 - l) * f) as f32);
@@ -71,11 +78,12 @@ impl LinearResampler {
         // Tail: the sample at the very last frame needs no right neighbour —
         // pad with the last frame itself (a zero-order hold) so nothing is
         // dropped at EOF.
-        let last = frames.saturating_sub(1);
-        while self.pos.floor() as usize <= last {
+        let last = base + frames as f64 - 1.0;
+        while self.pos.floor() <= last {
             self.outbuf.extend_from_slice(&self.prev[..nch]);
             self.pos += ratio;
         }
+        self.base += frames as f64;
 
         &self.outbuf
     }
@@ -133,5 +141,31 @@ mod tests {
         let joined: Vec<f32> = a.into_iter().chain(b).collect();
         assert!(!joined.is_empty());
         assert!((joined[0] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn downsample_continues_across_many_chunks() {
+        // Regression: 48 kHz -> 44.1 kHz (ratio > 1) in repeated 1152-frame
+        // chunks — exactly how an MP3 is fed. Every chunk after the first used
+        // to produce zero output, stalling the whole stream.
+        let mut r = LinearResampler::new(24, 48000, 44100, 2);
+        let mut chunk = vec![0f32; 1152 * 2];
+        for (i, s) in chunk.iter_mut().enumerate() {
+            *s = (i % 7) as f32 / 7.0;
+        }
+        let mut total = 0usize;
+        let mut first = None;
+        for _ in 0..24 {
+            let out = r.resample(&chunk);
+            assert!(
+                out.len() >= 1000,
+                "chunk produced only {} samples (expected ~2118)",
+                out.len()
+            );
+            first.get_or_insert_with(|| out.to_vec());
+            total += out.len();
+        }
+        // 24 chunks * 1152 frames * 2ch * (44100/48000) ~ 50781.
+        assert!(total > 50_000, "total too small: {total}");
     }
 }

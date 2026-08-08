@@ -146,25 +146,54 @@ impl IcecastOutput {
     /// Run the pump loop until the source is exhausted. Blocks the caller.
     pub fn run(&mut self) -> Result<()> {
         let mut buf = vec![0f32; self.frames_per_buffer * self.chans];
+        // Wall-clock pacing: consume input no faster than real time so the
+        // encoder and Icecast are fed at stream rate regardless of how libshout
+        // paces (unreliable for Ogg without listeners).
+        let start = std::time::Instant::now();
+        let mut frames_pulled = 0u64;
+        let mut last_sync = std::time::Instant::now();
 
         loop {
             if self.shutdown.load(Ordering::SeqCst) {
                 log::info!("shutdown requested, ending stream");
                 break;
             }
+
+            // Pull at real-time rate: sleep until the next buffer is due.
+            let elapsed_us = start.elapsed().as_micros() as u64;
+            let next_due_us = frames_pulled * 1_000_000 / self.sample_rate as u64;
+            if elapsed_us < next_due_us {
+                std::thread::sleep(Duration::from_micros((next_due_us - elapsed_us) as u64));
+            }
+
             let n = self.source.next_buffer(&mut buf);
             if n == 0 && self.source.is_exhausted() {
                 break;
             }
+            if n == 0 {
+                log::debug!("pump: source underflow, pacing");
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            frames_pulled += (n / self.chans) as u64;
             self.update_metadata();
 
             let encoded = self.encoder.as_mut().unwrap().encode(&buf[..n]);
+            if encoded.is_empty() {
+                // The encoder accumulates internally (LAME needs 1152-sample
+                // frames); nothing to send yet. Back off briefly.
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
             match self.send_or_reconnect(&encoded) {
                 SendResult::Sent => {}
                 SendResult::Dropped => continue,
             }
-            if let Some(shout) = self.shout.as_mut() {
-                shout.sync();
+            if last_sync.elapsed().as_millis() >= 100 {
+                if let Some(shout) = self.shout.as_mut() {
+                    shout.sync();
+                }
+                last_sync = std::time::Instant::now();
             }
         }
 

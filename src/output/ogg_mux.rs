@@ -102,12 +102,15 @@ fn segment_table(len: usize) -> Vec<u8> {
 }
 
 /// The Ogg CRC-32 (poly 0x04c11db7, no reflection, no final xor).
+///
+/// Table-driven MSB-first update: the next input byte xors into the *index*
+/// (the crc's top byte), not into the result.
 fn crc32(header: &[u8], body: &[u8]) -> u32 {
     let table = CRC_TABLE.get_or_init(crc_table);
     let mut crc: u32 = 0;
     for &b in header.iter().chain(body) {
-        let idx = ((crc >> 24) & 0xff) as usize;
-        crc = table[idx] ^ (crc << 8) ^ b as u32;
+        let idx = (((crc >> 24) ^ b as u32) & 0xff) as usize;
+        crc = table[idx] ^ (crc << 8);
     }
     crc
 }
@@ -185,7 +188,8 @@ mod tests {
 
         let out = mux.take_output();
         let pages = split_pages(&out);
-        // Head page, tags page, then one audio page.
+        // Head page, tags page, then one audio page (both packets coalesced
+        // into a single page; the encoder flushes per packet separately).
         assert_eq!(pages.len(), 3);
         // BOS flag on the first page, EOS on the last.
         assert_eq!(pages[0][5], 0x02);
@@ -222,5 +226,23 @@ mod tests {
         assert_eq!(segment_table(255), vec![255, 0]);
         assert_eq!(segment_table(256), vec![255, 1]);
         assert_eq!(segment_table(300), vec![255, 45]);
+    }
+
+    #[test]
+    fn crc_matches_external_reference() {
+        // Page 1 of a real stream: header (checksum zeroed) + 19-byte OpusHead.
+        // Expected CRC computed with an independent implementation (verified
+        // against ffmpeg-produced Ogg files).
+        let hdr = hex("4f676753000200000000000000004342414300000000000000000113");
+        let body = hex("4f707573486561640102000080bb0000000000");
+        let crc = crc32(&hdr, &body);
+        assert_eq!(crc, 0xae3e_7e5f, "CRC does not match external reference");
+    }
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
     }
 }

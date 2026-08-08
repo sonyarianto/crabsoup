@@ -18,6 +18,10 @@ pub struct Config {
     pub output: Option<OutputConfig>,
     /// Live DJ harbor listener (optional).
     pub live: Option<LiveConfig>,
+    /// One-shot radio jingles, played via the control port (optional).
+    pub jingles: Option<JingleConfig>,
+    /// Line-based telnet control port (optional).
+    pub control: Option<ControlConfig>,
 }
 
 /// The PCM bus: every source is resampled/converted to this spec.
@@ -150,6 +154,42 @@ impl Default for LiveConfig {
     }
 }
 
+/// One-shot jingles played over the music via `MixCommand::PlayJingle`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct JingleConfig {
+    /// Recursively scanned directory of audio files.
+    pub directory: Option<PathBuf>,
+    /// Explicit file list (appended to any `directory` results).
+    pub files: Vec<PathBuf>,
+}
+
+impl Default for JingleConfig {
+    fn default() -> Self {
+        Self {
+            directory: None,
+            files: Vec::new(),
+        }
+    }
+}
+
+/// Liquidsoap-style telnet control port.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ControlConfig {
+    pub host: String,
+    pub port: u16,
+}
+
+impl Default for ControlConfig {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".into(),
+            port: 1234,
+        }
+    }
+}
+
 impl Config {
     /// Load and parse a YAML config file.
     pub fn load(path: &Path) -> Result<Self> {
@@ -170,6 +210,21 @@ impl Config {
             collect_audio(dir, &mut out);
         }
         out.extend(self.playlist.files.iter().cloned());
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Resolve the configured jingle files (empty when `jingles:` is absent).
+    pub fn jingle_files(&self) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let Some(j) = &self.jingles else {
+            return out;
+        };
+        if let Some(dir) = &j.directory {
+            collect_audio(dir, &mut out);
+        }
+        out.extend(j.files.iter().cloned());
         out.sort();
         out.dedup();
         out
@@ -259,5 +314,32 @@ output:
         let spec = cfg.signal_spec();
         assert_eq!(spec.rate, 44100);
         assert_eq!(spec.channels.count(), 2);
+    }
+
+    #[test]
+    fn parses_jingles_and_control() {
+        let raw = r#"
+jingles:
+  directory: ./jingles
+  files:
+    - ./custom.wav
+control:
+  host: 127.0.0.1
+  port: 9999
+"#;
+        let cfg = Config::from_yaml(raw).unwrap();
+        let jingles = cfg.jingles.unwrap();
+        assert_eq!(jingles.directory.unwrap().to_str().unwrap(), "./jingles");
+        assert_eq!(jingles.files.len(), 1);
+        let ctl = cfg.control.unwrap();
+        assert_eq!(ctl.port, 9999);
+    }
+
+    #[test]
+    fn no_jingles_by_default() {
+        let cfg = Config::from_yaml("").unwrap();
+        assert!(cfg.jingles.is_none());
+        assert!(cfg.control.is_none());
+        assert!(cfg.jingle_files().is_empty());
     }
 }
