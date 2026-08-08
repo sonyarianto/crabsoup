@@ -20,10 +20,17 @@
       `log`) evaluated by mlua (vendored Lua 5.4). Scripts define everything:
       stream/mixer settings, sources, services, output. Verified live with
       `crabsoup.lua.example` (Opus mount, telnet jingle trigger).
+- [x] Native Icecast source protocol replaces libshout (`icecast_client.rs`):
+      single authenticated `SOURCE` request, raw encoded bytes, separate
+      `/admin/metadata` GETs for titles. No libshout dependency, no capability
+      negotiation, no 401-then-200 double login. Verified live: one `SOURCE`
+      request per connect (HTTP 200), title updates reach the mount (status-json
+      shows the track), ffprobe decodes the stream.
 
 ## Next up
 - [ ] Live DJ harbor end-to-end verification (PUT a real stream at `/live`, check auto-duck on connect/disconnect)
-- [ ] Opus stream title: Icecast rejects admin URL title updates for Opus mounts; libshout's in-stream OpusTags update didn't appear mid-stream during a 4-minute soak. Decide: insert OpusTags comment page ourselves, or accept title-less Opus
-- [ ] The 401-then-200 double login on every connect (libshout sends an unauthenticated probe first) — cosmetic, benign
+- [ ] Opus stream title: verify whether Icecast's `/admin/metadata` is enough for
+      Opus mounts now that libshout is gone (the old soak test saw no mid-stream
+      OpusTags updates); insert an OpusTags comment page ourselves if needed
 - [ ] Preview mode via `--preview`? (currently only by omitting `output.icecast` in the script)
 - [ ] Opus resampler is linear-interp only (48 kHz fixed); note: Opus path resamples bus -> 48 kHz

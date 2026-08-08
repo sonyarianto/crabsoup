@@ -24,8 +24,8 @@ Opus) to an Icecast server.
 media/ + jingles/
    │   (decoded via symphonia)
    ▼
-Playlist ──► CrossfadeMixer ──► PriorityMixer ──► Encoder ──► libshout ──► Icecast
-               (track overlap)  (live/jingle     (LAME or     (icecast source
+Playlist ──► CrossfadeMixer ──► PriorityMixer ──► Encoder ──► Icecast
+               (track overlap)  (live/jingle     (LAME or     (native source
                                  override)        libopus+Ogg)  protocol)
 ```
 
@@ -46,7 +46,7 @@ Source layout:
 | `src/source/` | `FileSource`, `Playlist` (scheduling), source composition |
 | `src/engine/` | `CrossfadeMixer`, `PriorityMixer`, `MixCommand` |
 | `src/live/` | DJ harbor (Icecast source protocol listener) |
-| `src/output/` | `encoder.rs` (LAME/libopus), `ogg_mux.rs`, `shout.rs` (libshout FFI), `icecast.rs` (pump + reconnect) |
+| `src/output/` | `encoder.rs` (LAME/libopus), `ogg_mux.rs`, `icecast_client.rs` (native source protocol), `icecast.rs` (pump + reconnect) |
 
 ## Building
 

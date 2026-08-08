@@ -26,8 +26,8 @@ that use them skip when absent.
 
 ## Conventions
 
-- Rust 2024 edition; no `unsafe` outside FFI (`src/output/shout.rs`,
-  `src/output/encoder.rs` LAME bindings).
+- Rust 2024 edition; no `unsafe` outside FFI (`src/output/encoder.rs`
+  LAME bindings).
 - Error type is `crate::Result<T, E = Box<dyn Error + Send + Sync>>`; string
   errors via `.into()` are the norm in FFI and IO paths.
 - Logging via `log` + `env_logger`; use `log::info/warn/error` with module
@@ -41,8 +41,9 @@ that use them skip when absent.
 
 ## Architecture notes
 
-Pipeline: `Playlist -> CrossfadeMixer -> PriorityMixer -> Encoder -> libshout
--> Icecast`. The `.lua` script's root source (e.g. `fallback({j, live, pl})`)
+Pipeline: `Playlist -> CrossfadeMixer -> PriorityMixer -> Encoder ->
+Icecast` via the native source-protocol client. The `.lua` script's root
+source (e.g. `fallback({j, live, pl})`)
 is that Playlist input; all sources are normalised to the PCM bus
 (`set("sample_rate", ...)`, `set("channels", ...)`, `frames_per_buffer`).
 
@@ -68,6 +69,11 @@ is that Playlist input; all sources are normalised to the PCM bus
   Ogg page per packet, flush per packet so audio reaches Icecast promptly.
 - Pump pacing in `src/output/icecast.rs` is wall-clock based:
   `next_due_us = frames_pulled * 1_000_000 / sample_rate`.
+- `src/output/icecast_client.rs` is the native Icecast source-protocol client
+  (no libshout): one authenticated `SOURCE` request, then raw encoded bytes;
+  titles go out on separate authenticated `/admin/metadata` GETs. One request
+  per operation — no libshout capability negotiation, no unauthenticated
+  401 probe, no `!POKE`.
 
 ## Critical gotchas
 
@@ -77,6 +83,4 @@ is that Playlist input; all sources are normalised to the PCM bus
   corrupted every page silently; `crc_matches_external_reference` guards it.
 - Opus requires 48 kHz sample rate — never feed it the bus rate directly.
 - icecast2 on localhost:8000 is the usual end-to-end target (source/admin
-  password `hackme`). Verify on-air streams with `ffprobe` against the mount;
-  note the mount reconnects with the usual libshout 401-then-200 double
-  login (benign).
+  password `hackme`). Verify on-air streams with `ffprobe` against the mount.

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::config::{OutputConfig, OutputFormat};
 use crate::output::encoder::{create_encoder, Encoder};
-use crate::output::shout::Shout;
+use crate::output::icecast_client::IcecastClient;
 use crate::source::AudioSource;
 use crate::Result;
 
@@ -21,7 +21,7 @@ pub struct IcecastOutput {
     sample_rate: u32,
     chans: usize,
     frames_per_buffer: usize,
-    shout: Option<Shout>,
+    shout: Option<IcecastClient>,
     encoder: Option<Box<dyn Encoder>>,
     last_title: String,
     shutdown: Arc<AtomicBool>,
@@ -67,7 +67,7 @@ impl IcecastOutput {
             self.config.bitrate,
             &self.config.name,
         )?);
-        self.shout = Some(Shout::connect(&self.config, self.sample_rate, self.chans as u16)?);
+        self.shout = Some(IcecastClient::connect(&self.config, self.sample_rate, self.chans as u16)?);
         log::info!(
             "connected to Icecast {}:{} mount {} ({})",
             self.config.host,
@@ -87,9 +87,6 @@ impl IcecastOutput {
 
     /// Re-establish the connection, discarding the old encoder (fresh headers).
     fn reconnect(&mut self) {
-        if let Some(s) = self.shout.as_mut() {
-            s.close();
-        }
         self.shout = None;
         self.encoder = None;
 
@@ -135,8 +132,8 @@ impl IcecastOutput {
     fn update_metadata(&mut self) {
         let title = self.source.label().unwrap_or_default();
         if title != self.last_title {
-            if let Some(shout) = self.shout.as_mut() {
-                shout.update_title(&title);
+            if let Err(e) = IcecastClient::update_title(&self.config, &title) {
+                log::warn!("icecast metadata update failed: {e}");
             }
             self.last_title = title.clone();
             log::info!("icecast: now playing {title}");
@@ -147,11 +144,9 @@ impl IcecastOutput {
     pub fn run(&mut self) -> Result<()> {
         let mut buf = vec![0f32; self.frames_per_buffer * self.chans];
         // Wall-clock pacing: consume input no faster than real time so the
-        // encoder and Icecast are fed at stream rate regardless of how libshout
-        // paces (unreliable for Ogg without listeners).
+        // encoder and Icecast are fed at stream rate.
         let start = std::time::Instant::now();
         let mut frames_pulled = 0u64;
-        let mut last_sync = std::time::Instant::now();
 
         loop {
             if self.shutdown.load(Ordering::SeqCst) {
@@ -189,12 +184,6 @@ impl IcecastOutput {
                 SendResult::Sent => {}
                 SendResult::Dropped => continue,
             }
-            if last_sync.elapsed().as_millis() >= 100 {
-                if let Some(shout) = self.shout.as_mut() {
-                    shout.sync();
-                }
-                last_sync = std::time::Instant::now();
-            }
         }
 
         // Flush encoder tail and close cleanly.
@@ -202,9 +191,7 @@ impl IcecastOutput {
             let tail = encoder.finish();
             self.send_or_reconnect(&tail);
         }
-        if let Some(shout) = self.shout.as_mut() {
-            shout.close();
-        }
+        self.shout = None;
         Ok(())
     }
 }
