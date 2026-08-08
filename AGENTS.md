@@ -80,9 +80,12 @@ is that Playlist input; all sources are normalised to the PCM bus
   requires type-less packets (no RFC 7845 packet-type byte — ffmpeg writes
   them type-less too). Never inject comment pages mid-stream: Icecast
   forwards them to listeners as audio, producing decoder warnings. One
-  request
-  per operation — no libshout capability negotiation, no unauthenticated
+  request per operation — no libshout capability negotiation, no unauthenticated
   401 probe, no `!POKE`.
+- The live harbor decodes DJ uploads with symphonia, which has no Opus codec
+  (confirmed through 0.6.0): MP3 uploads decode and air; Opus uploads log
+  "cannot create decoder: unsupported codec" and air silence for the ducked
+  window while the duck control still runs.
 
 ## Critical gotchas
 

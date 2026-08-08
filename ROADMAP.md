@@ -6,7 +6,7 @@
 - [x] Gapless crossfades (`crossfade_seconds`, `fade_curve`)
 - [x] MP3 -> Icecast broadcast, 192 kbps, title metadata
 - [x] Graceful Ctrl-C shutdown
-- [x] Unit tests (37), incl. resampler multi-chunk regression
+- [x] Unit tests (50), incl. resampler multi-chunk regression, Ogg CRC, Opus tags
 - [x] Opus end-to-end: encoder + Ogg mux -> Icecast verified live (ffprobe decodes
       mount, listeners get audio). Fixed Ogg page CRC bug (byte must xor into
       the table index, not into the result) that silently corrupted every page.
@@ -27,8 +27,12 @@
       request per connect (HTTP 200), title updates reach the mount (status-json
       shows the track), ffprobe decodes the stream.
 
-## Next up
-- [ ] Live DJ harbor end-to-end verification (PUT a real stream at `/live`, check auto-duck on connect/disconnect)
+- [x] Live DJ harbor end-to-end: PUT + Basic auth (200 OK), mixer duck control
+      verified (connect/disconnect events; broadcast RMS dips to ~25% then
+      recovers full level). Caveat: symphonia 0.5/0.6 has no Opus codec, so
+      MP3 uploads decode and air, while Opus uploads log "cannot create
+      decoder: unsupported codec" and air silence for the ducked window.
+
 - [x] Opus stream title: investigated to the source. Icecast 2.4.4 never parses
       OpusTags titles (format_opus.c counts header packets only) and rejects URL
       metadata updates for Opus mounts (HTTP 200 + "Mountpoint will not accept
@@ -40,5 +44,14 @@
       audio). Verified live: ffprobe reads `title=` from the stream's first
       OpusTags; MP3 keeps live URL titles; icecast 2.4.4 status-json stays
       title-less for Opus (documented server limitation).
+
+## Known limitations
+- DJ uploads must be MP3 for now (symphonia has no Opus codec; 0.6.0 feature
+  list confirmed ogg/vorbis/mp3 but no opus). A native Opus decode path
+  (audiopus + our ogg demuxer) is future work.
+- Icecast 2.4.4 shows no Opus titles (see Done section); 2.5+ shows the
+  stream-start title only.
+
+## Next up
 - [ ] Preview mode via `--preview`? (currently only by omitting `output.icecast` in the script)
 - [ ] Opus resampler is linear-interp only (48 kHz fixed); note: Opus path resamples bus -> 48 kHz
