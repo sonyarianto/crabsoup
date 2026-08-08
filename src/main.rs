@@ -21,6 +21,10 @@ struct Cli {
     /// Evaluate the script, print the resulting configuration, and exit.
     #[arg(long)]
     check: bool,
+    /// Decode and mix but never broadcast, even if the script defines an
+    /// `output.icecast`.
+    #[arg(long)]
+    preview: bool,
 }
 
 fn main() -> crabsoup::Result<()> {
@@ -32,7 +36,7 @@ fn main() -> crabsoup::Result<()> {
     let mut result = script::run(&src).map_err(|e| format!("script error: {e}"))?;
 
     if cli.check {
-        print_result(&result);
+        print_result(&result, cli.preview);
         return Ok(());
     }
 
@@ -47,8 +51,16 @@ fn main() -> crabsoup::Result<()> {
         .or_else(|| result.preview.take())
         .expect("script output checked by run()");
     let (tx, rx) = mpsc::channel();
-    let pm = PriorityMixer::new(root_source, rx, &result.mixer, spec, fpb);
-    let mut root: Box<dyn AudioSource> = Box::new(pm);
+
+    // `--preview` forces the preview path regardless of the script's output.
+    let broadcast = result.output.take().filter(|_| !cli.preview);
+    let mut root: Box<dyn AudioSource> = Box::new(PriorityMixer::new(
+        root_source,
+        rx,
+        &result.mixer,
+        spec,
+        fpb,
+    ));
 
     // Background tokio runtime: live harbor listener + Ctrl-C handler.
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -76,7 +88,7 @@ fn main() -> crabsoup::Result<()> {
         let _ = ctrl_tx.send(MixCommand::Shutdown);
     });
 
-    match &result.output {
+    match &broadcast {
         Some(out_cfg) => {
             let mut output =
                 IcecastOutput::new(out_cfg.clone(), root, spec.rate, chans, fpb);
@@ -99,17 +111,21 @@ fn main() -> crabsoup::Result<()> {
             output.run()
         }
         None => {
-            log::warn!(
-                "no output.icecast in script; running in preview mode \
-                 (decoding but not broadcasting)"
-            );
+            if cli.preview {
+                log::info!("--preview: decoding and mixing, not broadcasting");
+            } else {
+                log::warn!(
+                    "no output.icecast in script; running in preview mode \
+                     (decoding but not broadcasting)"
+                );
+            }
             run_preview(&mut *root, spec.rate, chans, fpb, shutdown)
         }
     }
 }
 
 /// `--check` output: a human-readable summary of the script result.
-fn print_result(result: &ScriptResult) {
+fn print_result(result: &ScriptResult, preview: bool) {
     let stream = &result.stream;
     let mixer = &result.mixer;
     println!(
@@ -127,12 +143,16 @@ fn print_result(result: &ScriptResult) {
     if let Some(c) = &result.control {
         println!("telnet: {}:{}", c.host, c.port);
     }
-    match &result.output {
-        Some(out) => println!(
-            "output: {:?} to {}:{}{}",
-            out.format, out.host, out.port, out.mount
-        ),
-        None => println!("output: preview only"),
+    if preview {
+        println!("output: preview only (forced by --preview)");
+    } else {
+        match &result.output {
+            Some(out) => println!(
+                "output: {:?} to {}:{}{}",
+                out.format, out.host, out.port, out.mount
+            ),
+            None => println!("output: preview only"),
+        }
     }
 }
 

@@ -7,7 +7,7 @@ use std::ptr;
 
 use crate::config::OutputFormat;
 use crate::output::ogg_mux::{OggMuxer, opus_head_packet, opus_tags_packet};
-use crate::resample::LinearResampler;
+use crate::resample::SincResampler;
 use crate::Result;
 
 /// Uniform interface for a PCM -> stream-format encoder.
@@ -183,7 +183,7 @@ pub struct OpusEncoder {
     encoder: audiopus::coder::Encoder,
     channels: usize,
     /// Resamples the stream rate to the Opus-required 48 kHz.
-    resampler: LinearResampler,
+    resampler: SincResampler,
     mux: OggMuxer,
     /// Accumulated 48 kHz interleaved PCM awaiting a full Opus frame.
     pcm: Vec<i16>,
@@ -218,7 +218,7 @@ impl OpusEncoder {
             log::warn!("Opus only supports mono/stereo; encoding {} channels", channels);
         }
 
-        let resampler = LinearResampler::new(24, sample_rate, OPUS_SAMPLE_RATE, channels as usize);
+        let resampler = SincResampler::new(24, sample_rate, OPUS_SAMPLE_RATE, channels as usize);
 
         let mut mux = OggMuxer::new(OPUS_SERIAL);
         // Headers go out as their own pages before any audio.

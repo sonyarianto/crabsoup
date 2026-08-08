@@ -65,8 +65,9 @@ is that Playlist input; all sources are normalised to the PCM bus
   `std::sync::mpsc`. The harbor and control port send into it.
 - `PriorityMixer` crossfades between `main` and an override with a gain ramp
   over `duck_seconds`; the override audio is `m*(1-gain) + o*gain`.
-- Opus path: `LinearResampler` bus -> 48 kHz, encode 20 ms frames, mux one
-  Ogg page per packet, flush per packet so audio reaches Icecast promptly.
+- Opus path: `SincResampler` (16-tap Hann-windowed sinc, 256-phase table)
+  bus -> 48 kHz, encode 20 ms frames, mux one Ogg page per packet, flush
+  per packet so audio reaches Icecast promptly.
 - Pump pacing in `src/output/icecast.rs` is wall-clock based:
   `next_due_us = frames_pulled * 1_000_000 / sample_rate`.
 - `src/output/icecast_client.rs` is the native Icecast source-protocol client

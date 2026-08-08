@@ -3,7 +3,7 @@ pub mod playlist;
 
 use symphonia::core::audio::SignalSpec;
 
-use crate::resample::LinearResampler;
+use crate::resample::SincResampler;
 
 /// A uniform pull-based interface for any audio input.
 ///
@@ -97,7 +97,7 @@ pub fn convert_channels(samples: &[f32], from: usize, to: usize) -> Vec<f32> {
 /// PCM into the target bus `SignalSpec`.
 pub struct PcmConverter {
     target: SignalSpec,
-    resampler: Option<LinearResampler>,
+    resampler: Option<SincResampler>,
     in_rate: u32,
 }
 
@@ -126,14 +126,14 @@ impl PcmConverter {
             return converted;
         }
         if self.resampler.is_none() || self.in_rate != spec.rate {
-            self.resampler = Some(LinearResampler::new(24, spec.rate, self.target.rate, to_ch));
+            self.resampler = Some(SincResampler::new(24, spec.rate, self.target.rate, to_ch));
             self.in_rate = spec.rate;
         }
         self.resampler.as_mut().unwrap().resample(&converted).to_vec()
     }
 
     /// Drain any samples remaining inside the resampler (call at EOF).
-    /// Linear interpolation has no tail, so this is a no-op.
+    /// The sinc filter emits every sample during `convert`, so this is a no-op.
     pub fn flush(&mut self) -> Vec<f32> {
         self.resampler
             .as_mut()

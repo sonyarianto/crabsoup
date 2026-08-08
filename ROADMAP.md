@@ -54,4 +54,6 @@
 
 ## Next up
 - [ ] Preview mode via `--preview`? (currently only by omitting `output.icecast` in the script)
-- [ ] Opus resampler is linear-interp only (48 kHz fixed); note: Opus path resamples bus -> 48 kHz
+- [x] Opus resampler upgraded: 16-tap Hann-windowed sinc polyphase FIR (256 phases),
+      DC-normalized per output sample so chunk edges and stream edges stay
+      unity-gain; `PcmConverter` (bus normalization) uses the same filter.
