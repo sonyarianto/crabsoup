@@ -1,6 +1,6 @@
 -- Crabsoup example script.
 --
--- Copy to `crabsoup.liq` (the default path) and adjust to taste.
+-- Copy to `crabsoup.lua` (the default path) and adjust to taste.
 -- This is plain Lua with Liquidsoap-flavoured names; `{key = value}`
 -- tables are how named options are passed.
 
