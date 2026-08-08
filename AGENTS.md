@@ -71,7 +71,16 @@ is that Playlist input; all sources are normalised to the PCM bus
   `next_due_us = frames_pulled * 1_000_000 / sample_rate`.
 - `src/output/icecast_client.rs` is the native Icecast source-protocol client
   (no libshout): one authenticated `SOURCE` request, then raw encoded bytes;
-  titles go out on separate authenticated `/admin/metadata` GETs. One request
+  titles go out on separate authenticated `/admin/metadata` GETs. Icecast
+  rejects URL metadata updates for Opus mounts (HTTP 200 + "Mountpoint will
+  not accept URL updates"), so Opus titles ride the stream header instead:
+  the initial OpusTags carries the first track’s title (set_title replaces
+  it until the headers flush, then no-ops). Icecast 2.4.4 never parses
+  OpusTags titles at all; 2.5+ parses only the stream-start header and
+  requires type-less packets (no RFC 7845 packet-type byte — ffmpeg writes
+  them type-less too). Never inject comment pages mid-stream: Icecast
+  forwards them to listeners as audio, producing decoder warnings. One
+  request
   per operation — no libshout capability negotiation, no unauthenticated
   401 probe, no `!POKE`.
 

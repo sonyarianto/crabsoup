@@ -54,7 +54,7 @@ impl IcecastClient {
         );
         stream.write_all(request.as_bytes())?;
 
-        let (status, message) = read_response_head(&mut stream)?;
+        let (status, message, _) = read_response_head(&mut stream)?;
         if !(200..300).contains(&status) {
             return Err(format!(
                 "Icecast rejected source on {}: HTTP {status} {message}",
@@ -72,7 +72,9 @@ impl IcecastClient {
     }
 
     /// Update the "now playing" title via `/admin/metadata` on a fresh
-    /// connection (the source connection must stay clean).
+    /// connection (the source connection must stay clean). Icecast replies
+    /// HTTP 200 even when it rejects the update, so the response body is
+    /// checked for the rejection message.
     pub fn update_title(config: &OutputConfig, title: &str) -> Result<()> {
         let params = format!(
             "mode=updinfo&charset=UTF-8&mount={}&song={}",
@@ -93,9 +95,13 @@ impl IcecastClient {
         stream.set_read_timeout(Some(IO_TIMEOUT))?;
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
         stream.write_all(request.as_bytes())?;
-        let (status, _) = read_response_head(&mut stream)?;
+        let (status, _, body) = read_response_head(&mut stream)?;
         if !(200..300).contains(&status) {
             return Err(format!("Icecast metadata update failed: HTTP {status}").into());
+        }
+        let text = String::from_utf8_lossy(&body);
+        if text.contains("will not accept") {
+            return Err(format!("Icecast refused the title update: {}", text.trim()).into());
         }
         Ok(())
     }
@@ -105,9 +111,9 @@ fn basic_auth(user: &str, password: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"))
 }
 
-/// Read the response head (everything up to `\r\n\r\n`) and return the
-/// numeric status and the reason phrase.
-fn read_response_head(stream: &mut TcpStream) -> Result<(u16, String)> {
+/// Read the response head (up to `\r\n\r\n`), then drain the body promised by
+/// `Content-Length`. Returns `(status, reason phrase, body)`.
+fn read_response_head(stream: &mut TcpStream) -> Result<(u16, String, Vec<u8>)> {
     let mut buf = Vec::new();
     let mut byte = [0u8; 1];
     while !buf.ends_with(b"\r\n\r\n") && buf.len() < 65536 {
@@ -122,7 +128,20 @@ fn read_response_head(stream: &mut TcpStream) -> Result<(u16, String)> {
     let _version = parts.next();
     let status: u16 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let message = parts.next().unwrap_or_default().trim().to_string();
-    Ok((status, message))
+
+    let mut body = Vec::new();
+    for line in head.lines().skip(1) {
+        if let Some((k, v)) = line.split_once(':')
+            && k.trim().eq_ignore_ascii_case("content-length")
+            && let Ok(len) = v.trim().parse::<usize>()
+            && len > 0
+        {
+            let mut out = vec![0u8; len];
+            let _ = stream.read_exact(&mut out);
+            body = out;
+        }
+    }
+    Ok((status, message, body))
 }
 
 /// RFC 3986 percent-encoding (unreserved chars pass through, everything else
@@ -251,6 +270,24 @@ mod tests {
             head.contains("Authorization: Basic c291cmNlOmhhY2ttZQ==\r\n"),
             "{head}"
         );
+    }
+
+    #[test]
+    fn update_title_detects_icecast_rejection() {
+        // Icecast answers HTTP 200 even when refusing (Opus mounts); only the
+        // body reveals the rejection.
+        let body = "<?xml version=\"1.0\"?><iceresponse><message>Mountpoint will not accept URL updates</message><return>1</return></iceresponse>";
+        let reply = format!(
+            "HTTP/1.0 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let server = FakeIcecast::new();
+        let port = server.port();
+        thread::spawn(move || server.serve_once(Box::leak(reply.into_boxed_str())));
+        let err = IcecastClient::update_title(&test_config(port), "track").unwrap_err();
+        assert!(err.to_string().contains("refused"), "{err}");
+        assert!(err.to_string().contains("will not accept"), "{err}");
     }
 
     #[test]

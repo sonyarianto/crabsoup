@@ -148,7 +148,8 @@ pub fn opus_head_packet(channels: u16) -> Vec<u8> {
     p
 }
 
-/// Build an `OpusTags` comment packet.
+/// Build an `OpusTags` comment packet (RFC 7845 §5.2: the comment block ends
+/// with a one-byte framing bit 0x01).
 pub fn opus_tags_packet(title: &str) -> Vec<u8> {
     let mut p = Vec::new();
     p.extend_from_slice(b"OpusTags");
@@ -160,6 +161,7 @@ pub fn opus_tags_packet(title: &str) -> Vec<u8> {
     p.extend_from_slice(&1u32.to_le_bytes()); // one comment
     p.extend_from_slice(&(comment.len() as u32).to_le_bytes());
     p.extend_from_slice(comment.as_bytes());
+    p.push(1); // framing bit
     p
 }
 
@@ -226,6 +228,17 @@ mod tests {
         assert_eq!(segment_table(255), vec![255, 0]);
         assert_eq!(segment_table(256), vec![255, 1]);
         assert_eq!(segment_table(300), vec![255, 45]);
+    }
+
+    #[test]
+    fn opus_tags_packet_has_framing_bit() {
+        // RFC 7845 §5.2: the comment header ends with a one-byte framing bit.
+        let p = opus_tags_packet("Some Track");
+        assert_eq!(p.last(), Some(&1));
+        assert!(String::from_utf8_lossy(&p).contains("title=Some Track"));
+        // magic + vendor len + vendor + count + comment len + comment + framing bit
+        let expected = 8 + 4 + 8 + 4 + 4 + "title=Some Track".len() + 1;
+        assert_eq!(p.len(), expected);
     }
 
     #[test]

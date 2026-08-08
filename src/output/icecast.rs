@@ -132,11 +132,26 @@ impl IcecastOutput {
     fn update_metadata(&mut self) {
         let title = self.source.label().unwrap_or_default();
         if title != self.last_title {
-            if let Err(e) = IcecastClient::update_title(&self.config, &title) {
-                log::warn!("icecast metadata update failed: {e}");
-            }
             self.last_title = title.clone();
             log::info!("icecast: now playing {title}");
+            match self.config.format {
+                // Opus mounts reject Icecast's URL metadata endpoint, and
+                // Icecast parses OpusTags only as stream headers (2.5+); the
+                // pre-flush set_title below gets the first track into them.
+                OutputFormat::Opus => {
+                    if let Some(encoder) = self.encoder.as_mut() {
+                        let tags = encoder.set_title(&title);
+                        if !tags.is_empty() {
+                            self.send_or_reconnect(&tags);
+                        }
+                    }
+                }
+                OutputFormat::Mp3 => {
+                    if let Err(e) = IcecastClient::update_title(&self.config, &title) {
+                        log::warn!("icecast metadata update failed: {e}");
+                    }
+                }
+            }
         }
     }
 

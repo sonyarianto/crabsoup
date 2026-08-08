@@ -29,8 +29,16 @@
 
 ## Next up
 - [ ] Live DJ harbor end-to-end verification (PUT a real stream at `/live`, check auto-duck on connect/disconnect)
-- [ ] Opus stream title: verify whether Icecast's `/admin/metadata` is enough for
-      Opus mounts now that libshout is gone (the old soak test saw no mid-stream
-      OpusTags updates); insert an OpusTags comment page ourselves if needed
+- [x] Opus stream title: investigated to the source. Icecast 2.4.4 never parses
+      OpusTags titles (format_opus.c counts header packets only) and rejects URL
+      metadata updates for Opus mounts (HTTP 200 + "Mountpoint will not accept
+      URL updates"); Icecast 2.5+/master parses only the initial OpusTags header
+      (type-less packets only; set_tag is NULL for Ogg there too). So the Opus
+      encoder sends OpusHead+OpusTags stream headers containing the first
+      track's title (replaced via set_title before the first flush), and never
+      injects mid-stream comment pages (Icecast forwards those to listeners as
+      audio). Verified live: ffprobe reads `title=` from the stream's first
+      OpusTags; MP3 keeps live URL titles; icecast 2.4.4 status-json stays
+      title-less for Opus (documented server limitation).
 - [ ] Preview mode via `--preview`? (currently only by omitting `output.icecast` in the script)
 - [ ] Opus resampler is linear-interp only (48 kHz fixed); note: Opus path resamples bus -> 48 kHz

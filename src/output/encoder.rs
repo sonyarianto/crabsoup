@@ -20,6 +20,12 @@ pub trait Encoder: Send {
 
     /// Drain any trailing encoder / muxer state at end of stream.
     fn finish(&mut self) -> Vec<u8>;
+
+    /// Emit an in-stream title update, returning the bytes to send to the
+    /// server (empty when the format has no in-stream mechanism).
+    fn set_title(&mut self, _title: &str) -> Vec<u8> {
+        Vec::new()
+    }
 }
 
 pub fn create_encoder(
@@ -182,6 +188,9 @@ pub struct OpusEncoder {
     /// Accumulated 48 kHz interleaved PCM awaiting a full Opus frame.
     pcm: Vec<i16>,
     granule: i64,
+    /// Header pages (OpusHead + OpusTags) still queued; replaced by
+    /// `set_title` while pending and emitted with the first encoded audio.
+    pending_headers: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 unsafe impl Send for OpusEncoder {}
@@ -215,8 +224,10 @@ impl OpusEncoder {
         // Headers go out as their own pages before any audio.
         mux.write_packet(&opus_head_packet(channels.min(2)), 0);
         mux.flush();
+        let head_page = mux.take_output();
         mux.write_packet(&opus_tags_packet(title), 0);
         mux.flush();
+        let tags_page = mux.take_output();
 
         Ok(Self {
             encoder,
@@ -225,11 +236,16 @@ impl OpusEncoder {
             mux,
             pcm: Vec::new(),
             granule: 0,
+            pending_headers: Some((head_page, tags_page)),
         })
     }
 
     fn encode_frames(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
+        if let Some((head, tags)) = self.pending_headers.take() {
+            out.extend_from_slice(&head);
+            out.extend_from_slice(&tags);
+        }
         let need = OPUS_FRAME_SAMPLES * self.channels;
         let mut encode_buf = vec![0u8; 1276];
 
@@ -280,6 +296,24 @@ impl Encoder for OpusEncoder {
         out.extend_from_slice(&self.mux.take_output());
         out
     }
+
+    /// Replace the queued OpusTags header title. Icecast parses OpusTags
+    /// only as stream headers (and only on 2.5+), so once the headers are
+    /// emitted any later call is a no-op: mid-stream comment pages would be
+    /// forwarded to listeners as audio, and URL updates are rejected.
+    fn set_title(&mut self, title: &str) -> Vec<u8> {
+        if self.pending_headers.is_some() {
+            let mut mux = OggMuxer::new(OPUS_SERIAL);
+            mux.write_packet(&opus_head_packet(self.channels.min(2) as u16), 0);
+            mux.flush();
+            let head_page = mux.take_output();
+            mux.write_packet(&opus_tags_packet(title), 0);
+            mux.flush();
+            let tags_page = mux.take_output();
+            self.pending_headers = Some((head_page, tags_page));
+        }
+        Vec::new()
+    }
 }
 
 #[cfg(test)]
@@ -316,6 +350,44 @@ mod tests {
         let s = String::from_utf8_lossy(&bytes);
         assert!(s.contains("OpusHead"));
         assert!(s.contains("OpusTags"));
+    }
+    #[test]
+    fn opus_set_title_replaces_initial_tags_only() {
+        // Before the headers are flushed, set_title changes the initial title.
+        let mut enc = OpusEncoder::new(44100, 2, 128_000, "initial").unwrap();
+        enc.set_title("the real first track");
+        let pcm = vec![0f32; 4410 * 2];
+        let all = [enc.encode(&pcm), enc.encode(&pcm), enc.finish()].concat();
+        assert!(String::from_utf8_lossy(&all).contains("title=the real first track"));
+        // Exactly one OpusTags packet: the header. set_title never injects
+        // mid-stream pages.
+        assert_eq!(String::from_utf8_lossy(&all).matches("OpusTags").count(), 1);
+        // Page sequence numbers are contiguous.
+        let pages = split_pages(&all);
+        for (i, p) in pages.iter().enumerate() {
+            let seq = u32::from_le_bytes(p[18..22].try_into().unwrap());
+            assert_eq!(seq, i as u32, "seq at page {i}");
+        }
+        // After the first encode, set_title is a no-op.
+        enc.set_title("later");
+        let all = [enc.encode(&pcm), enc.finish()].concat();
+        assert!(!String::from_utf8_lossy(&all).contains("title=later"));
+    }
+
+    fn split_pages(bytes: &[u8]) -> Vec<Vec<u8>> {
+        let mut pages = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            assert_eq!(&bytes[i..i + 4], b"OggS");
+            let nsegs = bytes[i + 26] as usize;
+            let segs = &bytes[i + 27..i + 27 + nsegs];
+            let body_len: usize = segs.iter().map(|&s| s as usize).sum();
+            let page = &bytes[i..i + 27 + nsegs + body_len];
+            pages.push(page.to_vec());
+            i += page.len();
+        }
+        assert_eq!(i, bytes.len());
+        pages
     }
 }
 
