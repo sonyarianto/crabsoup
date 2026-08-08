@@ -163,7 +163,7 @@ impl IcecastOutput {
             let elapsed_us = start.elapsed().as_micros() as u64;
             let next_due_us = frames_pulled * 1_000_000 / self.sample_rate as u64;
             if elapsed_us < next_due_us {
-                std::thread::sleep(Duration::from_micros((next_due_us - elapsed_us) as u64));
+                std::thread::sleep(Duration::from_micros(next_due_us - elapsed_us));
             }
 
             let n = self.source.next_buffer(&mut buf);

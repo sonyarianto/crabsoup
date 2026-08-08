@@ -157,6 +157,7 @@ impl Default for LiveConfig {
 /// One-shot jingles played over the music via `MixCommand::PlayJingle`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct JingleConfig {
     /// Recursively scanned directory of audio files.
     pub directory: Option<PathBuf>,
@@ -164,14 +165,6 @@ pub struct JingleConfig {
     pub files: Vec<PathBuf>,
 }
 
-impl Default for JingleConfig {
-    fn default() -> Self {
-        Self {
-            directory: None,
-            files: Vec::new(),
-        }
-    }
-}
 
 /// Liquidsoap-style telnet control port.
 #[derive(Debug, Clone, Serialize, Deserialize)]
