@@ -92,6 +92,7 @@ impl IcecastOutput {
         match self.config.format {
             OutputFormat::Mp3 => "MP3",
             OutputFormat::Opus => "Ogg/Opus",
+            OutputFormat::Aac => "AAC",
         }
     }
 
@@ -164,6 +165,8 @@ impl IcecastOutput {
                         log::warn!("icecast metadata update failed: {e}");
                     }
                 }
+                // ADTS has no in-stream title mechanism; nothing to send.
+                OutputFormat::Aac => {}
             }
         }
     }

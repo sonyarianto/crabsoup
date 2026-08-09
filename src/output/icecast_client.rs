@@ -32,6 +32,7 @@ impl IcecastClient {
         let content_type = match config.format {
             OutputFormat::Mp3 => "audio/mpeg",
             OutputFormat::Opus => "audio/ogg",
+            OutputFormat::Aac => "audio/aac",
         };
         let request = format!(
             "SOURCE {} HTTP/1.0\r\n\

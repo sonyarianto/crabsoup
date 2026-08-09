@@ -6,7 +6,7 @@ live in `docs/ARCHITECTURE.md`; the plan and ship history in `ROADMAP.md`.
 ## Project
 
 Crabsoup: Rust audio streaming engine (Rust 2024 edition) — gapless playlist,
-crossfades, live DJ ducking, one-shot jingles, MP3/Opus broadcast to Icecast.
+crossfades, live DJ ducking, one-shot jingles, MP3/Opus/AAC broadcast to Icecast.
 
 ## Commands
 

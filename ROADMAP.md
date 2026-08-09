@@ -161,12 +161,12 @@ no contention with Part B.
 - [ ] **C1 — `output.file` + multi-mount `output.icecast`** (needs A1;
       multi-mount landed with Part A; `output.file` landed as its own
       commit — see Done section).
-- [ ] **C2 — AAC encoder** (no dependency, can start immediately): new
+- [x] **C2 — AAC encoder** (no dependency, can start immediately): new
       `Encoder` impl, FFI to `fdk-aac` following the LAME `unsafe extern
       "C"` template (opaque handle, explicit `Drop`, `unsafe impl Send` with
       justification). Raw ADTS framing over the existing `IcecastClient`;
       `audio/aac` content-type branch next to the MP3/Opus branches. Low
-      risk, runnable alongside Phase 2.
+      risk, runnable alongside Phase 2. (Landed — see Done section.)
 - [ ] **C3 — HLS output** (needs C2): new module — segmenter rotating the
       encoder output into fixed-length chunks (4–6s), `.m3u8` media playlist
       writer, segment lifecycle (naming, retention window, cleanup). AAC is
@@ -215,6 +215,19 @@ practice).
       missing path, and mixed-root rejection. Verified live: mp3 (44.1 kHz)
       + Opus (48 kHz) recordings from a 25 s broadcast decode cleanly with
       ffprobe and close on telnet shutdown; broadcast unaffected.
+- [x] C2 (AAC encoder): `AacEncoder` in `src/output/encoder.rs` — FFI to
+      `fdk-aac` following the LAME `unsafe extern "C"` template (opaque
+      handle, explicit `Drop`, `unsafe impl Send`). Raw ADTS framing, set
+      via `AACENC_TRANSMUX`/`TT_MP4_ADTS`; AAC-LC, mono/stereo, bitrate in
+      bits/s, 44.1 kHz native (no resampler needed). FDK consumes at most
+      one frame per `aacEncEncode` call (excess input silently dropped), so
+      `encode` loops on the leftover, honoring `numInSamples`; `finish`
+      drains with `numInSamples = -1` until `AACENC_ENCODE_EOF`. Built
+      from source into `/usr/local` (no distro package; `build.rs` adds the
+      link path). `audio/aac` content-type branch next to MP3/Opus;
+      ADTS has no in-stream title mechanism, so `set_title` stays a no-op.
+      `output.file` + Icecast mount verified live: ffprobe decodes the
+      file and the `/c2.aac` mount at 44.1 kHz stereo 128 kbps.
 - [x] Part A (engine tap + Lua event loop, one PR): `src/engine/tap.rs` —
       `EngineTap` owns the root source on its own thread and publishes each
       wall-clock-paced buffer as `Arc<AudioFrame { pcm, label }>` to N

@@ -111,6 +111,8 @@ pub enum OutputFormat {
     #[default]
     Mp3,
     Opus,
+    /// Raw ADTS AAC (FDK-AAC encoder).
+    Aac,
 }
 
 #[derive(Debug, Clone)]

@@ -15,8 +15,8 @@ Opus) to an Icecast server.
   playlist ducks out while a DJ is live and fades back in on disconnect
 - Jingles: one-shot clips played over the music, triggered from a
   Liquidsoap-style telnet control port
-- Output: MP3 (via LAME) or Ogg/Opus (via libopus + a built-in Ogg muxer with
-  spec-correct CRC-32)
+- Output: MP3 (via LAME), Ogg/Opus (via libopus + a built-in Ogg muxer with
+  spec-correct CRC-32), or AAC/ADTS (via fdk-aac)
 - Graceful Ctrl-C shutdown
 
 ## Architecture
@@ -29,8 +29,9 @@ media/ + jingles/
    │   (decoded via symphonia)
    ▼
 Playlist ──► CrossfadeMixer ──► PriorityMixer ──► Encoder ──► Icecast
-               (track overlap)  (live/jingle     (LAME or     (native source
-                                 override)        libopus+Ogg)  protocol)
+               (track overlap)  (live/jingle     (LAME,      (native source
+                                  override)       libopus+Ogg,  protocol)
+                                                  or fdk-aac)
 ```
 
 The script's root source (e.g. `fallback({jingle, live, playlist})`) becomes
@@ -50,7 +51,7 @@ Source layout:
 | `src/source/` | `FileSource`, `Playlist` (scheduling), source composition |
 | `src/engine/` | `CrossfadeMixer`, `PriorityMixer`, `MixCommand` |
 | `src/live/` | DJ harbor (Icecast source protocol listener) |
-| `src/output/` | `encoder.rs` (LAME/libopus), `ogg_mux.rs`, `icecast_client.rs` (native source protocol), `icecast.rs` (pump + reconnect) |
+| `src/output/` | `encoder.rs` (LAME/libopus/fdk-aac), `ogg_mux.rs`, `icecast_client.rs` (native source protocol), `icecast.rs` (pump + reconnect) |
 
 ## Building
 
@@ -58,6 +59,10 @@ Requires Rust (edition 2024) and the dev packages for the native codecs:
 
 ```sh
 sudo apt install libmp3lame-dev libopus-dev   # Debian/Ubuntu
+# fdk-aac has no Debian/Ubuntu package: build from source into /usr/local
+# (build.rs links against it there):
+#   git clone https://github.com/mstorsjo/fdk-aac && cd fdk-aac
+#   ./autogen.sh && ./configure --prefix=/usr/local && make && sudo make install
 cargo build --release
 ```
 
@@ -75,6 +80,7 @@ Per-format test scripts live in `examples/`:
 ```sh
 ./target/release/crabsoup -c examples/crabsoup.opus.lua    # Opus -> /crabsoup.opus
 ./target/release/crabsoup -c examples/crabsoup.mp3.lua     # MP3  -> /crabsoup.mp3
+./target/release/crabsoup -c examples/crabsoup.aac.lua     # AAC  -> /crabsoup.aac
 ./target/release/crabsoup -c examples/crabsoup.preview.lua # no broadcast
 ```
 

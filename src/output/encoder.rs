@@ -2,7 +2,7 @@
 //! Ogg/Opus (via libopus + a built-in Ogg muxer). libshout then transports the
 //! encoded bytes to Icecast.
 
-use std::ffi::c_int;
+use std::ffi::{c_int, c_uint, c_void};
 use std::ptr;
 
 use crate::config::OutputFormat;
@@ -40,6 +40,7 @@ pub fn create_encoder(
         OutputFormat::Opus => Ok(Box::new(OpusEncoder::new(
             sample_rate, channels, bitrate, title,
         )?)),
+        OutputFormat::Aac => Ok(Box::new(AacEncoder::new(sample_rate, channels, bitrate)?)),
     }
 }
 
@@ -316,6 +317,265 @@ impl Encoder for OpusEncoder {
     }
 }
 
+// ---------------------------------------------------------------------------
+// AAC (FDK-AAC FFI, ADTS transport)
+// ---------------------------------------------------------------------------
+
+// Opaque FDK-AAC encoder handle; only ever used behind a pointer.
+#[repr(C)]
+struct AacEncoderRaw {
+    _unused: [u8; 1],
+}
+
+// Error / result codes (aacenc_lib.h).
+const AACENC_OK: c_int = 0x0000;
+const AACENC_ENCODE_EOF: c_int = 0x0080;
+// Parameter IDs (AACENC_PARAM).
+const AACENC_AOT: c_uint = 0x0100;
+const AACENC_BITRATE: c_uint = 0x0101;
+const AACENC_SAMPLERATE: c_uint = 0x0103;
+const AACENC_CHANNELMODE: c_uint = 0x0106;
+const AACENC_TRANSMUX: c_uint = 0x0300;
+// Parameter values.
+const AOT_AAC_LC: c_uint = 2;
+const MODE_1: c_uint = 1; // mono
+const MODE_2: c_uint = 2; // stereo
+const TT_MP4_ADTS: c_uint = 2;
+// Buffer identifiers (AACENC_BufferIdentifier).
+const IN_AUDIO_DATA: c_int = 0;
+const OUT_BITSTREAM_DATA: c_int = 3;
+
+#[repr(C)]
+struct AacBufDesc {
+    num_bufs: c_int,
+    bufs: *mut *mut c_void,
+    buffer_identifiers: *mut c_int,
+    buf_sizes: *mut c_int,
+    buf_el_sizes: *mut c_int,
+}
+
+#[repr(C)]
+struct AacInArgs {
+    num_in_samples: c_int,
+    num_anc_bytes: c_int,
+}
+
+#[repr(C)]
+struct AacOutArgs {
+    num_out_bytes: c_int,
+    num_in_samples: c_int,
+    num_anc_bytes: c_int,
+    bit_res_state: c_int,
+}
+
+#[repr(C)]
+struct AacInfoStruct {
+    max_out_buf_bytes: c_uint,
+    max_anc_bytes: c_uint,
+    in_buf_fill_level: c_uint,
+    input_channel_mask: c_uint,
+    frame_size: c_uint,
+    encoder_delay: c_uint,
+    encoder_nb_samples: c_uint,
+    conf_buf: [u8; 64],
+    conf_size: c_uint,
+}
+
+#[link(name = "fdk-aac")]
+unsafe extern "C" {
+    fn aacEncOpen(
+        handle: *mut *mut AacEncoderRaw,
+        modules: c_uint,
+        max_channels: c_uint,
+    ) -> c_int;
+    fn aacEncClose(handle: *mut *mut AacEncoderRaw) -> c_int;
+    fn aacEncoder_SetParam(handle: *mut AacEncoderRaw, param: c_uint, value: c_uint) -> c_int;
+    fn aacEncEncode(
+        handle: *mut AacEncoderRaw,
+        in_desc: *const AacBufDesc,
+        out_desc: *const AacBufDesc,
+        in_args: *const AacInArgs,
+        out_args: *mut AacOutArgs,
+    ) -> c_int;
+    fn aacEncInfo(handle: *mut AacEncoderRaw, info: *mut AacInfoStruct) -> c_int;
+}
+
+pub struct AacEncoder {
+    handle: *mut AacEncoderRaw,
+    out_buf_size: usize,
+}
+
+unsafe impl Send for AacEncoder {}
+
+impl AacEncoder {
+    pub fn new(sample_rate: u32, channels: u16, bitrate: u32) -> Result<Self> {
+        let mut handle = ptr::null_mut();
+        let status = unsafe { aacEncOpen(&mut handle, 0, channels.max(1) as c_uint) };
+        if status != AACENC_OK || handle.is_null() {
+            return Err(format!("aacEncOpen failed: {status:#x}").into());
+        }
+        let ch_mode = if channels == 1 { MODE_1 } else { MODE_2 };
+        if channels > 2 {
+            log::warn!("AAC only supports mono/stereo; encoding {} channels", channels);
+        }
+        let ok = unsafe {
+            aacEncoder_SetParam(handle, AACENC_AOT, AOT_AAC_LC)
+                | aacEncoder_SetParam(handle, AACENC_SAMPLERATE, sample_rate)
+                | aacEncoder_SetParam(handle, AACENC_CHANNELMODE, ch_mode)
+                | aacEncoder_SetParam(handle, AACENC_BITRATE, bitrate)
+                | aacEncoder_SetParam(handle, AACENC_TRANSMUX, TT_MP4_ADTS)
+        };
+        if ok != AACENC_OK {
+            unsafe { aacEncClose(&mut handle) };
+            return Err(format!("aacEncoder_SetParam failed: {ok:#x}").into());
+        }
+        // Trigger the internal (re)configuration before querying info.
+        let status = unsafe {
+            aacEncEncode(
+                handle,
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null_mut(),
+            )
+        };
+        if status != AACENC_OK {
+            unsafe { aacEncClose(&mut handle) };
+            return Err(format!("aacEncEncode init failed: {status:#x}").into());
+        }
+        let mut info: AacInfoStruct = unsafe { std::mem::zeroed() };
+        let status = unsafe { aacEncInfo(handle, &mut info) };
+        if status != AACENC_OK {
+            unsafe { aacEncClose(&mut handle) };
+            return Err(format!("aacEncInfo failed: {status:#x}").into());
+        }
+        // FDK's documented max; clamp so small configs stay usable.
+        let out_buf_size = (info.max_out_buf_bytes as usize).max(8192);
+        Ok(Self { handle, out_buf_size })
+    }
+
+    /// Run one `aacEncEncode` call. FDK consumes at most one frame's worth of
+    /// input per call (`nSamplesToRead - nSamplesRead`); the caller must loop
+    /// and feed any leftover input, using the reported `numInSamples`.
+    fn encode_call(&mut self, pcm: &[i16], eof: bool) -> (Vec<u8>, c_int, c_int) {
+        let mut out = vec![0u8; self.out_buf_size];
+        let mut in_ptr: *mut c_void = if eof {
+            ptr::null_mut()
+        } else {
+            pcm.as_ptr() as *mut c_void
+        };
+        let mut in_id = IN_AUDIO_DATA;
+        let mut in_size = pcm.len().saturating_mul(2) as c_int;
+        let mut in_el = 2;
+        let in_desc = AacBufDesc {
+            num_bufs: 1,
+            bufs: &mut in_ptr,
+            buffer_identifiers: &mut in_id,
+            buf_sizes: &mut in_size,
+            buf_el_sizes: &mut in_el,
+        };
+        let mut out_ptr: *mut c_void = out.as_mut_ptr() as *mut c_void;
+        let mut out_id = OUT_BITSTREAM_DATA;
+        let mut out_size = out.len() as c_int;
+        let mut out_el = 1;
+        let out_desc = AacBufDesc {
+            num_bufs: 1,
+            bufs: &mut out_ptr,
+            buffer_identifiers: &mut out_id,
+            buf_sizes: &mut out_size,
+            buf_el_sizes: &mut out_el,
+        };
+        // numInSamples == -1 drains the encoder's internal buffer.
+        let in_args = AacInArgs {
+            num_in_samples: if eof { -1 } else { pcm.len() as c_int },
+            num_anc_bytes: 0,
+        };
+        let mut out_args = AacOutArgs {
+            num_out_bytes: 0,
+            num_in_samples: 0,
+            num_anc_bytes: 0,
+            bit_res_state: 0,
+        };
+        let status = unsafe {
+            aacEncEncode(
+                self.handle,
+                if eof { ptr::null() } else { &in_desc },
+                &out_desc,
+                &in_args,
+                &mut out_args,
+            )
+        };
+        if status != AACENC_OK && status != AACENC_ENCODE_EOF {
+            log::warn!("aacEncEncode failed: {status:#x}");
+        }
+        out.truncate(out_args.num_out_bytes.max(0) as usize);
+        (out, status, out_args.num_in_samples.max(0))
+    }
+}
+
+impl Encoder for AacEncoder {
+    fn content_type(&self) -> &'static str {
+        "audio/aac"
+    }
+
+    fn encode(&mut self, pcm: &[f32]) -> Vec<u8> {
+        let mut i16buf = Vec::with_capacity(pcm.len());
+        for &s in pcm {
+            i16buf.push(clamp_i16(s));
+        }
+        let mut out = Vec::new();
+        let mut remaining: &[i16] = &i16buf;
+        let mut guard = 0;
+        while !remaining.is_empty() {
+            let (chunk, status, consumed) = self.encode_call(remaining, false);
+            out.extend_from_slice(&chunk);
+            if status != AACENC_OK {
+                break;
+            }
+            if consumed == 0 {
+                log::warn!("aacEncEncode consumed no input; giving up");
+                break;
+            }
+            remaining = &remaining[consumed as usize..];
+            guard += 1;
+            if guard > 1_000_000 {
+                log::warn!("aacEncEncode loop guard hit");
+                break;
+            }
+        }
+        out
+    }
+
+    fn finish(&mut self) -> Vec<u8> {
+        // FDK-AAC drains via repeated calls with numInSamples == -1 until it
+        // reports AACENC_ENCODE_EOF.
+        let mut out = Vec::new();
+        let mut guard = 0;
+        loop {
+            let (chunk, status, _) = self.encode_call(&[], true);
+            out.extend_from_slice(&chunk);
+            if status == AACENC_ENCODE_EOF {
+                break;
+            }
+            guard += 1;
+            if guard > 1_000_000 {
+                log::warn!("aacEncEncode flush loop guard hit");
+                break;
+            }
+        }
+        out
+    }
+}
+
+impl Drop for AacEncoder {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe { aacEncClose(&mut self.handle) };
+            self.handle = ptr::null_mut();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,6 +632,22 @@ mod tests {
         enc.set_title("later");
         let all = [enc.encode(&pcm), enc.finish()].concat();
         assert!(!String::from_utf8_lossy(&all).contains("title=later"));
+    }
+
+    #[test]
+    fn aac_encoder_produces_adts_stream() {
+        let mut enc = AacEncoder::new(44100, 2, 128_000).unwrap();
+        let mut pcm = vec![0f32; 44100 * 2]; // 1 second
+        for (i, s) in pcm.iter_mut().enumerate() {
+            let t = i as f64 / 44100.0;
+            *s = (2.0 * std::f64::consts::PI * 440.0 * t).sin() as f32 * 0.5;
+        }
+        let mut bytes = enc.encode(&pcm);
+        bytes.extend_from_slice(&enc.finish());
+        assert!(!bytes.is_empty());
+        // ADTS frames start with the 0xFFF sync word.
+        assert_eq!(bytes[0], 0xFF);
+        assert_eq!(bytes[1] >> 4, 0xF);
     }
 
     fn split_pages(bytes: &[u8]) -> Vec<Vec<u8>> {

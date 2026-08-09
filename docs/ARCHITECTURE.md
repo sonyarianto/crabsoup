@@ -71,6 +71,19 @@ One engine thread plus one thread per output:
 encode 20 ms frames, mux one Ogg page per packet, flush per packet so audio
 reaches Icecast promptly.
 
+## AAC path
+
+`AacEncoder` (`src/output/encoder.rs`) wraps FDK-AAC via FFI (same opaque
+handle + explicit `Drop` template as LAME): AAC-LC, mono/stereo, bitrate in
+bits/s, raw ADTS transport (`AACENC_TRANSMUX`/`TT_MP4_ADTS`). 44.1 kHz needs
+no resampler. FDK consumes **at most one frame's worth of input per
+`aacEncEncode` call** (`nSamplesToRead - nSamplesRead`; excess is silently
+dropped), so `encode` loops on the leftover using the reported
+`numInSamples`, and `finish` drains with `numInSamples = -1` until
+`AACENC_ENCODE_EOF`. ADTS has no in-stream title mechanism — `set_title`
+stays the trait no-op. fdk-aac has no distro package; it's built from source
+into `/usr/local` and `build.rs` adds the link path.
+
 ## Icecast client (`src/output/icecast_client.rs`)
 
 - Native source-protocol client (no libshout): one authenticated `SOURCE`

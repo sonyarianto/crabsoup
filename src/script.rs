@@ -702,8 +702,9 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         match value {
             "mp3" => Ok(OutputFormat::Mp3),
             "opus" => Ok(OutputFormat::Opus),
+            "aac" => Ok(OutputFormat::Aac),
             other => Err(mlua::Error::runtime(format!(
-                "unknown output format {other:?} (use \"mp3\" or \"opus\")"
+                "unknown output format {other:?} (use \"mp3\", \"opus\" or \"aac\")"
             ))),
         }
     }
