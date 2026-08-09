@@ -6,8 +6,9 @@ input and one-shot jingles with crossfades, and broadcasts the result (MP3 or
 Opus) to an Icecast server.
 
 - `.lua` scripting: real Lua with Liquidsoap-style functions — `playlist`,
-  `single`, `fallback`, `sequence`, `random`, `jingles`, `input.harbor`,
-  `output.icecast`, `output.preview`, `server.telnet`, `set`, `log`
+  `single`, `blank`, `sine`, `amplify`, `fallback`, `sequence`, `random`,
+  `jingles`, `input.harbor`, `output.icecast`, `output.preview`,
+  `server.telnet`, `set`, `log`
 - Playlist scheduling: recursive directory scan, explicit file lists, loop and shuffle
 - Gapless crossfades with configurable overlap and fade curve
 - Live DJ harbor: an Icecast source-protocol listener (`PUT /live`); the
@@ -100,8 +101,9 @@ output.icecast({host = "localhost", port = 8000,
 
 Named options are passed as Lua tables; most have defaults. `format` is
 `"mp3"` or `"opus"`. Composable sources: `playlist`, `single`, `jingles`,
-`fallback`/`sequence`, `random` (non-repeating shuffle). `output.preview(...)`
-runs without broadcasting.
+`fallback`/`sequence`, `random` (non-repeating shuffle), `blank`/`sine`
+(test tones, both accept an optional `duration`), and `amplify(source, gain)`.
+`output.preview(...)` runs without broadcasting.
 
 ### Control port
 
@@ -109,10 +111,41 @@ runs without broadcasting.
 printf 'jingles.play\n' | nc localhost 1234   # random jingle
 printf 'jingles.play trance\n' | nc localhost 1234  # by substring
 printf 'jingles.list\n' | nc localhost 1234   # index + path per line
+printf 'skip\n' | nc localhost 1234           # skip the current track
+printf 'status\n' | nc localhost 1234         # current track + uptime
 printf 'shutdown\n' | nc localhost 1234
 ```
 
-Commands: `jingles.list`, `jingles.play [n|substr]`, `shutdown`, `exit`, `help`.
+Commands: `jingles.list`, `jingles.play [n|substr]`, `skip`, `status`,
+`uptime`, `shutdown`, `exit`, `help`.
+
+## Liquidsoap parity map
+
+Approximate `.liq` → `.lua` equivalents, status tracked against
+[ROADMAP.md](ROADMAP.md) (done = shipped and verified; planned = next-up
+phase).
+
+| Liquidsoap (.liq) | Crabsoup (.lua) | Status |
+| --- | --- | --- |
+| `playlist("dir")` | `playlist({directory = "./media", shuffle = true})` | done |
+| `single("file")` | `single("path")` | done |
+| `fallback([...])`, `sequence([...])` | `fallback({...})`, `sequence({...})` | done |
+| `random([...])` | `random({...})` | done |
+| `blank(duration)` | `blank({duration = 2.0})` | done |
+| `sine(freq, duration)` | `sine({freq = 440, duration = 60, amplitude = 0.5})` | done |
+| `amplify(src, gain)` | `amplify(src, 0.5)` | done |
+| `input.harbor(...)` | `input.harbor({...})` | done |
+| `output.icecast(...)` | `output.icecast({...}, src)` | done (single output; multi-mount in Phase 4) |
+| `output.file(...)` | `output.file({path, format}, src)` | planned (Phase 4) |
+| `server.telnet(...)` | `server.telnet({port = 1234})` | done |
+| telnet `skip` / `status` / `uptime` | same | done |
+| live DJ ducking (`mksafe`/`switch` + request scheduling) | `input.harbor` + `PriorityMixer` ducking (harbor connect/disconnect drives the mixer) | done |
+| one-shot jingles (`switch` + request scheduling) | `jingles({directory})` + telnet `jingles.play` | done |
+| `request.queue` + telnet `queue.push` | planned (Phase 3) | planned |
+| `switch` (dayparting), `rotate` | planned (Phase 5) | planned |
+| `on_metadata` / `on_track` | planned (Phase 6) | planned |
+| `http://` request resolution | planned (Phase 7) | planned |
+| `compress` / `normalize` | planned (Phase 2) | planned |
 
 ## Testing
 

@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::{Arc, Mutex};
 
 use symphonia::core::audio::SignalSpec;
 
@@ -40,6 +41,10 @@ pub struct CrossfadeMixer {
     fade_pos: usize,
     tail: Option<Tail>,
     started: bool,
+    /// Reusable scratch buffers, sized on demand so `next_buffer` never
+    /// allocates on the hot path.
+    scratch_a: Vec<f32>,
+    scratch_b: Vec<f32>,
 }
 
 impl CrossfadeMixer {
@@ -62,6 +67,8 @@ impl CrossfadeMixer {
             fade_pos: 0,
             tail: None,
             started: false,
+            scratch_a: Vec::new(),
+            scratch_b: Vec::new(),
         }
     }
 
@@ -76,7 +83,6 @@ impl CrossfadeMixer {
             self.active_label = label;
         }
     }
-
     fn preload_next(&mut self) {
         if self.next.is_none() && self.provider.has_next() {
             let (src, label) = self.provider.next_source();
@@ -106,9 +112,11 @@ impl AudioSource for CrossfadeMixer {
             }
 
             let wanted = buffer.len();
-            let mut a = vec![0f32; wanted];
-            let mut b = vec![0f32; wanted];
-            let n_a = self.active.next_buffer(&mut a);
+            if self.scratch_a.len() != wanted {
+                self.scratch_a.resize(wanted, 0.0);
+                self.scratch_b.resize(wanted, 0.0);
+            }
+            let n_a = self.active.next_buffer(&mut self.scratch_a);
 
             // The active track ended before a successor was preloaded (e.g. it
             // consumed its last data mid-fade or `remaining_seconds` was
@@ -134,7 +142,7 @@ impl AudioSource for CrossfadeMixer {
                 let progress = 1.0 - tail.remaining as f64 / tail.total.max(1) as f64;
                 let ramp = tail.start_gain + (1.0 - tail.start_gain) * progress;
                 for ch in 0..chans {
-                    buffer[f * chans + ch] = (a[f * chans + ch] as f64 * ramp) as f32;
+                    buffer[f * chans + ch] = (self.scratch_a[f * chans + ch] as f64 * ramp) as f32;
                 }
                 tail.remaining = tail.remaining.saturating_sub(1);
             }
@@ -145,18 +153,18 @@ impl AudioSource for CrossfadeMixer {
         }
 
         if let Some(next) = self.next.as_mut() {
-                let n_b = next.next_buffer(&mut b);
+                let n_b = next.next_buffer(&mut self.scratch_b);
 
             let out_len = n_a.max(n_b);
                 let chans = self.channels;
             let frames_out = out_len / chans;
             let cf = self.crossfade_frames.max(1) as f64;
-            for i in 0..out_len {
+            for (i, out) in buffer.iter_mut().take(out_len).enumerate() {
                 let f = i / chans;
                 let t = ((self.fade_pos + f) as f64 / cf).clamp(0.0, 1.0);
                 let gain_b = t.powf(self.curve);
                 let gain_a = (1.0 - t).powf(self.curve);
-                buffer[i] = (a[i] as f64 * gain_a + b[i] as f64 * gain_b) as f32;
+                *out = (self.scratch_a[i] as f64 * gain_a + self.scratch_b[i] as f64 * gain_b) as f32;
             }
             self.fade_pos += frames_out;
 
@@ -179,7 +187,7 @@ impl AudioSource for CrossfadeMixer {
             }
 
             // No crossfade in progress: plain passthrough.
-            buffer[..n_a].copy_from_slice(&a[..n_a]);
+            buffer[..n_a].copy_from_slice(&self.scratch_a[..n_a]);
             return n_a;
         }
     }
@@ -196,6 +204,28 @@ impl AudioSource for CrossfadeMixer {
     fn label(&self) -> Option<String> {
         Some(self.active_label.clone())
     }
+
+    /// Advance to the next track immediately, abandoning the current one.
+    /// Used by the telnet `skip` command.
+    fn skip(&mut self) {
+        self.ensure_started();
+        if self.next.is_some() {
+            let promoted = self.next.take().expect("next must exist");
+            self.active = promoted;
+            self.active_label = self.next_label.take().unwrap_or_default();
+        } else if self.provider.has_next() {
+            let (src, label) = self.provider.next_source();
+            log::info!("crossfade: skip to {label}");
+            self.active = src;
+            self.active_label = label;
+        } else {
+            log::info!("crossfade: skip ignored, nothing next");
+            return;
+        }
+        self.fade_pos = 0;
+        self.tail = None;
+        log::info!("crossfade: skipped to {}", self.active_label);
+    }
 }
 
 /// Commands sent to the [`PriorityMixer`] from the live harbor / jingle trigger.
@@ -203,7 +233,44 @@ pub enum MixCommand {
     SetLive(Box<dyn AudioSource>),
     ClearLive,
     PlayJingle(PathBuf),
+    /// Skip the current playlist track (telnet `skip`).
+    Skip,
     Shutdown,
+}
+
+/// Shared engine status consumed by the control port (`status`, `uptime`).
+/// The pump loop updates `current`; the telnet server reads it.
+#[derive(Clone)]
+pub struct StatusHandle {
+    started: std::time::Instant,
+    current: Arc<std::sync::Mutex<String>>,
+}
+
+impl StatusHandle {
+    pub fn new() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            current: Arc::new(Mutex::new(String::new())),
+        }
+    }
+
+    pub fn set_current(&self, title: &str) {
+        *self.current.lock().unwrap() = title.to_string();
+    }
+
+    pub fn current(&self) -> String {
+        self.current.lock().unwrap().clone()
+    }
+
+    pub fn uptime_seconds(&self) -> u64 {
+        self.started.elapsed().as_secs()
+    }
+}
+
+impl Default for StatusHandle {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// A priority mixer combining the playlist (via [`CrossfadeMixer`]) with live
@@ -227,6 +294,10 @@ pub struct PriorityMixer {
     target_spec: SignalSpec,
     frames_per_buffer: usize,
     shutdown: bool,
+    /// Reusable scratch buffers, sized on demand so `next_buffer` never
+    /// allocates on the hot path.
+    scratch_m: Vec<f32>,
+    scratch_o: Vec<f32>,
 }
 
 impl PriorityMixer {
@@ -250,6 +321,8 @@ impl PriorityMixer {
             target_spec,
             frames_per_buffer,
             shutdown: false,
+            scratch_m: Vec::new(),
+            scratch_o: Vec::new(),
         }
     }
 
@@ -290,6 +363,10 @@ impl PriorityMixer {
                         Err(e) => log::warn!("failed to open jingle {}: {e}", path.display()),
                     }
                 }
+                Ok(MixCommand::Skip) => {
+                    log::info!("priority mixer: skip requested");
+                    self.main.skip();
+                }
                 Ok(MixCommand::Shutdown) => {
                     log::info!("priority mixer: shutdown requested");
                     self.shutdown = true;
@@ -298,16 +375,6 @@ impl PriorityMixer {
                 Err(TryRecvError::Disconnected) => break,
             }
         }
-    }
-
-    fn read_override(&mut self, out: &mut [f32]) -> usize {
-        if let Some(src) = self.live.as_mut() {
-            return src.next_buffer(out);
-        }
-        if let Some(src) = self.jingle.as_mut() {
-            return src.next_buffer(out);
-        }
-        0
     }
 
     fn step_gain(&mut self, n_out: usize) {
@@ -333,13 +400,26 @@ impl PriorityMixer {
 impl AudioSource for PriorityMixer {
     fn next_buffer(&mut self, buffer: &mut [f32]) -> usize {
         self.drain_commands();
+        if self.shutdown {
+            return 0;
+        }
 
         let wanted = buffer.len();
-        let mut m = vec![0f32; wanted];
-        let mut o = vec![0f32; wanted];
+        if self.scratch_m.len() != wanted {
+            self.scratch_m.resize(wanted, 0.0);
+            self.scratch_o.resize(wanted, 0.0);
+        }
 
-        let n_m = self.main.next_buffer(&mut m);
-        let n_o = self.read_override(&mut o);
+        let n_m = self.main.next_buffer(&mut self.scratch_m);
+        // Pull the override into the shared scratch: `read_override` is
+        // inlined so its borrows stay on disjoint fields (live/jingle).
+        let n_o = if let Some(src) = self.live.as_mut() {
+            src.next_buffer(&mut self.scratch_o)
+        } else if let Some(src) = self.jingle.as_mut() {
+            src.next_buffer(&mut self.scratch_o)
+        } else {
+            0
+        };
         if n_o > 0 {
             self.override_started = true;
         }
@@ -358,16 +438,16 @@ impl AudioSource for PriorityMixer {
         }
 
         let out_len = n_m.max(n_o);
-        for i in 0..out_len {
-            buffer[i] =
-                (m[i] as f64 * (1.0 - self.gain) + o[i] as f64 * self.gain) as f32;
+        for (i, out) in buffer.iter_mut().take(out_len).enumerate() {
+            *out = (self.scratch_m[i] as f64 * (1.0 - self.gain)
+                + self.scratch_o[i] as f64 * self.gain) as f32;
         }
         self.step_gain(out_len);
         out_len
     }
 
     fn is_exhausted(&self) -> bool {
-        self.main.is_exhausted()
+        self.shutdown || self.main.is_exhausted()
     }
 
     fn label(&self) -> Option<String> {
@@ -570,6 +650,85 @@ mod tests {
         assert!((buf[0] - 3.0).abs() < 1e-6);
         pm.next_buffer(&mut buf);
         assert!((buf[0] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn skip_advances_to_the_next_track() {
+        let provider = Box::new(FakeProvider::new(vec![(1.0, 1000), (2.0, 1000)]));
+        let cfg = mixer_config(0.2);
+        let mut mix = CrossfadeMixer::new(provider, &cfg, RATE as u32, CHANS);
+        let mut buf = vec![0f32; 10 * CHANS];
+        mix.next_buffer(&mut buf);
+        assert!((buf[0] - 1.0).abs() < 1e-6);
+
+        mix.skip();
+        mix.next_buffer(&mut buf);
+        assert!((buf[0] - 2.0).abs() < 1e-6);
+        assert_eq!(mix.label().as_deref(), Some("src(2)"));
+    }
+
+    #[test]
+    fn skip_is_a_noop_with_nothing_next() {
+        let provider = Box::new(FakeProvider::new(vec![(1.0, 10)]));
+        let cfg = mixer_config(0.2);
+        let mut mix = CrossfadeMixer::new(provider, &cfg, RATE as u32, CHANS);
+        mix.skip();
+        let mut buf = vec![0f32; 10 * CHANS];
+        assert_eq!(mix.next_buffer(&mut buf), 20);
+        assert!((buf[0] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn priority_mixer_forwards_skip_to_the_crossfade() {
+        let provider = Box::new(FakeProvider::new(vec![(1.0, 1000), (2.0, 1000)]));
+        let cfg = mixer_config(0.2);
+        let cross = CrossfadeMixer::new(provider, &cfg, RATE as u32, CHANS);
+        let (tx, rx) = mpsc::channel();
+        let spec = symphonia::core::audio::SignalSpec::new(
+            RATE as u32,
+            symphonia::core::audio::Channels::FRONT_LEFT
+                | symphonia::core::audio::Channels::FRONT_RIGHT,
+        );
+        let mut pm = PriorityMixer::new(Box::new(cross), rx, &cfg, spec, 10);
+        let mut buf = vec![0f32; 10 * CHANS];
+        pm.next_buffer(&mut buf);
+        assert!((buf[0] - 1.0).abs() < 1e-6);
+
+        tx.send(MixCommand::Skip).unwrap();
+        pm.next_buffer(&mut buf);
+        assert!((buf[0] - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn status_handle_reports_current_and_uptime() {
+        let status = StatusHandle::new();
+        status.set_current("a track");
+        assert_eq!(status.current(), "a track");
+        assert!(status.uptime_seconds() < 1000);
+    }
+
+    #[test]
+    fn shutdown_ends_the_stream() {
+        let main = Box::new(FakeSource {
+            value: 1.0,
+            total_frames: 100_000,
+            pos_frames: 0,
+        });
+        let cfg = mixer_config(0.2);
+        let spec = symphonia::core::audio::SignalSpec::new(
+            RATE as u32,
+            symphonia::core::audio::Channels::FRONT_LEFT
+                | symphonia::core::audio::Channels::FRONT_RIGHT,
+        );
+        let (tx, rx) = mpsc::channel();
+        let mut pm = PriorityMixer::new(main, rx, &cfg, spec, 10);
+        let mut buf = vec![0f32; 10 * CHANS];
+        assert_eq!(pm.next_buffer(&mut buf), 20);
+
+        tx.send(MixCommand::Shutdown).unwrap();
+        assert_eq!(pm.next_buffer(&mut buf), 0);
+        assert!(pm.is_exhausted());
+        assert!(pm.is_shutdown());
     }
 
     #[test]

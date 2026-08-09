@@ -27,6 +27,10 @@ pub trait AudioSource: Send {
     fn label(&self) -> Option<String> {
         None
     }
+
+    /// Advance to the next item immediately, where meaningful (telnet
+    /// `skip`). Sources without a notion of "next" ignore it.
+    fn skip(&mut self) {}
 }
 
 /// Supplies the *next* source on demand so a crossfade can be preloaded.
@@ -69,6 +73,119 @@ impl AudioSource for SilenceSource {
 impl Default for SilenceSource {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// A silence test source (Liquidsoap `blank`). With a duration it exhausts
+/// after that many seconds, letting `fallback`/`sequence` move on.
+pub struct BlankSource {
+    /// Samples remaining, `None` = infinite.
+    samples_left: Option<usize>,
+}
+
+impl BlankSource {
+    pub fn new() -> Self {
+        Self { samples_left: None }
+    }
+
+    pub fn with_duration(seconds: f64, sample_rate: u32) -> Self {
+        Self {
+            samples_left: Some((seconds * sample_rate as f64) as usize),
+        }
+    }
+}
+
+impl Default for BlankSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AudioSource for BlankSource {
+    fn next_buffer(&mut self, buffer: &mut [f32]) -> usize {
+        let total = buffer.len();
+        let n = self.samples_left.map(|l| l.min(total)).unwrap_or(total);
+        buffer[..n].fill(0.0);
+        if let Some(left) = self.samples_left.as_mut() {
+            *left -= n;
+        }
+        n
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.samples_left == Some(0)
+    }
+
+    fn label(&self) -> Option<String> {
+        Some("blank".into())
+    }
+}
+
+/// A sine test tone (Liquidsoap `sine`). With a duration it exhausts after
+/// that many seconds.
+pub struct SineSource {
+    freq: f32,
+    amplitude: f32,
+    sample_rate: u32,
+    channels: usize,
+    phase: f64,
+    frames_left: Option<usize>,
+}
+
+impl SineSource {
+    pub fn new(
+        freq: f32,
+        duration: Option<f64>,
+        amplitude: f32,
+        sample_rate: u32,
+        channels: usize,
+    ) -> Self {
+        Self {
+            freq,
+            amplitude,
+            sample_rate,
+            channels,
+            phase: 0.0,
+            frames_left: duration.map(|d| (d * sample_rate as f64) as usize),
+        }
+    }
+}
+
+impl AudioSource for SineSource {
+    fn next_buffer(&mut self, buffer: &mut [f32]) -> usize {
+        let frames = buffer.len() / self.channels;
+        let take = self.frames_left.map(|l| l.min(frames)).unwrap_or(frames);
+        if take == 0 {
+            return 0;
+        }
+        let step = 2.0 * std::f64::consts::PI * self.freq as f64 / self.sample_rate as f64;
+        for f in 0..take {
+            let v = ((self.phase + step * f as f64).sin() * self.amplitude as f64) as f32;
+            for ch in 0..self.channels {
+                buffer[f * self.channels + ch] = v;
+            }
+        }
+        if take < frames {
+            buffer[take * self.channels..].fill(0.0);
+        }
+        self.phase = (self.phase + step * take as f64) % (2.0 * std::f64::consts::PI);
+        if let Some(left) = self.frames_left.as_mut() {
+            *left -= take;
+        }
+        take * self.channels
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.frames_left == Some(0)
+    }
+
+    fn remaining_seconds(&self) -> Option<f64> {
+        self.frames_left
+            .map(|l| l as f64 / self.sample_rate as f64)
+    }
+
+    fn label(&self) -> Option<String> {
+        Some(format!("sine {:.0} Hz", self.freq))
     }
 }
 
@@ -156,5 +273,58 @@ mod tests {
     fn stereo_to_mono_averages() {
         let out = convert_channels(&[1.0, 3.0], 2, 1);
         assert_eq!(out, vec![2.0]);
+    }
+
+    #[test]
+    fn blank_is_infinite_silence() {
+        let mut b = BlankSource::new();
+        let mut buf = [0.5f32; 10];
+        let n = b.next_buffer(&mut buf);
+        assert_eq!(n, 10);
+        assert!(buf.iter().all(|&s| s == 0.0));
+        assert!(!b.is_exhausted());
+    }
+
+    #[test]
+    fn blank_with_duration_exhausts() {
+        let mut b = BlankSource::with_duration(0.5, 100);
+        let mut buf = vec![0f32; 30];
+        assert_eq!(b.next_buffer(&mut buf), 30);
+        assert_eq!(b.next_buffer(&mut buf), 20);
+        assert!(b.is_exhausted());
+        assert_eq!(b.next_buffer(&mut buf), 0);
+    }
+
+    #[test]
+    fn sine_generates_a_tone_at_the_requested_frequency() {
+        // 25 Hz at a 100 Hz rate: one cycle every 4 samples.
+        let mut s = SineSource::new(25.0, None, 0.5, 100, 1);
+        let mut buf = vec![0f32; 4];
+        s.next_buffer(&mut buf);
+        assert!((buf[0]).abs() < 1e-6);
+        assert!((buf[1] - 0.5).abs() < 1e-6);
+        assert!((buf[2]).abs() < 1e-6);
+        assert!((buf[3] + 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sine_stereo_duplicates_the_tone_across_channels() {
+        let mut s = SineSource::new(25.0, None, 0.5, 100, 2);
+        let mut buf = vec![0f32; 8];
+        s.next_buffer(&mut buf);
+        for f in 0..4 {
+            assert_eq!(buf[f * 2], buf[f * 2 + 1]);
+        }
+    }
+
+    #[test]
+    fn sine_with_duration_exhausts() {
+        let mut s = SineSource::new(50.0, Some(0.1), 0.5, 100, 2);
+        let mut buf = vec![0f32; 10];
+        assert_eq!(s.next_buffer(&mut buf), 10);
+        assert!(!s.is_exhausted());
+        assert_eq!(s.next_buffer(&mut buf), 10);
+        assert!(s.is_exhausted());
+        assert_eq!(s.remaining_seconds(), Some(0.0));
     }
 }

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::{OutputConfig, OutputFormat};
+use crate::engine::mixer::StatusHandle;
 use crate::output::encoder::{create_encoder, Encoder};
 use crate::output::icecast_client::IcecastClient;
 use crate::source::AudioSource;
@@ -25,6 +26,7 @@ pub struct IcecastOutput {
     encoder: Option<Box<dyn Encoder>>,
     last_title: String,
     shutdown: Arc<AtomicBool>,
+    status: Option<StatusHandle>,
 }
 
 impl IcecastOutput {
@@ -45,6 +47,7 @@ impl IcecastOutput {
             encoder: None,
             last_title: String::new(),
             shutdown: Arc::new(AtomicBool::new(false)),
+            status: None,
         }
     }
 
@@ -52,6 +55,11 @@ impl IcecastOutput {
     /// graceful Ctrl-C shutdown).
     pub fn set_shutdown(&mut self, flag: Arc<AtomicBool>) {
         self.shutdown = flag;
+    }
+
+    /// Expose the current track title to the control port via [`StatusHandle`].
+    pub fn set_status(&mut self, status: StatusHandle) {
+        self.status = Some(status);
     }
 
     pub fn reconnect_seconds(&self) -> u64 {
@@ -131,6 +139,9 @@ impl IcecastOutput {
 
     fn update_metadata(&mut self) {
         let title = self.source.label().unwrap_or_default();
+        if let Some(status) = &self.status {
+            status.set_current(&title);
+        }
         if title != self.last_title {
             self.last_title = title.clone();
             log::info!("icecast: now playing {title}");

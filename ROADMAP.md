@@ -52,41 +52,171 @@
 - Icecast 2.4.4 shows no Opus titles (see Done section); 2.5+ shows the
   stream-start title only.
 
-## Next up: Lua spec parity with Liquidsoap (.lua on par with .liq)
+## Next up: Liquidsoap parity + performance
 
-Goal: close the gap between what a production `.liq` script expresses and what
-`crabsoup.lua` can do. Each phase ships independently and is verified live or
-via inline tests before the next starts.
+Target: close the gap between a production `.liq` script and `crabsoup.lua`,
+landed as independently-shipping phases (inline tests, verified live) while
+beating Liquidsoap on CPU/memory per concurrent output and worst-case latency
+jitter — via real OS threads and allocation-free hot paths, not "Rust alone".
+This section is the plan; the Done sections above stay the source of truth
+for what shipped.
 
-### Phase 1 — parity map + ops primitives (small)
-- [ ] README appendix: "Liquidsoap .liq -> Crabsoup .lua" mapping table
-      (covers the harbor-ducking and one-shot-jingle behavior that .liq gets
-      via `switch`/`mksafe` + request scheduling).
-- [ ] Test sources `blank`, `sine`; operator `amplify(source, gain)`.
-- [ ] Telnet commands `skip`, `status`/`uptime`.
+### Performance principles (apply to every phase)
 
-### Phase 2 — queue/requests (main ops win)
-- [ ] `request`-style queue source: FIFO of paths pushed at runtime, plays when
-      non-empty, exhausts when empty (composes in `fallback` before the
-      playlist, like `request.queue`).
-- [ ] Telnet `queue.push <path>`, `queue.list`, `queue.clear`; `skip` wired to
-      the current track (playlist skip).
-- [ ] `server.register` (Lua API to register custom telnet commands).
+- No `Vec::new()`/`vec![...]` inside a `next_buffer` hot path. Scratch
+  buffers are sized at construction and resized only if the buffer size
+  actually changes.
+- Lock once per call, not per method: one `next_buffer` never takes the same
+  child `Mutex` twice (`FallbackSource`/`RandomSource` today; future
+  `EffectSource`/`OnMetadataSource` wrappers must not either).
+- One thread per output plus one puller thread; nothing finer-grained (DSP
+  effects stay inline in the pull chain).
+- `benches/` with criterion covering the mixers, resampler, and encode path
+  once the buffer-reuse + tap work lands; record baseline numbers in
+  ROADMAP.md so later phases check against them, not "seems fine".
+- SIMD is a later lever (sinc convolution, effect loops) — only after the
+  benchmark harness shows it is the bottleneck.
 
-### Phase 3 — scheduling (dayparting)
+### Part A — architectural prerequisites (land A1 + A2 as one PR)
+
+#### A1 — Engine tap (single puller, multi-consumer fan-out)
+Two outputs cannot both call `next_buffer()` on the same root — that is why
+`output.icecast` is single-call today and why `on_metadata` cannot hook in
+cleanly. Fix: one thread owns the root source and pulls at wall-clock pace
+(the loop `IcecastOutput::run` has today), publishing each buffer as an
+`Arc<AudioFrame { pcm, label }>` to N bounded `sync_channel(4)` taps.
+Outputs (`IcecastOutput`, future `output.file`) become pure consumers
+(`for frame in rx { encode + send }`) with independent reconnect loops — one
+stalled mount cannot stall the pull or the other outputs.
+`ScriptResult.output: Option<OutputConfig>` becomes
+`outputs: Vec<OutputConfig>`; a second `output.icecast` call is accepted
+when it shares the same source graph (check via `Arc::ptr_eq`).
+**Allocation note:** the tap must not allocate per pull either — keep a
+preallocated frame pool sized `4 * tap_count + 2` (bounded channels mean the
+pool never runs out on the steady-state path) with a fresh-Vec fallback.
+Acceptance: two mounts stream concurrently; killing one Icecast connection
+does not glitch the other; inline test with two fake consumers reading the
+same tap and asserting identical frame sequences.
+
+#### A2 — Lua-owning event loop (unblocks `on_metadata`, `server.register`)
+`mlua` is built without the `send` feature (deliberate — see `Cargo.toml`),
+so `Lua`/`Function`/`Table` are `!Send` and callable only on the thread that
+created them. After A1 the puller is a different thread, so wrapper sources
+send owned `Send` events (`ScriptEvent::Metadata { hook_id, title }`,
+`Shutdown`) over a channel; the Lua-owning thread runs the event loop and
+invokes hooks stored in `Vec<mlua::Function>` on `ScriptState`. `script::run`
+must hand back the `Lua` instance, which now outlives script evaluation —
+**a real shape change; call it out in AGENTS.md when it lands.** Event rate
+is metadata-rate (per track), not per buffer; audio-rate callbacks need
+their own budget/backpressure story.
+
+### Part B — feature phases
+
+#### Phase 2 — DSP effect chain (no Part A dependency)
+- [ ] `src/engine/effects.rs` gains `Compressor` (envelope follower; gain
+      reduction only above a threshold; `threshold`, `ratio`, `attack`,
+      `release`) and `Agc` (same follower shape, targets a level instead of
+      limiting — backs `normalize`). Register `amplify`/`compress`/
+      `normalize` with one `lua.create_function` closure each, matching the
+      existing `composer`/`fallback` registration style in `script.rs`.
+- [ ] Inline tests per effect: synthetic sine input, exact expected sample
+      values (mixer.rs style), gain reduction only above threshold, quiet
+      signal brought up toward the target.
+
+#### Phase 3 — request queue
+- [ ] FIFO source pushed at runtime via telnet `queue.push <path>`, plays
+      when non-empty, exhausts when empty (composes in `fallback` before the
+      playlist, like `request.queue`); `queue.list`, `queue.clear`; `skip`
+      wired to the current track (playlist skip).
+- [ ] `server.register` (Lua API for custom telnet commands) — natural once
+      A2's event-loop pattern exists; until then, custom commands that do not
+      call back into Lua only.
+
+#### Phase 4 — multi-output + file recording (needs A1)
+- [ ] `output.icecast` callable more than once (different mounts/formats).
+- [ ] `output.file({path, format}, source)`: same consumer shape as
+      `IcecastOutput` with a file sink; verified by ffprobe-decoding the
+      recorded file.
+
+#### Phase 5 — scheduling (dayparting)
 - [ ] `switch` source with time-based brackets (liq `switch` semantics:
       weekday/hour ranges, default child).
 - [ ] `rotate` source (sequential/even rotation over children).
 
-### Phase 4 — metadata hooks
-- [ ] `on_metadata(callback)` source wrapper invoking a Lua function per track
-      start with a metadata table (title, duration, path).
+#### Phase 6 — metadata hooks (needs A2)
+- [ ] `on_metadata(callback, source)`: A2 event loop, metadata table
+      (title, duration, path) per track start.
+- [ ] `on_track(callback, source)`: second `ScriptEvent` variant, fires on
+      track boundary without full metadata.
 
-### Phase 5 — recording
-- [ ] `output.file({path=..., format=...}, src)` reusing the mp3/opus encoders
-      with a file sink; live-verified by decoding the recorded file.
+#### Phase 7 — request protocols (`http://` resolution, biggest lift)
+- [ ] `request` abstraction resolving URIs through pluggable protocols.
+      Scope down to download-then-play first (retry/timeout, temp-file
+      lifecycle) before attempting a streaming-decode path.
+
+#### Phase 8 — loudness (replaygain / R128, stretch)
+- [ ] Feed ReplayGain/R128 tags into the Phase 2 `Agc`/`normalize` gain
+      baseline. Only once the envelope follower exists.
+
+### Part C — output-format & delivery track (parallel with Part B)
+
+Touches `src/output/` and `src/live/`, not `script.rs` source composition —
+no contention with Part B.
+
+- [ ] **C1 — `output.file` + multi-mount `output.icecast`** (needs A1; same
+      work as Phase 4, no separate effort).
+- [ ] **C2 — AAC encoder** (no dependency, can start immediately): new
+      `Encoder` impl, FFI to `fdk-aac` following the LAME `unsafe extern
+      "C"` template (opaque handle, explicit `Drop`, `unsafe impl Send` with
+      justification). Raw ADTS framing over the existing `IcecastClient`;
+      `audio/aac` content-type branch next to the MP3/Opus branches. Low
+      risk, runnable alongside Phase 2.
+- [ ] **C3 — HLS output** (needs C2): new module — segmenter rotating the
+      encoder output into fixed-length chunks (4–6s), `.m3u8` media playlist
+      writer, segment lifecycle (naming, retention window, cleanup). AAC is
+      the practical HLS codec, so sequence after C2. Acceptance: a real HLS
+      player (hls.js/VLC/Safari) plays a live segment window.
+- [ ] **C4 — Shoutcast v1/v2** (only if a concrete need shows up): alternate
+      handshake inside `icecast_client.rs`, exposed as `protocol =
+      "icecast" | "shoutcast"` on `output.icecast`'s config table.
+
+### Suggested execution order
+
+1. Buffer-reuse pass in `CrossfadeMixer`/`PriorityMixer` (perf, low risk, no
+   API change) — **done** alongside Phase 1.
+2. Phase 1 (primitives) — **done** (see Done section).
+3. Part A (A1 + A2 together — they share the "who owns the pull loop"
+   decision, easier to land as one architectural PR than two) — **next**.
+4. Track B, sequential: Phase 2 (no Part A dependency, can start early) →
+   Phase 3 → Phase 5 → Phase 6 (needs A2) → Phase 7 → Phase 8 (stretch).
+5. Track C once A1 lands: C1 → C2 → C3 (needs C2) → C4 (on request).
+
+If effort is constrained to one track at a time, prioritize Track C through
+C1/C2 ahead of Track B phases 5–8 — output breadth (file recording, multiple
+mounts, AAC) is the highest-value/lowest-risk next step for a station in
+production. Track B Phase 2 (DSP) is cheap enough to interleave regardless.
+
+Non-goals for now: full `.liq` language compatibility (the Lua stdlib
+approximates the operator surface, not the language); LADSPA plugin hosting
+(revisit only if a concrete need appears); clock-synchronized multi-output
+(one puller + fan-out first; revisit only if drift between outputs matters in
+practice).
 
 ## Done (cont.)
+- [x] Phase 1 (ops primitives): `blank`/`sine` test sources (optional
+      `duration`; exhaust cleanly so `fallback` hands over), `amplify`
+      operator via new `src/engine/effects.rs` (`Effect` trait +
+      `EffectSource<E>`, ready for the Phase 2 DSP chain), telnet `skip`
+      (`AudioSource::skip()` trait default no-op; `CrossfadeMixer` advances
+      the current track; `MixCommand::Skip`), telnet `status`/`uptime` via
+      a shared `StatusHandle` the pump loop keeps fresh, README parity map
+      (.liq -> .lua table). Verified live: `examples/crabsoup.tone.lua`
+      (60 s 440 Hz tone -> sequence -> blank) shows `sine 440 Hz` in
+      `status`; telnet `skip` and `shutdown` reach the mixer; `shutdown`
+      stops both pump loops (previously a no-op — `PriorityMixer::is_shutdown`
+      was never consulted, so telnet shutdown only replied). Mixer hot paths
+      now reuse scratch buffers (no per-`next_buffer` allocation in
+      `CrossfadeMixer`/`PriorityMixer`).
 - [x] Preview mode via `--preview` (forced even with `output.icecast`,
       combines with `--check`; verified live).
 - [x] Opus resampler upgraded: 16-tap Hann-windowed sinc polyphase FIR (256 phases),

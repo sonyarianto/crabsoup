@@ -7,6 +7,9 @@
 //! - `jingles.play`            — play a random jingle
 //! - `jingles.play <n>`        — play jingle at index `n`
 //! - `jingles.play <substr>`   — play the jingle whose name contains `substr`
+//! - `skip`                    — skip the current track
+//! - `status`                  — current track + uptime
+//! - `uptime`                  — seconds since startup
 //! - `shutdown`                — stop the app (like Ctrl-C)
 //! - `exit` / `quit`           — close the connection
 //! - `help`                    — list commands
@@ -20,13 +23,14 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::config::ControlConfig;
-use crate::engine::mixer::MixCommand;
+use crate::engine::mixer::{MixCommand, StatusHandle};
 
 /// Telnet command server. Owns one `mpsc::Sender` into the priority mixer.
 pub struct ControlServer {
     config: ControlConfig,
     jingles: Vec<PathBuf>,
     tx: mpsc::Sender<MixCommand>,
+    status: StatusHandle,
 }
 
 impl ControlServer {
@@ -34,11 +38,13 @@ impl ControlServer {
         config: ControlConfig,
         jingles: Vec<PathBuf>,
         tx: mpsc::Sender<MixCommand>,
+        status: StatusHandle,
     ) -> Self {
         Self {
             config,
             jingles,
             tx,
+            status,
         }
     }
 
@@ -67,8 +73,9 @@ impl ControlServer {
             };
             let jingles = self.jingles.clone();
             let tx = self.tx.clone();
+            let status = self.status.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(socket, &jingles, tx).await {
+                if let Err(e) = handle_connection(socket, &jingles, tx, &status).await {
                     log::warn!("control port ({peer}): {e}");
                 }
             });
@@ -80,6 +87,7 @@ async fn handle_connection(
     socket: TcpStream,
     jingles: &[PathBuf],
     tx: mpsc::Sender<MixCommand>,
+    status: &StatusHandle,
 ) -> Result<(), String> {
     let (reader, mut writer) = socket.into_split();
     let mut reader = BufReader::new(reader);
@@ -101,7 +109,7 @@ async fn handle_connection(
         if cmd.is_empty() {
             continue;
         }
-        match dispatch(cmd, jingles, &mut rng, &tx) {
+        match dispatch(cmd, jingles, &mut rng, &tx, status) {
             CommandResult::Reply(text) => reply(&mut writer, &text).await?,
             CommandResult::Exit => return Ok(()),
         }
@@ -118,12 +126,24 @@ fn dispatch(
     jingles: &[PathBuf],
     rng: &mut SmallRng,
     tx: &mpsc::Sender<MixCommand>,
+    status: &StatusHandle,
 ) -> CommandResult {
     let mut parts = cmd.split_whitespace();
     let verb = parts.next().unwrap_or("");
     match verb {
         "help" => CommandResult::Reply(help_text().to_string()),
         "exit" | "quit" => CommandResult::Exit,
+        "skip" => {
+            log::info!("control port: skip requested");
+            let _ = tx.send(MixCommand::Skip);
+            CommandResult::Reply("skipping".into())
+        }
+        "status" => CommandResult::Reply(format!(
+            "playing: {}\nuptime: {}s",
+            status.current(),
+            status.uptime_seconds()
+        )),
+        "uptime" => CommandResult::Reply(format!("uptime: {}s", status.uptime_seconds())),
         "shutdown" => {
             log::info!("control port: shutdown requested");
             let _ = tx.send(MixCommand::Shutdown);
@@ -151,7 +171,7 @@ fn dispatch(
 }
 
 fn help_text() -> &'static str {
-    "commands: jingles.list | jingles.play [n|substr] | shutdown | exit | help"
+    "commands: jingles.list | jingles.play [n|substr] | skip | status | uptime | shutdown | exit | help"
 }
 
 fn list_jingles(jingles: &[PathBuf]) -> String {
@@ -228,5 +248,35 @@ mod tests {
         assert_eq!(pick_jingle(&jingles(), "STING").unwrap(), 1);
         assert_eq!(pick_jingle(&jingles(), "intro").unwrap(), 0);
         assert!(pick_jingle(&jingles(), "bass").is_err());
+    }
+
+    #[test]
+    fn skip_sends_the_mix_command() {
+        let (tx, rx) = mpsc::channel();
+        let status = StatusHandle::new();
+        let reply = dispatch("skip", &jingles(), &mut SmallRng::from_entropy(), &tx, &status);
+        match reply {
+            CommandResult::Reply(text) => assert_eq!(text, "skipping"),
+            CommandResult::Exit => panic!("skip must reply"),
+        }
+        assert!(matches!(rx.try_recv(), Ok(MixCommand::Skip)));
+    }
+
+    #[test]
+    fn status_and_uptime_report_engine_state() {
+        let (tx, _rx) = mpsc::channel();
+        let status = StatusHandle::new();
+        status.set_current("some track");
+        match dispatch("status", &jingles(), &mut SmallRng::from_entropy(), &tx, &status) {
+            CommandResult::Reply(text) => {
+                assert!(text.contains("playing: some track"));
+                assert!(text.contains("uptime: "));
+            }
+            CommandResult::Exit => panic!("status must reply"),
+        }
+        match dispatch("uptime", &jingles(), &mut SmallRng::from_entropy(), &tx, &status) {
+            CommandResult::Reply(text) => assert!(text.starts_with("uptime: ")),
+            CommandResult::Exit => panic!("uptime must reply"),
+        }
     }
 }

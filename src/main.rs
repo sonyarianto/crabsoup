@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use clap::Parser;
 
-use crabsoup::engine::mixer::{MixCommand, PriorityMixer};
+use crabsoup::engine::mixer::{MixCommand, PriorityMixer, StatusHandle};
 use crabsoup::live::harbor::Harbor;
 use crabsoup::output::icecast::IcecastOutput;
 use crabsoup::script::{self, ScriptResult};
@@ -67,6 +67,10 @@ fn main() -> crabsoup::Result<()> {
         .enable_all()
         .build()?;
 
+    // Shared status for the telnet `status`/`uptime` commands; the pump loop
+    // keeps the current label fresh.
+    let status = StatusHandle::new();
+
     if let Some(live_cfg) = &result.harbor {
         let harbor = Harbor::new(live_cfg.clone(), spec, tx.clone());
         rt.spawn(async move { harbor.run().await });
@@ -74,7 +78,12 @@ fn main() -> crabsoup::Result<()> {
 
     if let Some(ctl_cfg) = &result.control {
         let jingles = result.jingles.clone();
-        let server = crabsoup::control::ControlServer::new(ctl_cfg.clone(), jingles, tx.clone());
+        let server = crabsoup::control::ControlServer::new(
+            ctl_cfg.clone(),
+            jingles,
+            tx.clone(),
+            status.clone(),
+        );
         rt.spawn(async move { server.run().await });
     }
 
@@ -93,6 +102,7 @@ fn main() -> crabsoup::Result<()> {
             let mut output =
                 IcecastOutput::new(out_cfg.clone(), root, spec.rate, chans, fpb);
             output.set_shutdown(shutdown.clone());
+            output.set_status(status.clone());
 
             // Initial connection with a bounded retry loop so Ctrl-C works
             // before the first successful connect.
@@ -119,7 +129,7 @@ fn main() -> crabsoup::Result<()> {
                      (decoding but not broadcasting)"
                 );
             }
-            run_preview(&mut *root, spec.rate, chans, fpb, shutdown)
+            run_preview(&mut *root, spec.rate, chans, fpb, shutdown, &status)
         }
     }
 }
@@ -164,6 +174,7 @@ fn run_preview(
     chans: usize,
     fpb: usize,
     shutdown: Arc<AtomicBool>,
+    status: &StatusHandle,
 ) -> crabsoup::Result<()> {
     let interval = Duration::from_secs_f64(fpb as f64 / sample_rate as f64);
     let mut buf = vec![0f32; fpb * chans];
@@ -174,8 +185,13 @@ fn run_preview(
             log::info!("preview: shutdown requested");
             return Ok(());
         }
-        root.next_buffer(&mut buf);
+        let n = root.next_buffer(&mut buf);
+        if n == 0 && root.is_exhausted() {
+            log::info!("preview: source ended");
+            return Ok(());
+        }
         let label = root.label().unwrap_or_default();
+        status.set_current(&label);
         if Some(label.as_str()) != last.as_deref() {
             log::info!("now playing: {label}");
             last = Some(label);

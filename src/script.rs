@@ -36,10 +36,11 @@ use symphonia::core::audio::SignalSpec;
 use crate::config::{
     collect_audio, ControlConfig, LiveConfig, MixerConfig, OutputConfig, OutputFormat, StreamConfig,
 };
+use crate::engine::effects::{Amplify, EffectSource};
 use crate::engine::mixer::CrossfadeMixer;
 use crate::source::file::FileSource;
 use crate::source::playlist::Playlist;
-use crate::source::{AudioSource, SilenceSource};
+use crate::source::{AudioSource, BlankSource, SilenceSource, SineSource};
 
 /// Everything the engine needs after a `.lua` script finishes evaluating.
 pub struct ScriptResult {
@@ -344,6 +345,65 @@ pub fn run(src: &str) -> mlua::Result<ScriptResult> {
         })?,
     )?;
 
+    // ---- test sources (Liquidsoap `blank`, `sine`) -----------------------
+    let blank_state = state.clone();
+    globals.set(
+        "blank",
+        lua.create_function(move |_, opts: Option<Table>| {
+            let duration: Option<f64> = match &opts {
+                Some(t) => t.get("duration")?,
+                None => None,
+            };
+            let (spec, _) = bus(&blank_state);
+            let src: Box<dyn AudioSource> = match duration {
+                Some(d) => Box::new(BlankSource::with_duration(d, spec.rate)),
+                None => Box::new(BlankSource::new()),
+            };
+            Ok(LuaSource::new(src))
+        })?,
+    )?;
+
+    let sine_state = state.clone();
+    globals.set(
+        "sine",
+        lua.create_function(move |_, opts: Option<Table>| {
+            let freq: f64 = match &opts {
+                Some(t) => t.get::<Option<f64>>("freq")?.unwrap_or(440.0),
+                None => 440.0,
+            };
+            let duration: Option<f64> = match &opts {
+                Some(t) => t.get("duration")?,
+                None => None,
+            };
+            let amplitude: f64 = match &opts {
+                Some(t) => t.get::<Option<f64>>("amplitude")?.unwrap_or(0.5),
+                None => 0.5,
+            };
+            let (spec, _) = bus(&sine_state);
+            let src = SineSource::new(
+                freq as f32,
+                duration,
+                amplitude as f32,
+                spec.rate,
+                spec.channels.count(),
+            );
+            Ok(LuaSource::new(Box::new(src)))
+        })?,
+    )?;
+
+    // ---- effects (Liquidsoap `amplify`) ----------------------------------
+    let amp_state = state.clone();
+    globals.set(
+        "amplify",
+        lua.create_function(move |_, (mut source, gain): (LuaSource, f64)| {
+            let (spec, _) = bus(&amp_state);
+            let child = source.take();
+            let src =
+                EffectSource::new(child, Amplify::new(gain as f32), spec.channels.count());
+            Ok(LuaSource::new(Box::new(src)))
+        })?,
+    )?;
+
     // ---- source composition ---------------------------------------------
     let composer = lua.create_function(|_, (children, kind): (Table, String)| {
         let sources = source_list(&children)?;
@@ -552,5 +612,48 @@ mod tests {
         )
         .expect("script runs");
         assert!(res.preview.is_some());
+    }
+
+    #[test]
+    fn sine_with_duration_drives_exactly_one_second_of_frames() {
+        let res = run(
+            r#"
+            output.preview(amplify(sine({freq = 220, duration = 1}), 0.5))
+            "#,
+        )
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        let mut total = 0usize;
+        let mut peak = 0.0f32;
+        while !root.is_exhausted() {
+            let n = root.next_buffer(&mut buf);
+            total += n;
+            peak = peak.max(buf[..n].iter().fold(0.0, |m, &s| m.max(s.abs())));
+        }
+        // 1 s at 44100 Hz stereo, amplified by 0.5 (sine amplitude 0.5 -> 0.25).
+        assert_eq!(total, 44100 * 2);
+        assert!(peak <= 0.26, "amplify did not scale the tone (peak {peak})");
+    }
+
+    #[test]
+    fn blank_falls_through_to_the_next_child() {
+        let res = run(
+            r#"
+            output.preview(fallback({blank({duration = 0.1}), sine({duration = 1, freq = 100})}))
+            "#,
+        )
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        let n1 = root.next_buffer(&mut buf);
+        assert_eq!(n1, 4410, "blank should fill 0.1s then hand over");
+        assert!(buf[..n1].iter().all(|&s| s == 0.0));
+        let n2 = root.next_buffer(&mut buf);
+        assert!(n2 > 0);
+        assert!(
+            buf[..n2].iter().any(|&s| s.abs() > 0.01),
+            "fallback did not reach the sine after blank ended"
+        );
     }
 }

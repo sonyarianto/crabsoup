@@ -48,9 +48,10 @@ is that Playlist input; all sources are normalised to the PCM bus
 (`set("sample_rate", ...)`, `set("channels", ...)`, `frames_per_buffer`).
 
 - `src/script.rs` registers the Liquidsoap-flavoured Lua stdlib
-  (`playlist`, `single`, `jingles`, `fallback`/`sequence`/`random`,
-  `input.harbor`, `output.icecast`, `output.preview`, `server.telnet`, `set`,
-  `log`). Sources are Lua userdata wrapping `Arc<Mutex<Box<dyn AudioSource>>>`
+  (`playlist`, `single`, `blank`, `sine`, `amplify`, `jingles`,
+  `fallback`/`sequence`/`random`, `input.harbor`, `output.icecast`,
+  `output.preview`, `server.telnet`, `set`, `log`). Sources are Lua userdata
+  wrapping `Arc<Mutex<Box<dyn AudioSource>>>`
   so they can be composed; `LuaSource::into_inner` steals the box via
   `mem::replace` (mlua keeps a clone on the stack during the call, so
   `Arc::try_unwrap` would fail).
@@ -61,10 +62,16 @@ is that Playlist input; all sources are normalised to the PCM bus
 - The engine is single-chain: one `output.icecast` per script; without it,
   `output.preview` (or preview mode in main.rs).
 - `MixCommand` (`src/engine/mixer.rs`) is the mixer control channel
-  (`SetLive`, `ClearLive`, `PlayJingle(PathBuf)`, `Shutdown`) over
-  `std::sync::mpsc`. The harbor and control port send into it.
+  (`SetLive`, `ClearLive`, `PlayJingle(PathBuf)`, `Skip`, `Shutdown`) over
+  `std::sync::mpsc`. The harbor and control port send into it. `Skip` calls
+  `AudioSource::skip()` (trait default no-op; `CrossfadeMixer` advances);
+  `Shutdown` makes `PriorityMixer` return 0/exhausted so both pump loops
+  (`IcecastOutput::run`, `run_preview`) exit. `StatusHandle` is the shared
+  label/uptime cell the pump updates and the telnet `status`/`uptime` read.
 - `PriorityMixer` crossfades between `main` and an override with a gain ramp
-  over `duck_seconds`; the override audio is `m*(1-gain) + o*gain`.
+  over `duck_seconds`; the override audio is `m*(1-gain) + o*gain`. Both
+  mixers keep reusable scratch `Vec<f32>` fields (sized on buffer-size
+  change) so `next_buffer` never allocates.
 - Opus path: `SincResampler` (16-tap Hann-windowed sinc, 256-phase table)
   bus -> 48 kHz, encode 20 ms frames, mux one Ogg page per packet, flush
   per packet so audio reaches Icecast promptly.
