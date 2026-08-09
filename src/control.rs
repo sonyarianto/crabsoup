@@ -15,6 +15,7 @@
 //! - `help`                    — list commands
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc;
 
 use rand::rngs::SmallRng;
@@ -24,11 +25,13 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::config::ControlConfig;
 use crate::engine::mixer::{MixCommand, StatusHandle};
+use crate::source::request::RequestQueue;
 
 /// Telnet command server. Owns one `mpsc::Sender` into the priority mixer.
 pub struct ControlServer {
     config: ControlConfig,
     jingles: Vec<PathBuf>,
+    queue: Option<Arc<RequestQueue>>,
     tx: mpsc::Sender<MixCommand>,
     status: StatusHandle,
 }
@@ -37,12 +40,14 @@ impl ControlServer {
     pub fn new(
         config: ControlConfig,
         jingles: Vec<PathBuf>,
+        queue: Option<Arc<RequestQueue>>,
         tx: mpsc::Sender<MixCommand>,
         status: StatusHandle,
     ) -> Self {
         Self {
             config,
             jingles,
+            queue,
             tx,
             status,
         }
@@ -72,10 +77,11 @@ impl ControlServer {
                 }
             };
             let jingles = self.jingles.clone();
+            let queue = self.queue.clone();
             let tx = self.tx.clone();
             let status = self.status.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(socket, &jingles, tx, &status).await {
+                if let Err(e) = handle_connection(socket, &jingles, queue, tx, &status).await {
                     log::warn!("control port ({peer}): {e}");
                 }
             });
@@ -86,6 +92,7 @@ impl ControlServer {
 async fn handle_connection(
     socket: TcpStream,
     jingles: &[PathBuf],
+    queue: Option<Arc<RequestQueue>>,
     tx: mpsc::Sender<MixCommand>,
     status: &StatusHandle,
 ) -> Result<(), String> {
@@ -109,7 +116,7 @@ async fn handle_connection(
         if cmd.is_empty() {
             continue;
         }
-        match dispatch(cmd, jingles, &mut rng, &tx, status) {
+        match dispatch(cmd, jingles, queue.as_deref(), &mut rng, &tx, status) {
             CommandResult::Reply(text) => reply(&mut writer, &text).await?,
             CommandResult::Exit => return Ok(()),
         }
@@ -124,6 +131,7 @@ enum CommandResult {
 fn dispatch(
     cmd: &str,
     jingles: &[PathBuf],
+    queue: Option<&RequestQueue>,
     rng: &mut SmallRng,
     tx: &mpsc::Sender<MixCommand>,
     status: &StatusHandle,
@@ -138,6 +146,46 @@ fn dispatch(
             let _ = tx.send(MixCommand::Skip);
             CommandResult::Reply("skipping".into())
         }
+        "queue.push" => match parts.next() {
+            Some(path) => match queue {
+                Some(q) => {
+                    q.push(path.into());
+                    CommandResult::Reply(format!("queued {path} ({})", q.len()))
+                }
+                None => CommandResult::Reply("ERROR: no request.queue source in script".into()),
+            },
+            None => CommandResult::Reply("usage: queue.push <path>".into()),
+        },
+        "queue.list" => match queue {
+            Some(q) => {
+                let lines: Vec<String> = q
+                    .list()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| format!("{i}: {}", p.display()))
+                    .collect();
+                if lines.is_empty() {
+                    CommandResult::Reply("queue empty".into())
+                } else {
+                    CommandResult::Reply(lines.join("\n"))
+                }
+            }
+            None => CommandResult::Reply("ERROR: no request.queue source in script".into()),
+        },
+        "queue.clear" => match queue {
+            Some(q) => {
+                q.clear();
+                CommandResult::Reply("queue cleared".into())
+            }
+            None => CommandResult::Reply("ERROR: no request.queue source in script".into()),
+        },
+        "queue.skip" => match queue {
+            Some(q) => {
+                q.request_skip();
+                CommandResult::Reply("skipping queued track".into())
+            }
+            None => CommandResult::Reply("ERROR: no request.queue source in script".into()),
+        },
         "status" => CommandResult::Reply(format!(
             "playing: {}\nuptime: {}s",
             status.current(),
@@ -171,7 +219,7 @@ fn dispatch(
 }
 
 fn help_text() -> &'static str {
-    "commands: jingles.list | jingles.play [n|substr] | skip | status | uptime | shutdown | exit | help"
+    "commands: jingles.list | jingles.play [n|substr] | queue.push <path> | queue.list | queue.clear | queue.skip | skip | status | uptime | shutdown | exit | help"
 }
 
 fn list_jingles(jingles: &[PathBuf]) -> String {
@@ -254,7 +302,7 @@ mod tests {
     fn skip_sends_the_mix_command() {
         let (tx, rx) = mpsc::channel();
         let status = StatusHandle::new();
-        let reply = dispatch("skip", &jingles(), &mut SmallRng::from_entropy(), &tx, &status);
+        let reply = dispatch("skip", &jingles(), None, &mut SmallRng::from_entropy(), &tx, &status);
         match reply {
             CommandResult::Reply(text) => assert_eq!(text, "skipping"),
             CommandResult::Exit => panic!("skip must reply"),
@@ -267,16 +315,64 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let status = StatusHandle::new();
         status.set_current("some track");
-        match dispatch("status", &jingles(), &mut SmallRng::from_entropy(), &tx, &status) {
+        match dispatch("status", &jingles(), None, &mut SmallRng::from_entropy(), &tx, &status) {
             CommandResult::Reply(text) => {
                 assert!(text.contains("playing: some track"));
                 assert!(text.contains("uptime: "));
             }
             CommandResult::Exit => panic!("status must reply"),
         }
-        match dispatch("uptime", &jingles(), &mut SmallRng::from_entropy(), &tx, &status) {
+        match dispatch("uptime", &jingles(), None, &mut SmallRng::from_entropy(), &tx, &status) {
             CommandResult::Reply(text) => assert!(text.starts_with("uptime: ")),
             CommandResult::Exit => panic!("uptime must reply"),
+        }
+    }
+
+    #[test]
+    fn queue_commands_push_list_clear_and_skip() {
+        let (tx, _rx) = mpsc::channel();
+        let status = StatusHandle::new();
+        let queue = Arc::new(RequestQueue::new());
+        let mut rng = SmallRng::from_entropy();
+
+        match dispatch("queue.push /tmp/a.mp3", &jingles(), Some(&queue), &mut rng, &tx, &status) {
+            CommandResult::Reply(text) => assert!(text.contains("queued /tmp/a.mp3 (1)"), "{text}"),
+            CommandResult::Exit => panic!("queue.push must reply"),
+        }
+        match dispatch("queue.push /tmp/b.mp3", &jingles(), Some(&queue), &mut rng, &tx, &status) {
+            CommandResult::Reply(text) => assert!(text.contains("(2)"), "{text}"),
+            CommandResult::Exit => panic!("queue.push must reply"),
+        }
+        match dispatch("queue.list", &jingles(), Some(&queue), &mut rng, &tx, &status) {
+            CommandResult::Reply(text) => {
+                assert!(text.contains("0: /tmp/a.mp3"));
+                assert!(text.contains("1: /tmp/b.mp3"));
+            }
+            CommandResult::Exit => panic!("queue.list must reply"),
+        }
+        match dispatch("queue.skip", &jingles(), Some(&queue), &mut rng, &tx, &status) {
+            CommandResult::Reply(text) => assert!(text.contains("skipping queued track"), "{text}"),
+            CommandResult::Exit => panic!("queue.skip must reply"),
+        }
+        match dispatch("queue.clear", &jingles(), Some(&queue), &mut rng, &tx, &status) {
+            CommandResult::Reply(text) => assert!(text.contains("cleared"), "{text}"),
+            CommandResult::Exit => panic!("queue.clear must reply"),
+        }
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn queue_commands_require_a_configured_queue() {
+        let (tx, _rx) = mpsc::channel();
+        let status = StatusHandle::new();
+        let mut rng = SmallRng::from_entropy();
+        for cmd in ["queue.push /tmp/a.mp3", "queue.list", "queue.skip", "queue.clear"] {
+            match dispatch(cmd, &jingles(), None, &mut rng, &tx, &status) {
+                CommandResult::Reply(text) => {
+                    assert!(text.contains("no request.queue source"), "{cmd}: {text}")
+                }
+                CommandResult::Exit => panic!("{cmd} must reply"),
+            }
         }
     }
 }

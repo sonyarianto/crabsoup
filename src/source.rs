@@ -1,5 +1,6 @@
 pub mod file;
 pub mod playlist;
+pub mod request;
 
 use symphonia::core::audio::SignalSpec;
 

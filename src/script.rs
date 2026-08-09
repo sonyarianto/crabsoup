@@ -43,6 +43,7 @@ use crate::engine::effects::{Agc, Amplify, Compressor, EffectSource};
 use crate::engine::mixer::CrossfadeMixer;
 use crate::source::file::FileSource;
 use crate::source::playlist::Playlist;
+use crate::source::request::{RequestQueue, RequestQueueSource};
 use crate::source::{AudioSource, BlankSource, SilenceSource, SineSource};
 
 /// Everything the engine needs after a `.lua` script finishes evaluating.
@@ -55,6 +56,9 @@ pub struct ScriptResult {
     pub outputs: Vec<OutputConfig>,
     pub file_outputs: Vec<FileOutputConfig>,
     pub hls_outputs: Vec<HlsOutputConfig>,
+    /// Shared state of the `request.queue` source, handed to the telnet
+    /// server for `queue.push`/`queue.list`/`queue.clear`/`queue.skip`.
+    pub request_queue: Option<Arc<RequestQueue>>,
     /// The engine's root source, taken from `output.icecast`.
     pub root: Option<Box<dyn AudioSource>>,
     /// The root source from `output.preview` (used when no icecast output).
@@ -72,6 +76,7 @@ struct ScriptState {
     outputs: Vec<OutputConfig>,
     file_outputs: Vec<FileOutputConfig>,
     hls_outputs: Vec<HlsOutputConfig>,
+    request_queue: Option<Arc<RequestQueue>>,
     /// The shared root source graph. First `output.icecast` call steals the
     /// box; later calls must pass the same `Arc` (checked via `ptr_eq`).
     root: Option<Box<dyn AudioSource>>,
@@ -276,8 +281,11 @@ impl FromLua for LuaSource {
     }
 }
 
-/// Selects children in script order: the first non-exhausted child wins
-/// (Liquidsoap's `fallback` / `sequence`).
+/// Selects children in script order: the first available child wins, and
+/// availability is re-checked from the top on every pull (Liquidsoap's
+/// `fallback` / `sequence`). A child that exhausts is skipped forever; a
+/// child that becomes available again later (a `request.queue` receiving a
+/// push) preempts the current one.
 struct FallbackSource {
     children: Vec<LuaSource>,
     current: usize,
@@ -287,39 +295,53 @@ impl FallbackSource {
     fn new(children: Vec<LuaSource>) -> Self {
         Self { children, current: 0 }
     }
+
+    /// Index of the first child that can still produce audio.
+    fn active(&self) -> Option<usize> {
+        (0..self.children.len()).find(|&i| {
+            let child = self.children[i].0.lock().unwrap();
+            !child.is_exhausted()
+        })
+    }
 }
 
 impl AudioSource for FallbackSource {
     fn next_buffer(&mut self, buffer: &mut [f32]) -> usize {
-        while self.current < self.children.len() {
-            let n = self.children[self.current].0.lock().unwrap().next_buffer(buffer);
+        for i in 0..self.children.len() {
+            let n = self.children[i].0.lock().unwrap().next_buffer(buffer);
             if n > 0 {
+                self.current = i;
                 return n;
             }
-            if self.children[self.current].0.lock().unwrap().is_exhausted() {
-                log::debug!("fallback: child {} done, switching", self.current);
-                self.current += 1;
-                continue;
+            if !self.children[i].0.lock().unwrap().is_exhausted() {
+                // First available child is temporarily silent: wait for it.
+                return 0;
             }
-            return 0;
         }
         0
     }
 
     fn is_exhausted(&self) -> bool {
-        self.current >= self.children.len()
-            || self.children[self.current..]
-                .iter()
-                .all(|c| c.0.lock().unwrap().is_exhausted())
+        self.active().is_none()
     }
 
     fn remaining_seconds(&self) -> Option<f64> {
-        self.children
-            .get(self.current)
-            .and_then(|c| c.0.lock().unwrap().remaining_seconds())
+        self.active()
+            .and_then(|i| self.children[i].0.lock().unwrap().remaining_seconds())
     }
 
     fn label(&self) -> Option<String> {
+        if let Some(i) = self.active() {
+            return self
+                .children[i]
+                .0
+                .lock()
+                .unwrap()
+                .label()
+                .or_else(|| Some("(no source)".into()));
+        }
+        // Everything exhausted: keep reporting the last track's label so
+        // metadata hooks do not see a spurious "(no source)" transition.
         self.children
             .get(self.current)
             .and_then(|c| c.0.lock().unwrap().label())
@@ -501,6 +523,19 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
             Ok(LuaSource::new(Box::new(src)))
         })?,
     )?;
+
+    // ---- request queue (Liquidsoap `request.queue`) ----------------------
+    let queue_state = state.clone();
+    let request_fn = lua.create_function(move |_, _: ()| {
+        let (spec, fpb) = bus(&queue_state);
+        let queue = Arc::new(RequestQueue::new());
+        queue_state.borrow_mut().request_queue = Some(queue.clone());
+        let src = RequestQueueSource::new(queue, spec, fpb);
+        Ok(LuaSource::new(Box::new(src)))
+    })?;
+    let request = lua.create_table()?;
+    request.set("queue", request_fn)?;
+    globals.set("request", request)?;
 
     // ---- test sources (Liquidsoap `blank`, `sine`) -----------------------
     let blank_state = state.clone();
@@ -836,6 +871,7 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         outputs: std::mem::take(&mut s.outputs),
         file_outputs: std::mem::take(&mut s.file_outputs),
         hls_outputs: std::mem::take(&mut s.hls_outputs),
+        request_queue: s.request_queue.take(),
         root: s.root.take(),
         preview: s.preview.take(),
     };
@@ -945,6 +981,62 @@ mod tests {
             buf[..n2].iter().any(|&s| s.abs() > 0.01),
             "fallback did not reach the sine after blank ended"
         );
+    }
+
+    #[test]
+    fn request_queue_registers_and_is_shared_with_the_control_port() {
+        let (_rt, res) = run(
+            r#"
+            q = request.queue()
+            output.preview(fallback({q, sine({freq = 440, duration = 1})}))
+            "#,
+        )
+        .expect("script runs");
+        let queue = res.request_queue.expect("queue registered");
+        assert!(queue.is_empty());
+        queue.push("/tmp/x.mp3".into());
+        assert_eq!(queue.list(), vec![PathBuf::from("/tmp/x.mp3")]);
+    }
+
+    #[test]
+    fn request_queue_preempts_a_playing_playlist_when_pushed() {
+        let real = PathBuf::from("media/sunset-house-grooves-deep-house-sunset-538759.mp3");
+        if !real.exists() {
+            return;
+        }
+        let (_rt, res) = run(
+            r#"
+            q = request.queue()
+            output.preview(fallback({q, sine({freq = 440, duration = 2})}))
+            "#,
+        )
+        .expect("script runs");
+        let queue = res.request_queue.as_ref().expect("queue registered");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+
+        // Queue empty: the sine plays.
+        let n = root.next_buffer(&mut buf);
+        assert!(n > 0);
+        assert!(buf[..n].iter().any(|&s| s.abs() > 0.01), "sine should play");
+        assert_eq!(root.label().as_deref(), Some("sine 440 Hz"));
+
+        // Pushing a request mid-stream: the queue preempts on the next pull.
+        queue.push(real.clone());
+        let n = root.next_buffer(&mut buf);
+        assert!(n > 0);
+        assert_eq!(
+            root.label(),
+            Some(real.display().to_string()),
+            "queued track must take over"
+        );
+
+        // `queue.skip` drops the requested track; with the queue now empty
+        // the fallback returns to the sine.
+        queue.request_skip();
+        let n = root.next_buffer(&mut buf);
+        assert!(n > 0);
+        assert_eq!(root.label().as_deref(), Some("sine 440 Hz"));
     }
 
     #[test]

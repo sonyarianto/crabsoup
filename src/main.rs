@@ -82,9 +82,11 @@ fn main() -> crabsoup::Result<()> {
 
     if let Some(ctl_cfg) = &result.control {
         let jingles = result.jingles.clone();
+        let queue = result.request_queue.clone();
         let server = crabsoup::control::ControlServer::new(
             ctl_cfg.clone(),
             jingles,
+            queue,
             tx.clone(),
             status.clone(),
         );

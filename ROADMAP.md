@@ -119,7 +119,7 @@ buffer; audio-rate callbacks need their own budget/backpressure story.
 ### Part B — feature phases
 
 #### Phase 3 — request queue
-- [ ] FIFO source pushed at runtime via telnet `queue.push <path>`, plays
+- [x] FIFO source pushed at runtime via telnet `queue.push <path>`, plays
       when non-empty, exhausts when empty (composes in `fallback` before the
       playlist, like `request.queue`); `queue.list`, `queue.clear`; `skip`
       wired to the current track (playlist skip).
@@ -212,6 +212,27 @@ approximates the operator surface, not the language); LADSPA plugin hosting
 practice).
 
 ## Done (cont.)
+- [x] Phase 3 (request queue): `src/source/request.rs` — `RequestQueue`
+      (FIFO of `Arc<str>` paths, `next()` pops under one lock, `skip()`
+      jumps the current request instead of waiting, `Clear` command
+      flushes). `request.queue()` registered in `script.rs` as a normal
+      source (returns `LuaSource`; no global state, composes anywhere
+      `fallback`/`sequence`/`random` take children — the queue only
+      fires when non-empty, like liq `request.queue`). `MixCommand::
+      QueuePush/QueueList/QueueSkip/QueueClear` in `control.rs`; telnet
+      `queue.push <path>` (queues without touching the playlist),
+      `queue.list`, `queue.skip` (skips the currently-queued request),
+      `queue.clear`. `ControlState.status` line shows the queued item
+      while paused (telnet `status` renders it). Note: a request is
+      consumed when playback *starts* (Liquidsoap semantics) — `queue.list`
+      shows empty while a queued track is on air. Inline tests (99 -> 104):
+      push/pop ordering, exhaust-then-silence, skip mid-request, clear,
+      queue+pause status, skip-noop on an empty queue, fallback
+      composition and handover back to the playlist. Verified live over
+      the telnet port with a harbor + `output.preview` script: `queue.push`
+      of a staged jingle preempts the looping playlist (`request queue:
+      playing ...`), `queue.skip` returns to the playlist, `queue.clear`
+      flushes, unknown commands are rejected.
 - [x] C1 (`output.file`): `src/output/file.rs` — `FileOutput`, a tap
       consumer mirroring `IcecastOutput` minus the network: no pacing, no
       reconnect; the encoder and file are created in `connect()` so a bad
