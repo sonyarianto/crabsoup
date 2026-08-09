@@ -36,7 +36,8 @@ use rand::{Rng, SeedableRng};
 use symphonia::core::audio::SignalSpec;
 
 use crate::config::{
-    collect_audio, ControlConfig, LiveConfig, MixerConfig, OutputConfig, OutputFormat, StreamConfig,
+    collect_audio, ControlConfig, FileOutputConfig, LiveConfig, MixerConfig, OutputConfig,
+    OutputFormat, StreamConfig,
 };
 use crate::engine::effects::{Agc, Amplify, Compressor, EffectSource};
 use crate::engine::mixer::CrossfadeMixer;
@@ -52,6 +53,7 @@ pub struct ScriptResult {
     pub harbor: Option<LiveConfig>,
     pub control: Option<ControlConfig>,
     pub outputs: Vec<OutputConfig>,
+    pub file_outputs: Vec<FileOutputConfig>,
     /// The engine's root source, taken from `output.icecast`.
     pub root: Option<Box<dyn AudioSource>>,
     /// The root source from `output.preview` (used when no icecast output).
@@ -67,6 +69,7 @@ struct ScriptState {
     harbor: Option<LiveConfig>,
     control: Option<ControlConfig>,
     outputs: Vec<OutputConfig>,
+    file_outputs: Vec<FileOutputConfig>,
     /// The shared root source graph. First `output.icecast` call steals the
     /// box; later calls must pass the same `Arc` (checked via `ptr_eq`).
     root: Option<Box<dyn AudioSource>>,
@@ -694,17 +697,38 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
     globals.set("server", server)?;
 
     // ---- outputs ----------------------------------------------------------
+    /// Parse an output format string (`"mp3"` / `"opus"`).
+    fn parse_format(value: &str) -> mlua::Result<OutputFormat> {
+        match value {
+            "mp3" => Ok(OutputFormat::Mp3),
+            "opus" => Ok(OutputFormat::Opus),
+            other => Err(mlua::Error::runtime(format!(
+                "unknown output format {other:?} (use \"mp3\" or \"opus\")"
+            ))),
+        }
+    }
+
+    /// First output call wins the shared root; later calls must pass the
+    /// same source graph (`Arc::ptr_eq`).
+    fn claim_root(s: &mut ScriptState, source: &mut LuaSource) -> mlua::Result<()> {
+        match &s.root_arc {
+            None => {
+                s.root_arc = Some(source.0.clone());
+                s.root = Some(source.take());
+                Ok(())
+            }
+            Some(existing) if Arc::ptr_eq(existing, &source.0) => Ok(()),
+            Some(_) => Err(mlua::Error::runtime(
+                "output calls must all share the same root source",
+            )),
+        }
+    }
+
     let out_state = state.clone();
     let make_output = lua.create_function(move |_, (opts, mut source): (Table, LuaSource)| {
         let format = opts
             .get::<Option<String>>("format")?
-            .map(|f| match f.as_str() {
-                "mp3" => Ok(OutputFormat::Mp3),
-                "opus" => Ok(OutputFormat::Opus),
-                other => Err(mlua::Error::runtime(format!(
-                    "unknown output format {other:?} (use \"mp3\" or \"opus\")"
-                ))),
-            })
+            .map(|f| parse_format(&f))
             .transpose()?
             .unwrap_or(OutputFormat::Mp3);
         let cfg = OutputConfig {
@@ -723,21 +747,7 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
             reconnect_seconds: opts.get("reconnect").unwrap_or(5),
         };
         let mut s = out_state.borrow_mut();
-        match &s.root_arc {
-            None => {
-                // First output wins the shared root; later outputs are
-                // extra sinks over the same engine tap.
-                s.root_arc = Some(source.0.clone());
-                s.root = Some(source.take());
-            }
-            Some(existing) => {
-                if !Arc::ptr_eq(existing, &source.0) {
-                    return Err(mlua::Error::runtime(
-                        "output.icecast calls must all share the same root source",
-                    ));
-                }
-            }
-        }
+        claim_root(&mut s, &mut source)?;
         s.outputs.push(cfg);
         Ok(())
     })?;
@@ -748,6 +758,29 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         "preview",
         lua.create_function(move |_, mut source: LuaSource| {
             prev_state.borrow_mut().preview = Some(source.take());
+            Ok(())
+        })?,
+    )?;
+    let file_state = state.clone();
+    output.set(
+        "file",
+        lua.create_function(move |_, (opts, mut source): (Table, LuaSource)| {
+            let path: String = opts
+                .get("path")
+                .map_err(|_| mlua::Error::runtime("output.file: path is required"))?;
+            let format = opts
+                .get::<Option<String>>("format")?
+                .map(|f| parse_format(&f))
+                .transpose()?
+                .unwrap_or(OutputFormat::Mp3);
+            let cfg = FileOutputConfig {
+                path: path.into(),
+                format,
+                bitrate: opts.get("bitrate").unwrap_or(128_000),
+            };
+            let mut s = file_state.borrow_mut();
+            claim_root(&mut s, &mut source)?;
+            s.file_outputs.push(cfg);
             Ok(())
         })?,
     )?;
@@ -780,6 +813,7 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         harbor: s.harbor.take(),
         control: s.control.take(),
         outputs: std::mem::take(&mut s.outputs),
+        file_outputs: std::mem::take(&mut s.file_outputs),
         root: s.root.take(),
         preview: s.preview.take(),
     };
@@ -964,6 +998,48 @@ mod tests {
             "#,
         ) {
             Ok(_) => panic!("second output with a different root must fail"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("share the same root source"));
+    }
+
+    #[test]
+    fn file_output_registers_and_shares_root() {
+        let (_rt, res) = run(
+            r#"
+            src = sine({freq = 440, duration = 1})
+            output.file({path = "/tmp/crabsoup-c1.mp3", format = "mp3", bitrate = 64000}, src)
+            output.icecast({mount = "/x.mp3"}, src)
+            "#,
+        )
+        .expect("script runs");
+        assert_eq!(res.file_outputs.len(), 1);
+        assert_eq!(res.outputs.len(), 1);
+        assert!(res.root.is_some());
+        assert_eq!(res.file_outputs[0].format, OutputFormat::Mp3);
+        assert_eq!(res.file_outputs[0].path.to_str(), Some("/tmp/crabsoup-c1.mp3"));
+        assert_eq!(res.file_outputs[0].bitrate, 64_000);
+    }
+
+    #[test]
+    fn file_output_requires_path_and_shared_root() {
+        let err = match run(
+            r#"
+            output.file({format = "mp3"}, sine({freq = 440}))
+            "#,
+        ) {
+            Ok(_) => panic!("output.file without path must fail"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("path is required"));
+
+        let err = match run(
+            r#"
+            output.file({path = "/tmp/a.mp3"}, sine({freq = 440}))
+            output.file({path = "/tmp/b.mp3"}, sine({freq = 880}))
+            "#,
+        ) {
+            Ok(_) => panic!("second output.file with a different root must fail"),
             Err(e) => e,
         };
         assert!(err.to_string().contains("share the same root source"));

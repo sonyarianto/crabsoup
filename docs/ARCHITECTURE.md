@@ -34,7 +34,8 @@ One engine thread plus one thread per output:
 - Registers the Liquidsoap-flavoured Lua stdlib: `playlist`, `single`,
   `blank`, `sine`, `amplify`, `compress`, `normalize`, `jingles`,
   `fallback`/`sequence`/`random`, `input.harbor`, `output.icecast`,
-  `output.preview`, `server.telnet`, `on_metadata`, `set`, `log`.
+  `output.file`, `output.preview`, `server.telnet`, `on_metadata`, `set`,
+  `log`.
 - Sources are Lua userdata wrapping `Arc<Mutex<Box<dyn AudioSource>>>` so they
   compose; `LuaSource::take` steals the box via `mem::replace` (mlua keeps a
   clone on the stack during the call, so `Arc::try_unwrap` would fail).

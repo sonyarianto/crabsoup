@@ -9,6 +9,7 @@ use clap::Parser;
 use crabsoup::engine::mixer::{MixCommand, PriorityMixer, StatusHandle};
 use crabsoup::engine::tap::{AudioFrame, EngineTap};
 use crabsoup::live::harbor::Harbor;
+use crabsoup::output::file::FileOutput;
 use crabsoup::output::icecast::IcecastOutput;
 use crabsoup::script::{self, ScriptResult};
 use crabsoup::source::AudioSource;
@@ -144,6 +145,22 @@ fn main() -> crabsoup::Result<()> {
         }));
     }
 
+    // File outputs: the encoder and file are created up front so a bad path
+    // fails fast at startup; the consumer thread then just drains the tap.
+    let record = if cli.preview {
+        Vec::new()
+    } else {
+        result.file_outputs.clone()
+    };
+    for cfg in &record {
+        let mut output = FileOutput::new(cfg.clone(), tap.register(), spec.rate, chans);
+        output.set_shutdown(shutdown.clone());
+        output
+            .connect()
+            .map_err(|e| format!("output.file: {e}"))?;
+        handles.push(std::thread::spawn(move || output.run()));
+    }
+
     // The tap pulls on its own thread; the Lua-owning main thread runs the
     // script event loop.
     let tap_shutdown = shutdown.clone();
@@ -151,10 +168,23 @@ fn main() -> crabsoup::Result<()> {
 
     runtime.run_event_loop(&shutdown);
 
+    let mut first_error: Option<String> = None;
     for handle in handles {
-        let _ = handle.join();
+        match handle.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                log::error!("output thread error: {e}");
+                if first_error.is_none() {
+                    first_error = Some(e.to_string());
+                }
+            }
+            Err(_) => log::error!("output thread panicked"),
+        }
     }
     let _ = tap_handle.join();
+    if let Some(msg) = first_error {
+        return Err(msg.into());
+    }
     Ok(())
 }
 
@@ -178,14 +208,18 @@ fn print_result(result: &ScriptResult, preview: bool) {
     }
     if preview {
         lines.push("output: preview only (forced by --preview)".to_string());
-    } else if result.outputs.is_empty() {
-        lines.push("output: preview only".to_string());
     } else {
         for out in &result.outputs {
             lines.push(format!(
                 "output: {:?} to {}:{}{}",
                 out.format, out.host, out.port, out.mount
             ));
+        }
+        for rec in &result.file_outputs {
+            lines.push(format!("record: {:?} to {}", rec.format, rec.path.display()));
+        }
+        if result.outputs.is_empty() && result.file_outputs.is_empty() {
+            lines.push("output: preview only".to_string());
         }
     }
     println!("{}", lines.join("\n"));

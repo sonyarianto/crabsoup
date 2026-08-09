@@ -130,9 +130,8 @@ buffer; audio-rate callbacks need their own budget/backpressure story.
 #### Phase 4 — multi-output + file recording (needs A1)
 - [x] `output.icecast` callable more than once (different mounts/formats,
       same source graph) — part of Part A.
-- [ ] `output.file({path, format}, source)`: same consumer shape as
-      `IcecastOutput` with a file sink; verified by ffprobe-decoding the
-      recorded file.
+- [x] `output.file({path, format, bitrate}, source)`: tap consumer with a
+      file sink — part of C1.
 
 #### Phase 5 — scheduling (dayparting)
 - [ ] `switch` source with time-based brackets (liq `switch` semantics:
@@ -159,8 +158,9 @@ buffer; audio-rate callbacks need their own budget/backpressure story.
 Touches `src/output/` and `src/live/`, not `script.rs` source composition —
 no contention with Part B.
 
-- [ ] **C1 — `output.file` + multi-mount `output.icecast`** (needs A1; same
-      work as Phase 4, no separate effort).
+- [ ] **C1 — `output.file` + multi-mount `output.icecast`** (needs A1;
+      multi-mount landed with Part A; `output.file` landed as its own
+      commit — see Done section).
 - [ ] **C2 — AAC encoder** (no dependency, can start immediately): new
       `Encoder` impl, FFI to `fdk-aac` following the LAME `unsafe extern
       "C"` template (opaque handle, explicit `Drop`, `unsafe impl Send` with
@@ -200,6 +200,21 @@ approximates the operator surface, not the language); LADSPA plugin hosting
 practice).
 
 ## Done (cont.)
+- [x] C1 (`output.file`): `src/output/file.rs` — `FileOutput`, a tap
+      consumer mirroring `IcecastOutput` minus the network: no pacing, no
+      reconnect; the encoder and file are created in `connect()` so a bad
+      path fails at startup (`main.rs` fails fast before the tap starts).
+      `output.file({path, format, bitrate}, source)` registered in
+      `script.rs` alongside the icecast closure via a shared `claim_root`
+      helper (`Arc::ptr_eq` check); `ScriptResult.file_outputs:
+      Vec<FileOutputConfig>`. `main.rs` spawns one consumer thread per file
+      output and now surfaces output-thread errors after unwind (first error
+      becomes the process exit error). Inline tests: MP3 file written from a
+      sine is decoded back with symphonia and asserted non-silent; Opus file
+      asserts Ogg magic + size; script tests for registration, root sharing,
+      missing path, and mixed-root rejection. Verified live: mp3 (44.1 kHz)
+      + Opus (48 kHz) recordings from a 25 s broadcast decode cleanly with
+      ffprobe and close on telnet shutdown; broadcast unaffected.
 - [x] Part A (engine tap + Lua event loop, one PR): `src/engine/tap.rs` —
       `EngineTap` owns the root source on its own thread and publishes each
       wall-clock-paced buffer as `Arc<AudioFrame { pcm, label }>` to N

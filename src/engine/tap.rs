@@ -19,7 +19,7 @@ pub struct AudioFrame {
     pub pcm: Vec<f32>,
     pub label: Option<Arc<str>>,
     /// Returns `pcm` to the shared pool when the last consumer drops us.
-    pool: Option<Arc<FramePool>>,
+    pub(crate) pool: Option<Arc<FramePool>>,
 }
 
 impl Drop for AudioFrame {
@@ -37,7 +37,7 @@ impl Drop for AudioFrame {
 /// consumer is done. If the pool ever runs dry (stalled consumers holding
 /// frames), the puller falls back to a fresh `Vec` — allocation only on that
 /// degraded path, never on the steady-state one.
-struct FramePool {
+pub(crate) struct FramePool {
     idle: Mutex<Vec<Vec<f32>>>,
     max_idle: usize,
 }

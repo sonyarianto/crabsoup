@@ -80,6 +80,14 @@ pub struct OutputConfig {
     pub reconnect_seconds: u64,
 }
 
+/// Config for `output.file`: encode the tap to a local file.
+#[derive(Debug, Clone)]
+pub struct FileOutputConfig {
+    pub path: PathBuf,
+    pub format: OutputFormat,
+    pub bitrate: u32,
+}
+
 impl Default for OutputConfig {
     fn default() -> Self {
         Self {
