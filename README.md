@@ -6,9 +6,9 @@ input and one-shot jingles with crossfades, and broadcasts the result (MP3 or
 Opus) to an Icecast server.
 
 - `.lua` scripting: real Lua with Liquidsoap-style functions — `playlist`,
-  `single`, `blank`, `sine`, `amplify`, `fallback`, `sequence`, `random`,
-  `jingles`, `input.harbor`, `output.icecast`, `output.preview`,
-  `server.telnet`, `set`, `log`
+  `single`, `blank`, `sine`, `amplify`, `compress`, `normalize`, `fallback`,
+  `sequence`, `random`, `jingles`, `input.harbor`, `output.icecast`,
+  `output.preview`, `server.telnet`, `set`, `log`
 - Playlist scheduling: recursive directory scan, explicit file lists, loop and shuffle
 - Gapless crossfades with configurable overlap and fade curve
 - Live DJ harbor: an Icecast source-protocol listener (`PUT /live`); the
@@ -102,8 +102,10 @@ output.icecast({host = "localhost", port = 8000,
 Named options are passed as Lua tables; most have defaults. `format` is
 `"mp3"` or `"opus"`. Composable sources: `playlist`, `single`, `jingles`,
 `fallback`/`sequence`, `random` (non-repeating shuffle), `blank`/`sine`
-(test tones, both accept an optional `duration`), and `amplify(source, gain)`.
-`output.preview(...)` runs without broadcasting.
+(test tones, both accept an optional `duration`), and the DSP operators
+`amplify(source, gain)`, `compress(source, opts)`, `normalize(source, opts)`
+(run inline in the pull chain). `output.preview(...)` runs without
+broadcasting.
 
 ### Control port
 
@@ -134,6 +136,7 @@ phase).
 | `blank(duration)` | `blank({duration = 2.0})` | done |
 | `sine(freq, duration)` | `sine({freq = 440, duration = 60, amplitude = 0.5})` | done |
 | `amplify(src, gain)` | `amplify(src, 0.5)` | done |
+| `compress(threshold, ratio, ...)`, `normalize(target, ...)` | `compress(src, {threshold = -12, ratio = 2})`, `normalize(src, {target = -13})` | done |
 | `input.harbor(...)` | `input.harbor({...})` | done |
 | `output.icecast(...)` | `output.icecast({...}, src)` | done (single output; multi-mount in Phase 4) |
 | `output.file(...)` | `output.file({path, format}, src)` | planned (Phase 4) |
@@ -145,7 +148,6 @@ phase).
 | `switch` (dayparting), `rotate` | planned (Phase 5) | planned |
 | `on_metadata` / `on_track` | planned (Phase 6) | planned |
 | `http://` request resolution | planned (Phase 7) | planned |
-| `compress` / `normalize` | planned (Phase 2) | planned |
 
 ## Testing
 

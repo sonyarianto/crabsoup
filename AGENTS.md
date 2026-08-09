@@ -48,9 +48,10 @@ is that Playlist input; all sources are normalised to the PCM bus
 (`set("sample_rate", ...)`, `set("channels", ...)`, `frames_per_buffer`).
 
 - `src/script.rs` registers the Liquidsoap-flavoured Lua stdlib
-  (`playlist`, `single`, `blank`, `sine`, `amplify`, `jingles`,
-  `fallback`/`sequence`/`random`, `input.harbor`, `output.icecast`,
-  `output.preview`, `server.telnet`, `set`, `log`). Sources are Lua userdata
+  (`playlist`, `single`, `blank`, `sine`, `amplify`, `compress`, `normalize`,
+  `jingles`, `fallback`/`sequence`/`random`, `input.harbor`,
+  `output.icecast`, `output.preview`, `server.telnet`, `set`, `log`).
+  Sources are Lua userdata
   wrapping `Arc<Mutex<Box<dyn AudioSource>>>`
   so they can be composed; `LuaSource::into_inner` steals the box via
   `mem::replace` (mlua keeps a clone on the stack during the call, so

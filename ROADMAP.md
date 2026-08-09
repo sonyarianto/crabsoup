@@ -112,17 +112,6 @@ their own budget/backpressure story.
 
 ### Part B — feature phases
 
-#### Phase 2 — DSP effect chain (no Part A dependency)
-- [ ] `src/engine/effects.rs` gains `Compressor` (envelope follower; gain
-      reduction only above a threshold; `threshold`, `ratio`, `attack`,
-      `release`) and `Agc` (same follower shape, targets a level instead of
-      limiting — backs `normalize`). Register `amplify`/`compress`/
-      `normalize` with one `lua.create_function` closure each, matching the
-      existing `composer`/`fallback` registration style in `script.rs`.
-- [ ] Inline tests per effect: synthetic sine input, exact expected sample
-      values (mixer.rs style), gain reduction only above threshold, quiet
-      signal brought up toward the target.
-
 #### Phase 3 — request queue
 - [ ] FIFO source pushed at runtime via telnet `queue.push <path>`, plays
       when non-empty, exhausts when empty (composes in `fallback` before the
@@ -187,8 +176,8 @@ no contention with Part B.
 2. Phase 1 (primitives) — **done** (see Done section).
 3. Part A (A1 + A2 together — they share the "who owns the pull loop"
    decision, easier to land as one architectural PR than two) — **next**.
-4. Track B, sequential: Phase 2 (no Part A dependency, can start early) →
-   Phase 3 → Phase 5 → Phase 6 (needs A2) → Phase 7 → Phase 8 (stretch).
+4. Track B, sequential: Phase 2 (DSP) — **done**; next Phase 3 → Phase 5 →
+   Phase 6 (needs A2) → Phase 7 → Phase 8 (stretch).
 5. Track C once A1 lands: C1 → C2 → C3 (needs C2) → C4 (on request).
 
 If effort is constrained to one track at a time, prioritize Track C through
@@ -203,6 +192,20 @@ approximates the operator surface, not the language); LADSPA plugin hosting
 practice).
 
 ## Done (cont.)
+- [x] Phase 2 (DSP effect chain): `src/engine/effects.rs` gains `Compressor`
+      (feed-forward envelope follower, gain reduction only above
+      `threshold_db`, `ratio`, `attack`/`release` time constants, `makeup`)
+      and `Agc` (same follower shape with a faster measurement stage, rides
+      the gain toward `target_db` with slow-boost/fast-cut smoothing,
+      `max_boost_db`/`max_cut_db` clamps — backs `normalize`). Operators
+      `compress(source, opts)` and `normalize(source, opts)` registered in
+      `script.rs` via one `lua.create_function` each, chaining through the
+      same `EffectSource` as `amplify`. Inline tests with synthetic sine
+      input assert exact expected sample values (gain reduction only above
+      threshold, ratio-1 transparency, makeup gain, quiet signal brought up
+      toward the target, max-boost clamp, slow gain on silence so it does
+      not pump). Verified live: `examples/crabsoup.dsp.lua` (compress ->
+      normalize -> amplify on a 440 Hz tone) runs in preview.
 - [x] Phase 1 (ops primitives): `blank`/`sine` test sources (optional
       `duration`; exhaust cleanly so `fallback` hands over), `amplify`
       operator via new `src/engine/effects.rs` (`Effect` trait +

@@ -36,7 +36,7 @@ use symphonia::core::audio::SignalSpec;
 use crate::config::{
     collect_audio, ControlConfig, LiveConfig, MixerConfig, OutputConfig, OutputFormat, StreamConfig,
 };
-use crate::engine::effects::{Amplify, EffectSource};
+use crate::engine::effects::{Agc, Amplify, Compressor, EffectSource};
 use crate::engine::mixer::CrossfadeMixer;
 use crate::source::file::FileSource;
 use crate::source::playlist::Playlist;
@@ -248,6 +248,14 @@ impl AudioSource for RandomSource {
     }
 }
 
+/// Read an optional numeric table field with a default.
+fn opt_f64(opts: &Option<Table>, key: &str, default: f64) -> mlua::Result<f64> {
+    match opts {
+        Some(t) => Ok(t.get::<Option<f64>>(key)?.unwrap_or(default)),
+        None => Ok(default),
+    }
+}
+
 /// Parse an audio source list from a Lua array table of `LuaSource`s.
 fn source_list(table: &Table) -> mlua::Result<Vec<LuaSource>> {
     let mut sources = Vec::new();
@@ -391,7 +399,7 @@ pub fn run(src: &str) -> mlua::Result<ScriptResult> {
         })?,
     )?;
 
-    // ---- effects (Liquidsoap `amplify`) ----------------------------------
+    // ---- effects (Liquidsoap `amplify`, `compress`, `normalize`) ---------
     let amp_state = state.clone();
     globals.set(
         "amplify",
@@ -401,6 +409,60 @@ pub fn run(src: &str) -> mlua::Result<ScriptResult> {
             let src =
                 EffectSource::new(child, Amplify::new(gain as f32), spec.channels.count());
             Ok(LuaSource::new(Box::new(src)))
+        })?,
+    )?;
+
+    let compress_state = state.clone();
+    globals.set(
+        "compress",
+        lua.create_function(move |_, (mut source, opts): (LuaSource, Option<Table>)| {
+            let threshold = opt_f64(&opts, "threshold", -12.0)?;
+            let ratio = opt_f64(&opts, "ratio", 2.0)?;
+            let attack = opt_f64(&opts, "attack", 0.005)?;
+            let release = opt_f64(&opts, "release", 0.1)?;
+            let makeup = opt_f64(&opts, "makeup", 0.0)?;
+            let (spec, _) = bus(&compress_state);
+            let child = source.take();
+            let fx = Compressor::new(
+                threshold as f32,
+                ratio as f32,
+                attack as f32,
+                release as f32,
+                makeup as f32,
+                spec.rate,
+            );
+            Ok(LuaSource::new(Box::new(EffectSource::new(
+                child,
+                fx,
+                spec.channels.count(),
+            ))))
+        })?,
+    )?;
+
+    let normalize_state = state.clone();
+    globals.set(
+        "normalize",
+        lua.create_function(move |_, (mut source, opts): (LuaSource, Option<Table>)| {
+            let target = opt_f64(&opts, "target", -13.0)?;
+            let attack = opt_f64(&opts, "attack", 3.0)?;
+            let release = opt_f64(&opts, "release", 0.5)?;
+            let max_boost = opt_f64(&opts, "max_boost", 20.0)?;
+            let max_cut = opt_f64(&opts, "max_cut", 20.0)?;
+            let (spec, _) = bus(&normalize_state);
+            let child = source.take();
+            let fx = Agc::new(
+                target as f32,
+                attack as f32,
+                release as f32,
+                max_boost as f32,
+                max_cut as f32,
+                spec.rate,
+            );
+            Ok(LuaSource::new(Box::new(EffectSource::new(
+                child,
+                fx,
+                spec.channels.count(),
+            ))))
         })?,
     )?;
 
@@ -655,5 +717,40 @@ mod tests {
             buf[..n2].iter().any(|&s| s.abs() > 0.01),
             "fallback did not reach the sine after blank ended"
         );
+    }
+
+    #[test]
+    fn compress_reduces_a_loud_tone() {
+        let res = run(
+            r#"
+            output.preview(compress(sine({freq = 440, duration = 1, amplitude = 1.0}),
+                                    {threshold = -12, ratio = 2, attack = 0, release = 0}))
+            "#,
+        )
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        root.next_buffer(&mut buf);
+        let peak = buf.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        // 0 dB peaks, -12 dB threshold, 2:1 -> the peak is cut by 6 dB.
+        assert!((peak - 0.5).abs() < 0.01, "compressed peak {peak}");
+    }
+
+    #[test]
+    fn normalize_boosts_a_quiet_tone() {
+        let res = run(
+            r#"
+            output.preview(normalize(sine({freq = 440, duration = 1, amplitude = 0.02}),
+                                     {target = -6, attack = 0, release = 0}))
+            "#,
+        )
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        root.next_buffer(&mut buf);
+        let peak = buf.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        // 0.02 is -34 dB; reaching -6 needs +28 dB, clamped to the 20 dB
+        // max boost: 0.02 * 10 = 0.2.
+        assert!((peak - 0.2).abs() < 0.01, "normalized peak {peak}");
     }
 }
