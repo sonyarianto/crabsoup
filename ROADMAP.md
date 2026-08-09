@@ -141,7 +141,7 @@ buffer; audio-rate callbacks need their own budget/backpressure story.
 #### Phase 6 — metadata hooks (needs A2)
 - [x] `on_metadata(callback, source)`: A2 event loop, metadata table
       (title) per track start — part of Part A.
-- [ ] `on_track(callback, source)`: second `ScriptEvent` variant, fires on
+- [x] `on_track(callback, source)`: second `ScriptEvent` variant, fires on
       track boundary without full metadata.
 
 #### Phase 7 — request protocols (`http://` resolution, biggest lift)
@@ -257,6 +257,21 @@ practice).
       Verified live: `switch` with `days = {"sun"}` picked the Sunday
       branch on-air; telnet `skip` through `rotate({a, b})` alternated
       children track-by-track.
+- [x] Phase 6 (on_track): `ScriptEvent::Track { hook_id }` joins
+      `Metadata`; `ScriptState`/`ScriptRuntime` carry a separate
+      `track_hooks` vec (a `Track` event can never hit an `on_metadata`
+      callback). `OnTrackSource` wraps a child like `OnMetadataSource` but
+      reports a boundary on *any* track start: the child's `label` changed
+      (even to `None`), or it produces audio again after being silent
+      without exhausting (a paused/request-queue child resuming — a
+      boundary `on_metadata` would miss since the label may not change).
+      `on_track(callback, source)` registered in `script.rs`; the callback
+      runs on the Lua-owning event loop with no arguments (ROADMAP scope:
+      boundary without metadata). Inline tests (117 -> 120): one event per
+      track over a `sequence` of two sines, single short child, and a
+      `BurstySource` fake proving a resume-after-pause fires with an
+      unchanged label. Verified live: three 1.5 s sine tracks in sequence
+      logged `on_track #1/2/3` from the Lua callback on-air.
 - [x] C1 (`output.file`): `src/output/file.rs` — `FileOutput`, a tap
       consumer mirroring `IcecastOutput` minus the network: no pacing, no
       reconnect; the encoder and file are created in `connect()` so a bad

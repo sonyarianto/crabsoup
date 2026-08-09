@@ -85,6 +85,10 @@ struct ScriptState {
     /// Lua callbacks registered by `on_metadata`; indexed by hook id, live
     /// on the Lua-owning thread only.
     metadata_hooks: Vec<mlua::Function>,
+    /// Lua callbacks registered by `on_track`; indexed by hook id. Kept
+    /// separate from `metadata_hooks` so a `Track` event never calls an
+    /// `on_metadata` callback (and vice versa).
+    track_hooks: Vec<mlua::Function>,
 }
 
 /// Events sent from engine threads to the Lua-owning thread. The payload is
@@ -92,6 +96,9 @@ struct ScriptState {
 pub enum ScriptEvent {
     /// A source wrapped by `on_metadata` observed a track-label change.
     Metadata { hook_id: usize, title: String },
+    /// A source wrapped by `on_track` started a new track (boundary
+    /// detected, metadata not required).
+    Track { hook_id: usize },
     /// Request the engine stop (future `server.register` use).
     Shutdown,
 }
@@ -103,6 +110,7 @@ pub struct ScriptRuntime {
     pub lua: Lua,
     event_rx: mpsc::Receiver<ScriptEvent>,
     metadata_hooks: Vec<mlua::Function>,
+    track_hooks: Vec<mlua::Function>,
 }
 
 impl ScriptRuntime {
@@ -157,6 +165,14 @@ impl ScriptRuntime {
                     log::warn!("on_metadata callback error: {e}");
                 }
             }
+            ScriptEvent::Track { hook_id } => {
+                let Some(cb) = self.track_hooks.get(hook_id) else {
+                    return;
+                };
+                if let Err(e) = cb.call::<()>(()) {
+                    log::warn!("on_track callback error: {e}");
+                }
+            }
             ScriptEvent::Shutdown => {
                 end.store(true, std::sync::atomic::Ordering::SeqCst);
             }
@@ -198,6 +214,69 @@ impl AudioSource for OnMetadataSource {
             }
             self.last_label = label;
         }
+        n
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.child.is_exhausted()
+    }
+
+    fn remaining_seconds(&self) -> Option<f64> {
+        self.child.remaining_seconds()
+    }
+
+    fn label(&self) -> Option<String> {
+        self.child.label()
+    }
+
+    fn skip(&mut self) {
+        self.child.skip();
+    }
+}
+
+/// Wrapper source that emits [`ScriptEvent::Track`] at track boundaries —
+/// the child's label changed, or it produces audio again after having been
+/// silent (exhausted or paused). Unlike [`OnMetadataSource`], a boundary is
+/// reported even when the new track carries no label.
+struct OnTrackSource {
+    child: Box<dyn AudioSource>,
+    tx: mpsc::Sender<ScriptEvent>,
+    hook_id: usize,
+    last_label: Option<String>,
+    /// The child returned no audio since the last boundary.
+    silent: bool,
+}
+
+impl OnTrackSource {
+    fn new(child: Box<dyn AudioSource>, tx: mpsc::Sender<ScriptEvent>, hook_id: usize) -> Self {
+        Self {
+            child,
+            tx,
+            hook_id,
+            last_label: None,
+            silent: false,
+        }
+    }
+}
+
+impl AudioSource for OnTrackSource {
+    fn next_buffer(&mut self, buffer: &mut [f32]) -> usize {
+        let n = self.child.next_buffer(buffer);
+        if n == 0 {
+            // Silence: remember it, but only report the boundary when audio
+            // comes back (a permanently exhausted child is no new track).
+            if !self.child.is_exhausted() {
+                self.silent = true;
+            }
+            return n;
+        }
+        if self.silent || self.last_label != self.child.label() {
+            let _ = self.tx.send(ScriptEvent::Track {
+                hook_id: self.hook_id,
+            });
+        }
+        self.last_label = self.child.label();
+        self.silent = false;
         n
     }
 
@@ -1248,7 +1327,7 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
     )?;
     globals.set("output", output)?;
 
-    // ---- metadata hooks (Liquidsoap `on_metadata`) ------------------------
+    // ---- metadata hooks (Liquidsoap `on_metadata`, `on_track`) ---------------
     let meta_state = state.clone();
     let meta_tx = event_tx.clone();
     globals.set(
@@ -1258,6 +1337,19 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
             let child = source.take();
             meta_state.borrow_mut().metadata_hooks.push(callback);
             let wrapped = OnMetadataSource::new(child, meta_tx.clone(), hook_id);
+            Ok(LuaSource::new(Box::new(wrapped)))
+        })?,
+    )?;
+
+    let track_state = state.clone();
+    let track_tx = event_tx.clone();
+    globals.set(
+        "on_track",
+        lua.create_function(move |_, (mut source, callback): (LuaSource, mlua::Function)| {
+            let hook_id = track_state.borrow().track_hooks.len();
+            let child = source.take();
+            track_state.borrow_mut().track_hooks.push(callback);
+            let wrapped = OnTrackSource::new(child, track_tx.clone(), hook_id);
             Ok(LuaSource::new(Box::new(wrapped)))
         })?,
     )?;
@@ -1290,6 +1382,7 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         lua,
         event_rx,
         metadata_hooks: std::mem::take(&mut s.metadata_hooks),
+        track_hooks: std::mem::take(&mut s.track_hooks),
     };
     Ok((runtime, result))
 }
@@ -1489,6 +1582,143 @@ mod tests {
         assert_eq!(titles.raw_len(), 2, "expected one event per track");
         assert_eq!(titles.get::<String>(1).expect("t1"), "sine 440 Hz");
         assert_eq!(titles.get::<String>(2).expect("t2"), "sine 880 Hz");
+    }
+
+    // ---- Phase 6: on_track ----------------------------------------------
+
+    #[test]
+    fn on_track_fires_at_each_track_boundary() {
+        let (_rt, res) = run(
+            r#"
+            tracks = 0
+            src = on_track(sequence({sine({freq = 440, duration = 0.1}),
+                                     sine({freq = 880, duration = 0.1})}),
+                           function() tracks = tracks + 1 end)
+            output.preview(src)
+            "#,
+        )
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        for _ in 0..4 {
+            root.next_buffer(&mut buf);
+        }
+        drop(root);
+        _rt.drain_metadata();
+        let tracks: u64 = _rt.global("tracks").expect("tracks counter");
+        assert_eq!(tracks, 2, "one event per track start");
+    }
+
+    #[test]
+    fn on_track_fires_for_a_short_child_that_exhausts() {
+        let (_rt, res) = run(
+            r#"
+            tracks = {}
+            src = on_track(blank({duration = 0.1}),
+                           function() tracks[#tracks + 1] = true end)
+            output.preview(src)
+            "#,
+        )
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        root.next_buffer(&mut buf);
+        drop(root);
+        _rt.drain_metadata();
+        let tracks: mlua::Table = _rt.global("tracks").expect("tracks table");
+        assert_eq!(tracks.raw_len(), 1, "blank labels itself, so one boundary");
+    }
+
+    /// Audio in two bursts with a stretch of paused (non-exhausted)
+    /// zero-frame pulls between them, keeping the same label throughout.
+    struct BurstySource {
+        label: &'static str,
+        burst1: usize,
+        pause_pulls: usize,
+        burst2: usize,
+        state: u8, // 0 = burst 1, 1 = pause, 2 = burst 2, 3 = exhausted
+    }
+
+    impl BurstySource {
+        fn new(label: &'static str) -> Self {
+            Self { label, burst1: 100, pause_pulls: 1, burst2: 100, state: 0 }
+        }
+    }
+
+    impl AudioSource for BurstySource {
+        fn next_buffer(&mut self, buffer: &mut [f32]) -> usize {
+            match self.state {
+                0 if self.burst1 > 0 => {
+                    let take = self.burst1.min(buffer.len());
+                    buffer[..take].fill(0.5);
+                    self.burst1 -= take;
+                    take
+                }
+                0 => {
+                    self.state = 1;
+                    0
+                }
+                1 if self.pause_pulls > 0 => {
+                    self.pause_pulls -= 1;
+                    0
+                }
+                1 => {
+                    self.state = 2;
+                    0
+                }
+                2 if self.burst2 > 0 => {
+                    let take = self.burst2.min(buffer.len());
+                    buffer[..take].fill(0.5);
+                    self.burst2 -= take;
+                    take
+                }
+                2 => {
+                    self.state = 3;
+                    0
+                }
+                _ => 0,
+            }
+        }
+
+        fn is_exhausted(&self) -> bool {
+            self.state == 3
+        }
+
+        fn label(&self) -> Option<String> {
+            Some(self.label.into())
+        }
+    }
+
+    #[test]
+    fn on_track_reports_a_resume_after_a_pause_without_any_label_change() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let child: Box<dyn AudioSource> = Box::new(BurstySource::new("same-label"));
+        let mut src = OnTrackSource::new(child, tx, 0);
+        let mut buf = vec![0f32; 50];
+
+        // Burst 1: boundary #1 (None label -> "same-label").
+        assert_eq!(src.next_buffer(&mut buf), 50);
+        assert_eq!(src.next_buffer(&mut buf), 50);
+        // Three zero-frame pulls while not exhausted (segment rollover,
+        // the pause, and the rollover back into burst 2): silent, no event.
+        assert_eq!(src.next_buffer(&mut buf), 0);
+        assert_eq!(src.next_buffer(&mut buf), 0);
+        assert_eq!(src.next_buffer(&mut buf), 0);
+        // Burst 2 resumes with the *same* label: boundary #2 must still fire.
+        assert_eq!(src.next_buffer(&mut buf), 50);
+        assert_eq!(src.next_buffer(&mut buf), 50);
+        assert_eq!(src.next_buffer(&mut buf), 0);
+        assert!(src.is_exhausted());
+
+        let count = |rx: &std::sync::mpsc::Receiver<ScriptEvent>| -> usize {
+            let mut n = 0;
+            while let Ok(e) = rx.try_recv() {
+                assert!(matches!(e, ScriptEvent::Track { hook_id: 0 }));
+                n += 1;
+            }
+            n
+        };
+        assert_eq!(count(&rx), 2, "one event per burst, despite one label");
     }
 
     #[test]
@@ -1698,8 +1928,8 @@ mod tests {
     fn switch_stays_in_a_window_and_moves_to_the_default_when_it_closes() {
         let clock = Arc::new(Mutex::new(LocalTime { weekday: 1, minutes: 9 * 60 }));
         let fpb = 100;
-        let mut a = LuaSource::new(Box::new(LabelCycler::new(0.25, &["a1", "a2"], 300)));
-        let mut b = LuaSource::new(Box::new(LabelCycler::new(0.75, &["b1", "b2"], 300)));
+        let a = LuaSource::new(Box::new(LabelCycler::new(0.25, &["a1", "a2"], 300)));
+        let b = LuaSource::new(Box::new(LabelCycler::new(0.75, &["b1", "b2"], 300)));
         let mut src = ScheduleSource::new(
             ScheduleKind::Switch(vec![
                 SwitchSlot {

@@ -35,7 +35,7 @@ One engine thread plus one thread per output:
   `blank`, `sine`, `amplify`, `compress`, `normalize`, `jingles`,
   `fallback`/`sequence`/`random`, `switch`, `rotate`, `input.harbor`,
   `output.icecast`, `output.file`, `output.preview`, `server.telnet`,
-  `on_metadata`, `set`, `log`.
+  `on_metadata`, `on_track`, `set`, `log`.
 - Sources are Lua userdata wrapping `Arc<Mutex<Box<dyn AudioSource>>>` so they
   compose; `LuaSource::take` steals the box via `mem::replace` (mlua keeps a
   clone on the stack during the call, so `Arc::try_unwrap` would fail).
@@ -49,7 +49,11 @@ One engine thread plus one thread per output:
 - `ScriptRuntime` owns the `Lua` state, which now outlives script evaluation.
   `on_metadata(callback, source)` wraps the source in `OnMetadataSource`,
   which sends `ScriptEvent::Metadata { hook_id, title }` over an `mpsc`
-  channel; the Lua-owning main thread invokes the callback.
+  channel; the Lua-owning main thread invokes the callback. `on_track`
+  wraps in `OnTrackSource` (`ScriptEvent::Track { hook_id }`) and fires at
+  *any* track boundary: label change (even to `None`) or a resume after a
+  non-exhausted silence — both hook registries are separate vectors, so a
+  `Track` event never reaches an `on_metadata` callback.
 - `switch`/`rotate` share one `ScheduleSource`: the active child plays the
   whole track, and a new child is re-picked only at a track boundary
   (child `label` change or exhaustion). `switch` slots are `when` predicates

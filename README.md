@@ -171,7 +171,7 @@ phase).
 | one-shot jingles (`switch` + request scheduling) | `jingles({directory})` + telnet `jingles.play` | done |
 | `request.queue` + telnet `queue.push` | planned (Phase 3) | planned |
 | `switch` (dayparting), `rotate` | `switch({ {when = {days, from, to}, src = ...}, {src = default} })`, `rotate({...}, {weights = ...})` | done |
-| `on_metadata` / `on_track` | planned (Phase 6) | planned |
+| `on_metadata` / `on_track` | `on_metadata(fn, src)` (title table), `on_track(fn, src)` (boundary, no args) | done |
 | `http://` request resolution | planned (Phase 7) | planned |
 
 ## Testing
