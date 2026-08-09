@@ -21,6 +21,9 @@ Opus) to an Icecast server.
 
 ## Architecture
 
+Implementation-level wiring (engine tap, threading model, gotchas) lives in
+`docs/ARCHITECTURE.md`; this is the user-facing summary.
+
 ```
 media/ + jingles/
    │   (decoded via symphonia)

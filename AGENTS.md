@@ -1,12 +1,12 @@
 # AGENTS.md
 
-Guidance for AI agents working on this repository.
+Guidance for AI agents working on this repository. Implementation details
+live in `docs/ARCHITECTURE.md`; the plan and ship history in `ROADMAP.md`.
 
 ## Project
 
 Crabsoup: Rust audio streaming engine (Rust 2024 edition) — gapless playlist,
 crossfades, live DJ ducking, one-shot jingles, MP3/Opus broadcast to Icecast.
-See `README.md` for the architecture and user-facing docs.
 
 ## Commands
 
@@ -39,69 +39,19 @@ that use them skip when absent.
 - Keep `ROADMAP.md` in sync: move verified work to the Done section.
 - Do not add comments unless they explain non-obvious behavior.
 
-## Architecture notes
-
-Pipeline: `Playlist -> CrossfadeMixer -> PriorityMixer -> Encoder ->
-Icecast` via the native source-protocol client. The `.lua` script's root
-source (e.g. `fallback({j, live, pl})`)
-is that Playlist input; all sources are normalised to the PCM bus
-(`set("sample_rate", ...)`, `set("channels", ...)`, `frames_per_buffer`).
-
-- `src/script.rs` registers the Liquidsoap-flavoured Lua stdlib
-  (`playlist`, `single`, `blank`, `sine`, `amplify`, `compress`, `normalize`,
-  `jingles`, `fallback`/`sequence`/`random`, `input.harbor`,
-  `output.icecast`, `output.preview`, `server.telnet`, `set`, `log`).
-  Sources are Lua userdata
-  wrapping `Arc<Mutex<Box<dyn AudioSource>>>`
-  so they can be composed; `LuaSource::into_inner` steals the box via
-  `mem::replace` (mlua keeps a clone on the stack during the call, so
-  `Arc::try_unwrap` would fail).
-- `src/script.rs` returns `mlua::Result` — `mlua::Error` is `!Send`, so the
-  crate `Result` alias cannot hold it; main maps it to a string.
-- `set` keys: `sample_rate`, `channels`, `frames_per_buffer`,
-  `crossfade_seconds`, `fade_curve`, `duck_seconds`.
-- The engine is single-chain: one `output.icecast` per script; without it,
-  `output.preview` (or preview mode in main.rs).
-- `MixCommand` (`src/engine/mixer.rs`) is the mixer control channel
-  (`SetLive`, `ClearLive`, `PlayJingle(PathBuf)`, `Skip`, `Shutdown`) over
-  `std::sync::mpsc`. The harbor and control port send into it. `Skip` calls
-  `AudioSource::skip()` (trait default no-op; `CrossfadeMixer` advances);
-  `Shutdown` makes `PriorityMixer` return 0/exhausted so both pump loops
-  (`IcecastOutput::run`, `run_preview`) exit. `StatusHandle` is the shared
-  label/uptime cell the pump updates and the telnet `status`/`uptime` read.
-- `PriorityMixer` crossfades between `main` and an override with a gain ramp
-  over `duck_seconds`; the override audio is `m*(1-gain) + o*gain`. Both
-  mixers keep reusable scratch `Vec<f32>` fields (sized on buffer-size
-  change) so `next_buffer` never allocates.
-- Opus path: `SincResampler` (16-tap Hann-windowed sinc, 256-phase table)
-  bus -> 48 kHz, encode 20 ms frames, mux one Ogg page per packet, flush
-  per packet so audio reaches Icecast promptly.
-- Pump pacing in `src/output/icecast.rs` is wall-clock based:
-  `next_due_us = frames_pulled * 1_000_000 / sample_rate`.
-- `src/output/icecast_client.rs` is the native Icecast source-protocol client
-  (no libshout): one authenticated `SOURCE` request, then raw encoded bytes;
-  titles go out on separate authenticated `/admin/metadata` GETs. Icecast
-  rejects URL metadata updates for Opus mounts (HTTP 200 + "Mountpoint will
-  not accept URL updates"), so Opus titles ride the stream header instead:
-  the initial OpusTags carries the first track’s title (set_title replaces
-  it until the headers flush, then no-ops). Icecast 2.4.4 never parses
-  OpusTags titles at all; 2.5+ parses only the stream-start header and
-  requires type-less packets (no RFC 7845 packet-type byte — ffmpeg writes
-  them type-less too). Never inject comment pages mid-stream: Icecast
-  forwards them to listeners as audio, producing decoder warnings. One
-  request per operation — no libshout capability negotiation, no unauthenticated
-  401 probe, no `!POKE`.
-- The live harbor decodes DJ uploads with symphonia, which has no Opus codec
-  (confirmed through 0.6.0): MP3 uploads decode and air; Opus uploads log
-  "cannot create decoder: unsupported codec" and air silence for the ducked
-  window while the duck control still runs.
-
 ## Critical gotchas
+
+Short list that has burned previous work — full context in
+`docs/ARCHITECTURE.md`.
 
 - Ogg CRC is CRC-32/MPEG-2 (MSB-first, init 0, poly 0x04c11db7, no final
   xor). The input byte xors into the table **index**
-  (`idx = ((crc >> 24) ^ b) & 0xff`), not into the result. A previous bug
-  corrupted every page silently; `crc_matches_external_reference` guards it.
+  (`idx = ((crc >> 24) ^ b) & 0xff`), not into the result;
+  `crc_matches_external_reference` guards it.
 - Opus requires 48 kHz sample rate — never feed it the bus rate directly.
+- The `on_metadata` closure stays in the Lua registry for the process
+  lifetime, keeping its channel `Sender` alive: `run_event_loop` must exit on
+  the shared end-flag the tap sets when the engine stops, never on channel
+  disconnection.
 - icecast2 on localhost:8000 is the usual end-to-end target (source/admin
   password `hackme`). Verify on-air streams with `ffprobe` against the mount.
