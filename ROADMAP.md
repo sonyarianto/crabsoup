@@ -77,7 +77,10 @@ for what shipped.
 - SIMD is a later lever (sinc convolution, effect loops) — only after the
   benchmark harness shows it is the bottleneck.
 
-### Part A — architectural prerequisites (land A1 + A2 as one PR)
+### Part A — architectural prerequisites (landed as one PR, see Done)
+
+A1 and A2 shipped together: the engine tap (single puller, fan-out) and the
+Lua-owning event loop. Details in the Done section below.
 
 #### A1 — Engine tap (single puller, multi-consumer fan-out)
 Two outputs cannot both call `next_buffer()` on the same root — that is why
@@ -105,10 +108,13 @@ created them. After A1 the puller is a different thread, so wrapper sources
 send owned `Send` events (`ScriptEvent::Metadata { hook_id, title }`,
 `Shutdown`) over a channel; the Lua-owning thread runs the event loop and
 invokes hooks stored in `Vec<mlua::Function>` on `ScriptState`. `script::run`
-must hand back the `Lua` instance, which now outlives script evaluation —
-**a real shape change; call it out in AGENTS.md when it lands.** Event rate
-is metadata-rate (per track), not per buffer; audio-rate callbacks need
-their own budget/backpressure story.
+hands back the `Lua` instance (`ScriptRuntime`), which now outlives script
+evaluation. **Gotcha when it landed:** the `on_metadata` closure stays in the
+Lua registry for the process lifetime, so its captured channel `Sender` never
+drops — the event loop must poll with `recv_timeout` and exit on a shared
+end-flag (the tap sets it when the engine stops) instead of waiting for
+channel disconnection. Event rate is metadata-rate (per track), not per
+buffer; audio-rate callbacks need their own budget/backpressure story.
 
 ### Part B — feature phases
 
@@ -122,7 +128,8 @@ their own budget/backpressure story.
       call back into Lua only.
 
 #### Phase 4 — multi-output + file recording (needs A1)
-- [ ] `output.icecast` callable more than once (different mounts/formats).
+- [x] `output.icecast` callable more than once (different mounts/formats,
+      same source graph) — part of Part A.
 - [ ] `output.file({path, format}, source)`: same consumer shape as
       `IcecastOutput` with a file sink; verified by ffprobe-decoding the
       recorded file.
@@ -133,8 +140,8 @@ their own budget/backpressure story.
 - [ ] `rotate` source (sequential/even rotation over children).
 
 #### Phase 6 — metadata hooks (needs A2)
-- [ ] `on_metadata(callback, source)`: A2 event loop, metadata table
-      (title, duration, path) per track start.
+- [x] `on_metadata(callback, source)`: A2 event loop, metadata table
+      (title) per track start — part of Part A.
 - [ ] `on_track(callback, source)`: second `ScriptEvent` variant, fires on
       track boundary without full metadata.
 
@@ -175,7 +182,8 @@ no contention with Part B.
    API change) — **done** alongside Phase 1.
 2. Phase 1 (primitives) — **done** (see Done section).
 3. Part A (A1 + A2 together — they share the "who owns the pull loop"
-   decision, easier to land as one architectural PR than two) — **next**.
+   decision, easier to land as one architectural PR than two) — **done**
+   (see Done section).
 4. Track B, sequential: Phase 2 (DSP) — **done**; next Phase 3 → Phase 5 →
    Phase 6 (needs A2) → Phase 7 → Phase 8 (stretch).
 5. Track C once A1 lands: C1 → C2 → C3 (needs C2) → C4 (on request).
@@ -192,6 +200,30 @@ approximates the operator surface, not the language); LADSPA plugin hosting
 practice).
 
 ## Done (cont.)
+- [x] Part A (engine tap + Lua event loop, one PR): `src/engine/tap.rs` —
+      `EngineTap` owns the root source on its own thread and publishes each
+      wall-clock-paced buffer as `Arc<AudioFrame { pcm, label }>` to N
+      bounded `sync_channel(4)` taps; outputs became pure consumers with
+      independent reconnect loops. `IcecastOutput` now consumes frames from
+      the tap (no pull loop, no pacing); the preview loop is a tap consumer
+      too. Frame recycling via a preallocated pool sized `4 * tap_count + 2`
+      (fresh-Vec fallback on the degraded path only) — steady state stays
+      allocation-free. `script.rs`: `ScriptResult.outputs: Vec<OutputConfig>`
+      (second `output.icecast` accepted iff it shares the same source graph,
+      checked via `Arc::ptr_eq`); `script::run` returns `(ScriptRuntime,
+      ScriptResult)`; `ScriptRuntime` owns the `Lua` state plus the event
+      loop and `drain_metadata()`; `OnMetadataSource` wrapper emits
+      `ScriptEvent::Metadata { hook_id, title }` on label change; `on_metadata`
+      registers a Lua callback invoked on the Lua-owning main thread. The
+      event loop polls with `recv_timeout` and exits on a shared end-flag
+      (the tap sets it when the engine stops for any reason) — channel
+      disconnection is not observable while the runtime lives (the registry
+      closure keeps a `Sender`), which initially hung the loop. Verified
+      live: mp3 + opus mounts from one root stream concurrently on icecast2
+      (ffprobe decodes both), metadata events reach the Lua callback, telnet
+      `shutdown` exits the process cleanly, `--check` prints every output,
+      full test suite 84 passed incl. tap fan-out, stalled-consumer, metadata
+      ordering, and shared-root rejection tests.
 - [x] Phase 2 (DSP effect chain): `src/engine/effects.rs` gains `Compressor`
       (feed-forward envelope follower, gain reduction only above
       `threshold_db`, `ratio`, `attack`/`release` time constants, `makeup`)

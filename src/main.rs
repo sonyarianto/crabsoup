@@ -7,6 +7,7 @@ use std::time::Duration;
 use clap::Parser;
 
 use crabsoup::engine::mixer::{MixCommand, PriorityMixer, StatusHandle};
+use crabsoup::engine::tap::{AudioFrame, EngineTap};
 use crabsoup::live::harbor::Harbor;
 use crabsoup::output::icecast::IcecastOutput;
 use crabsoup::script::{self, ScriptResult};
@@ -33,7 +34,7 @@ fn main() -> crabsoup::Result<()> {
 
     let src = std::fs::read_to_string(&cli.config)
         .map_err(|e| format!("failed to read script {}: {e}", cli.config.display()))?;
-    let mut result = script::run(&src).map_err(|e| format!("script error: {e}"))?;
+    let (runtime, mut result) = script::run(&src).map_err(|e| format!("script error: {e}"))?;
 
     if cli.check {
         print_result(&result, cli.preview);
@@ -44,32 +45,33 @@ fn main() -> crabsoup::Result<()> {
     let chans = spec.channels.count();
     let fpb = result.stream.frames_per_buffer;
 
-    // Root source -> priority mixer (live DJ ducking / jingle overrides).
+    // Root source -> priority mixer (live DJ ducking / jingle overrides) ->
+    // engine tap: one puller thread, N consumer taps.
     let root_source = result
         .root
         .take()
         .or_else(|| result.preview.take())
         .expect("script output checked by run()");
     let (tx, rx) = mpsc::channel();
+    let root: Box<dyn AudioSource> =
+        Box::new(PriorityMixer::new(root_source, rx, &result.mixer, spec, fpb));
+    let mut tap = EngineTap::new(root, spec.rate, chans);
 
-    // `--preview` forces the preview path regardless of the script's output.
-    let broadcast = result.output.take().filter(|_| !cli.preview);
-    let mut root: Box<dyn AudioSource> = Box::new(PriorityMixer::new(
-        root_source,
-        rx,
-        &result.mixer,
-        spec,
-        fpb,
-    ));
+    let broadcast = if cli.preview {
+        Vec::new()
+    } else {
+        result.outputs.clone()
+    };
+
+    // Shared status for the telnet `status`/`uptime` commands; the consuming
+    // loops keep the current label fresh.
+    let status = StatusHandle::new();
+    let shutdown = Arc::new(AtomicBool::new(false));
 
     // Background tokio runtime: live harbor listener + Ctrl-C handler.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-
-    // Shared status for the telnet `status`/`uptime` commands; the pump loop
-    // keeps the current label fresh.
-    let status = StatusHandle::new();
 
     if let Some(live_cfg) = &result.harbor {
         let harbor = Harbor::new(live_cfg.clone(), spec, tx.clone());
@@ -87,31 +89,42 @@ fn main() -> crabsoup::Result<()> {
         rt.spawn(async move { server.run().await });
     }
 
-    let shutdown = Arc::new(AtomicBool::new(false));
+    // Ctrl-C: set the flag and tell the mixer to stop.
     let ctrl_shutdown = shutdown.clone();
     let ctrl_tx = tx.clone();
     rt.spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        log::info!("Ctrl-C received, shutting down");
-        ctrl_shutdown.store(true, Ordering::SeqCst);
-        let _ = ctrl_tx.send(MixCommand::Shutdown);
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {
+                ctrl_shutdown.store(true, Ordering::SeqCst);
+                let _ = ctrl_tx.send(MixCommand::Shutdown);
+                log::info!("ctrl-c: shutdown requested");
+            }
+            Err(e) => log::error!("ctrl-c listener: {e}"),
+        }
     });
 
-    match &broadcast {
-        Some(out_cfg) => {
-            let mut output =
-                IcecastOutput::new(out_cfg.clone(), root, spec.rate, chans, fpb);
-            output.set_shutdown(shutdown.clone());
-            output.set_status(status.clone());
-
-            // Initial connection with a bounded retry loop so Ctrl-C works
-            // before the first successful connect.
+    // One consuming thread per output; each keeps its own reconnect loop so
+    // one stalled mount cannot affect the pull rate or the other outputs.
+    let mut handles = Vec::new();
+    for out_cfg in &broadcast {
+        let out_rx = tap.register();
+        let out_shutdown = shutdown.clone();
+        let out_status = status.clone();
+        let cfg = out_cfg.clone();
+        let rate = spec.rate;
+        let channels = chans;
+        handles.push(std::thread::spawn(move || {
+            let mut output = IcecastOutput::new(cfg, out_rx, rate, channels);
+            output.set_shutdown(out_shutdown.clone());
+            output.set_status(out_status);
+            // Initial connection: retry until we reach the server, but stop
+            // if the operator hits Ctrl-C while we wait.
             loop {
                 match output.connect() {
                     Ok(()) => break,
                     Err(e) => {
                         log::error!("cannot connect to Icecast: {e}");
-                        if shutdown.load(Ordering::SeqCst) {
+                        if out_shutdown.load(Ordering::SeqCst) {
                             return Ok(());
                         }
                         std::thread::sleep(Duration::from_secs(output.reconnect_seconds()));
@@ -119,83 +132,82 @@ fn main() -> crabsoup::Result<()> {
                 }
             }
             output.run()
-        }
-        None => {
-            if cli.preview {
-                log::info!("--preview: decoding and mixing, not broadcasting");
-            } else {
-                log::warn!(
-                    "no output.icecast in script; running in preview mode \
-                     (decoding but not broadcasting)"
-                );
-            }
-            run_preview(&mut *root, spec.rate, chans, fpb, shutdown, &status)
-        }
+        }));
     }
+
+    if broadcast.is_empty() {
+        let preview_rx = tap.register();
+        let preview_shutdown = shutdown.clone();
+        let preview_status = status.clone();
+        handles.push(std::thread::spawn(move || {
+            run_preview(preview_rx, preview_shutdown, preview_status)
+        }));
+    }
+
+    // The tap pulls on its own thread; the Lua-owning main thread runs the
+    // script event loop.
+    let tap_shutdown = shutdown.clone();
+    let tap_handle = std::thread::spawn(move || tap.run(fpb, tap_shutdown));
+
+    runtime.run_event_loop(&shutdown);
+
+    for handle in handles {
+        let _ = handle.join();
+    }
+    let _ = tap_handle.join();
+    Ok(())
 }
 
-/// `--check` output: a human-readable summary of the script result.
 fn print_result(result: &ScriptResult, preview: bool) {
-    let stream = &result.stream;
-    let mixer = &result.mixer;
-    println!(
-        "stream: {} Hz, {} ch, {} frames/buffer",
-        stream.sample_rate, stream.channels, stream.frames_per_buffer
-    );
-    println!(
-        "mixer: crossfade {:.1}s, curve {}, duck {:.1}s",
-        mixer.crossfade_seconds, mixer.fade_curve, mixer.duck_seconds
-    );
-    println!("jingles: {} file(s)", result.jingles.len());
-    if let Some(h) = &result.harbor {
-        println!("harbor: {}:{}{}", h.host, h.port, h.mount);
+    let mut lines = vec![
+        format!(
+            "stream: {} Hz, {} ch, {} frames/buffer",
+            result.stream.sample_rate, result.stream.channels, result.stream.frames_per_buffer
+        ),
+        format!(
+            "mixer: crossfade {}s, curve {}, duck {}s",
+            result.mixer.crossfade_seconds, result.mixer.fade_curve, result.mixer.duck_seconds
+        ),
+        format!("jingles: {} file(s)", result.jingles.len()),
+    ];
+    if let Some(harbor) = &result.harbor {
+        lines.push(format!("harbor: {}:{}", harbor.host, harbor.port));
     }
-    if let Some(c) = &result.control {
-        println!("telnet: {}:{}", c.host, c.port);
+    if let Some(ctl) = &result.control {
+        lines.push(format!("telnet: {}:{}", ctl.host, ctl.port));
     }
     if preview {
-        println!("output: preview only (forced by --preview)");
+        lines.push("output: preview only (forced by --preview)".to_string());
+    } else if result.outputs.is_empty() {
+        lines.push("output: preview only".to_string());
     } else {
-        match &result.output {
-            Some(out) => println!(
+        for out in &result.outputs {
+            lines.push(format!(
                 "output: {:?} to {}:{}{}",
                 out.format, out.host, out.port, out.mount
-            ),
-            None => println!("output: preview only"),
+            ));
         }
     }
+    println!("{}", lines.join("\n"));
 }
 
-/// Preview mode: pull audio from the mixer and log the current label, but do
-/// not encode or broadcast.
 fn run_preview(
-    root: &mut dyn AudioSource,
-    sample_rate: u32,
-    chans: usize,
-    fpb: usize,
+    rx: mpsc::Receiver<Arc<AudioFrame>>,
     shutdown: Arc<AtomicBool>,
-    status: &StatusHandle,
+    status: StatusHandle,
 ) -> crabsoup::Result<()> {
-    let interval = Duration::from_secs_f64(fpb as f64 / sample_rate as f64);
-    let mut buf = vec![0f32; fpb * chans];
-    let mut last = None;
-
-    loop {
+    let mut last: Option<String> = None;
+    while let Ok(frame) = rx.recv() {
         if shutdown.load(Ordering::SeqCst) {
             log::info!("preview: shutdown requested");
             return Ok(());
         }
-        let n = root.next_buffer(&mut buf);
-        if n == 0 && root.is_exhausted() {
-            log::info!("preview: source ended");
-            return Ok(());
-        }
-        let label = root.label().unwrap_or_default();
+        let label = frame.label.as_deref().unwrap_or_default().to_string();
         status.set_current(&label);
         if Some(label.as_str()) != last.as_deref() {
             log::info!("now playing: {label}");
             last = Some(label);
         }
-        std::thread::sleep(interval);
     }
+    Ok(())
 }

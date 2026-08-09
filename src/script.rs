@@ -26,7 +26,9 @@
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use mlua::{FromLua, Lua, Table, UserData, Value as LValue};
 use rand::rngs::SmallRng;
@@ -49,7 +51,7 @@ pub struct ScriptResult {
     pub jingles: Vec<PathBuf>,
     pub harbor: Option<LiveConfig>,
     pub control: Option<ControlConfig>,
-    pub output: Option<OutputConfig>,
+    pub outputs: Vec<OutputConfig>,
     /// The engine's root source, taken from `output.icecast`.
     pub root: Option<Box<dyn AudioSource>>,
     /// The root source from `output.preview` (used when no icecast output).
@@ -64,9 +66,146 @@ struct ScriptState {
     jingles: Vec<PathBuf>,
     harbor: Option<LiveConfig>,
     control: Option<ControlConfig>,
-    output: Option<OutputConfig>,
+    outputs: Vec<OutputConfig>,
+    /// The shared root source graph. First `output.icecast` call steals the
+    /// box; later calls must pass the same `Arc` (checked via `ptr_eq`).
     root: Option<Box<dyn AudioSource>>,
+    root_arc: Option<Arc<Mutex<Box<dyn AudioSource>>>>,
     preview: Option<Box<dyn AudioSource>>,
+    /// Lua callbacks registered by `on_metadata`; indexed by hook id, live
+    /// on the Lua-owning thread only.
+    metadata_hooks: Vec<mlua::Function>,
+}
+
+/// Events sent from engine threads to the Lua-owning thread. The payload is
+/// always owned and `Send` — `Lua`/`Function`/`Table` never cross threads.
+pub enum ScriptEvent {
+    /// A source wrapped by `on_metadata` observed a track-label change.
+    Metadata { hook_id: usize, title: String },
+    /// Request the engine stop (future `server.register` use).
+    Shutdown,
+}
+
+/// The evaluated script's runtime: the `Lua` instance (which now outlives
+/// script evaluation) and the event loop that invokes callbacks on it.
+/// Must stay on the thread that created it.
+pub struct ScriptRuntime {
+    pub lua: Lua,
+    event_rx: mpsc::Receiver<ScriptEvent>,
+    metadata_hooks: Vec<mlua::Function>,
+}
+
+impl ScriptRuntime {
+    /// Read a Lua global (used by tests; later `server.register`).
+    pub fn global<T: mlua::FromLua>(&self, name: &str) -> mlua::Result<T> {
+        self.lua.globals().get(name)
+    }
+
+    /// Drive the Lua-owning event loop until the engine signals completion.
+    ///
+    /// The channel never disconnects on its own while the script runtime is
+    /// alive (the `on_metadata` closure in the Lua registry keeps a `Sender`
+    /// for the whole process), so the loop polls with a timeout and exits
+    /// when `end` is set, on a [`ScriptEvent::Shutdown`], or when every
+    /// sender really is gone. Call only from the thread that owns `Lua`.
+    pub fn run_event_loop(&self, end: &std::sync::atomic::AtomicBool) {
+        use std::sync::mpsc::RecvTimeoutError;
+        while !end.load(std::sync::atomic::Ordering::SeqCst) {
+            match self.event_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(event) => self.handle_event(event, end),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    }
+
+    /// Process any already-pending events without blocking (tests).
+    pub fn drain_metadata(&self) {
+        while let Ok(event) = self.event_rx.try_recv() {
+            self.handle_event(event, &std::sync::atomic::AtomicBool::new(false));
+        }
+    }
+
+    fn handle_event(&self, event: ScriptEvent, end: &std::sync::atomic::AtomicBool) {
+        match event {
+            ScriptEvent::Metadata { hook_id, title } => {
+                let Some(cb) = self.metadata_hooks.get(hook_id) else {
+                    return;
+                };
+                let table = match self.lua.create_table() {
+                    Ok(t) => t,
+                    Err(e) => {
+                        log::warn!("on_metadata callback: table error: {e}");
+                        return;
+                    }
+                };
+                if let Err(e) = table.set("title", title.as_str()) {
+                    log::warn!("on_metadata callback: {e}");
+                    return;
+                }
+                if let Err(e) = cb.call::<()>(table) {
+                    log::warn!("on_metadata callback error: {e}");
+                }
+            }
+            ScriptEvent::Shutdown => {
+                end.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+/// Wrapper source that emits [`ScriptEvent::Metadata`] when its child's
+/// label changes. Only the label string crosses the channel; the callback
+/// itself stays on the Lua-owning thread.
+struct OnMetadataSource {
+    child: Box<dyn AudioSource>,
+    tx: mpsc::Sender<ScriptEvent>,
+    hook_id: usize,
+    last_label: Option<String>,
+}
+
+impl OnMetadataSource {
+    fn new(child: Box<dyn AudioSource>, tx: mpsc::Sender<ScriptEvent>, hook_id: usize) -> Self {
+        Self {
+            child,
+            tx,
+            hook_id,
+            last_label: None,
+        }
+    }
+}
+
+impl AudioSource for OnMetadataSource {
+    fn next_buffer(&mut self, buffer: &mut [f32]) -> usize {
+        let n = self.child.next_buffer(buffer);
+        let label = self.child.label();
+        if label != self.last_label {
+            if let Some(title) = &label {
+                let _ = self.tx.send(ScriptEvent::Metadata {
+                    hook_id: self.hook_id,
+                    title: title.clone(),
+                });
+            }
+            self.last_label = label;
+        }
+        n
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.child.is_exhausted()
+    }
+
+    fn remaining_seconds(&self) -> Option<f64> {
+        self.child.remaining_seconds()
+    }
+
+    fn label(&self) -> Option<String> {
+        self.child.label()
+    }
+
+    fn skip(&mut self) {
+        self.child.skip();
+    }
 }
 
 impl ScriptState {
@@ -109,8 +248,9 @@ impl LuaSource {
     }
 
     /// Steal the wrapped source, leaving silence in its place. Works even if
-    /// the value is still shared with other Lua references (single-chain
-    /// engine consumes the source at the output).
+    /// the value is still shared with other Lua references: the first
+    /// `output.icecast` call consumes the source; later calls only share the
+    /// same `Arc` via the engine tap.
     fn take(&mut self) -> Box<dyn AudioSource> {
         let mut guard = self.0.lock().unwrap();
         std::mem::replace(&mut *guard, Box::new(SilenceSource::new()))
@@ -291,11 +431,15 @@ fn crossfading_playlist(
     Box::new(CrossfadeMixer::new(Box::new(playlist), &mixer_cfg, spec.rate, chans))
 }
 
-/// Evaluate a `.lua` script and return the engine wiring it describes.
-pub fn run(src: &str) -> mlua::Result<ScriptResult> {
+/// Evaluate a `.lua` script and return the runtime plus the engine wiring.
+/// The [`ScriptRuntime`] owns the `Lua` instance, which now lives for the
+/// process lifetime: callbacks are invoked from its event loop on the
+/// calling thread only.
+pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
     let lua = Lua::new();
     let globals = lua.globals();
     let state = Rc::new(RefCell::new(ScriptState::default()));
+    let (event_tx, event_rx) = mpsc::channel();
 
     // ---- settings ------------------------------------------------------
     let set_state = state.clone();
@@ -579,13 +723,22 @@ pub fn run(src: &str) -> mlua::Result<ScriptResult> {
             reconnect_seconds: opts.get("reconnect").unwrap_or(5),
         };
         let mut s = out_state.borrow_mut();
-        if s.root.is_some() {
-            return Err(mlua::Error::runtime(
-                "only one output.icecast per script (single-chain engine)",
-            ));
+        match &s.root_arc {
+            None => {
+                // First output wins the shared root; later outputs are
+                // extra sinks over the same engine tap.
+                s.root_arc = Some(source.0.clone());
+                s.root = Some(source.take());
+            }
+            Some(existing) => {
+                if !Arc::ptr_eq(existing, &source.0) {
+                    return Err(mlua::Error::runtime(
+                        "output.icecast calls must all share the same root source",
+                    ));
+                }
+            }
         }
-        s.root = Some(source.take());
-        s.output = Some(cfg);
+        s.outputs.push(cfg);
         Ok(())
     })?;
     let output = lua.create_table()?;
@@ -600,6 +753,20 @@ pub fn run(src: &str) -> mlua::Result<ScriptResult> {
     )?;
     globals.set("output", output)?;
 
+    // ---- metadata hooks (Liquidsoap `on_metadata`) ------------------------
+    let meta_state = state.clone();
+    let meta_tx = event_tx.clone();
+    globals.set(
+        "on_metadata",
+        lua.create_function(move |_, (mut source, callback): (LuaSource, mlua::Function)| {
+            let hook_id = meta_state.borrow().metadata_hooks.len();
+            let child = source.take();
+            meta_state.borrow_mut().metadata_hooks.push(callback);
+            let wrapped = OnMetadataSource::new(child, meta_tx.clone(), hook_id);
+            Ok(LuaSource::new(Box::new(wrapped)))
+        })?,
+    )?;
+
     // ---- evaluate ---------------------------------------------------------
     lua.load(src)
         .set_name("crabsoup.lua")
@@ -612,7 +779,7 @@ pub fn run(src: &str) -> mlua::Result<ScriptResult> {
         jingles: std::mem::take(&mut s.jingles),
         harbor: s.harbor.take(),
         control: s.control.take(),
-        output: s.output.take(),
+        outputs: std::mem::take(&mut s.outputs),
         root: s.root.take(),
         preview: s.preview.take(),
     };
@@ -621,7 +788,12 @@ pub fn run(src: &str) -> mlua::Result<ScriptResult> {
             "script defines no output: add output.icecast(...) or output.preview(...)",
         ));
     }
-    Ok(result)
+    let runtime = ScriptRuntime {
+        lua,
+        event_rx,
+        metadata_hooks: std::mem::take(&mut s.metadata_hooks),
+    };
+    Ok((runtime, result))
 }
 
 #[cfg(test)]
@@ -630,7 +802,7 @@ mod tests {
 
     #[test]
     fn script_sets_settings_via_lua() {
-        let res = run(
+        let (_rt, res) = run(
             r#"
             set("sample_rate", 48000)
             set("channels", 1)
@@ -665,7 +837,7 @@ mod tests {
 
     #[test]
     fn compose_sources_without_files() {
-        let res = run(
+        let (_rt, res) = run(
             r#"
             live = input.harbor({})
             backup = input.harbor({})
@@ -678,7 +850,7 @@ mod tests {
 
     #[test]
     fn sine_with_duration_drives_exactly_one_second_of_frames() {
-        let res = run(
+        let (_rt, res) = run(
             r#"
             output.preview(amplify(sine({freq = 220, duration = 1}), 0.5))
             "#,
@@ -700,7 +872,7 @@ mod tests {
 
     #[test]
     fn blank_falls_through_to_the_next_child() {
-        let res = run(
+        let (_rt, res) = run(
             r#"
             output.preview(fallback({blank({duration = 0.1}), sine({duration = 1, freq = 100})}))
             "#,
@@ -721,7 +893,7 @@ mod tests {
 
     #[test]
     fn compress_reduces_a_loud_tone() {
-        let res = run(
+        let (_rt, res) = run(
             r#"
             output.preview(compress(sine({freq = 440, duration = 1, amplitude = 1.0}),
                                     {threshold = -12, ratio = 2, attack = 0, release = 0}))
@@ -737,8 +909,69 @@ mod tests {
     }
 
     #[test]
+    fn on_metadata_callback_receives_titles_in_order() {
+        let (_rt, res) = run(
+            r#"
+            titles = {}
+            src = on_metadata(sequence({sine({freq = 440, duration = 0.1}),
+                                       sine({freq = 880, duration = 0.1})}),
+                              function(m) titles[#titles + 1] = m.title end)
+            output.preview(src)
+            "#,
+        )
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        // Each 0.1 s tone lasts ~1.1 buffers at 4096 frames; drive enough
+        // buffers to cross both track boundaries, then drop the source and
+        // drain whatever events were queued.
+        for _ in 0..4 {
+            root.next_buffer(&mut buf);
+        }
+        drop(root);
+        _rt.drain_metadata();
+
+        let titles: mlua::Table = _rt.global("titles").expect("titles table");
+        assert_eq!(titles.raw_len(), 2, "expected one event per track");
+        assert_eq!(titles.get::<String>(1).expect("t1"), "sine 440 Hz");
+        assert_eq!(titles.get::<String>(2).expect("t2"), "sine 880 Hz");
+    }
+
+    #[test]
+    fn multiple_outputs_share_one_root_source() {
+        let (_rt, res) = run(
+            r#"
+            src = sine({freq = 440, duration = 1})
+            output.icecast({mount = "/a.mp3", format = "mp3"}, src)
+            output.icecast({mount = "/b.ogg", format = "opus"}, src)
+            "#,
+        )
+        .expect("script runs");
+        assert_eq!(res.outputs.len(), 2);
+        assert!(res.root.is_some());
+        assert_eq!(res.outputs[0].mount, "/a.mp3");
+        assert_eq!(res.outputs[1].mount, "/b.ogg");
+        assert_eq!(res.outputs[0].format, OutputFormat::Mp3);
+        assert_eq!(res.outputs[1].format, OutputFormat::Opus);
+    }
+
+    #[test]
+    fn different_roots_for_multiple_outputs_are_rejected() {
+        let err = match run(
+            r#"
+            output.icecast({mount = "/a.mp3"}, sine({freq = 440}))
+            output.icecast({mount = "/b.mp3"}, sine({freq = 880}))
+            "#,
+        ) {
+            Ok(_) => panic!("second output with a different root must fail"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("share the same root source"));
+    }
+
+    #[test]
     fn normalize_boosts_a_quiet_tone() {
-        let res = run(
+        let (_rt, res) = run(
             r#"
             output.preview(normalize(sine({freq = 440, duration = 1, amplitude = 0.02}),
                                      {target = -6, attack = 0, release = 0}))

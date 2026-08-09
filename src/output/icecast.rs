@@ -1,12 +1,13 @@
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::{OutputConfig, OutputFormat};
 use crate::engine::mixer::StatusHandle;
+use crate::engine::tap::AudioFrame;
 use crate::output::encoder::{create_encoder, Encoder};
 use crate::output::icecast_client::IcecastClient;
-use crate::source::AudioSource;
 use crate::Result;
 
 enum SendResult {
@@ -14,14 +15,17 @@ enum SendResult {
     Dropped,
 }
 
-/// Pulls audio from a source, encodes it, and pushes the result to Icecast
-/// with automatic reconnection.
+/// Consumes frames from the engine tap, encodes them, and pushes the result
+/// to Icecast with automatic reconnection.
+///
+/// This is a pure consumer: the tap owns the pull loop and paces the stream,
+/// so a stalled connection drops frames here instead of stalling the engine
+/// or the other outputs.
 pub struct IcecastOutput {
     config: OutputConfig,
-    source: Box<dyn AudioSource>,
+    rx: Receiver<Arc<AudioFrame>>,
     sample_rate: u32,
     chans: usize,
-    frames_per_buffer: usize,
     shout: Option<IcecastClient>,
     encoder: Option<Box<dyn Encoder>>,
     last_title: String,
@@ -32,17 +36,15 @@ pub struct IcecastOutput {
 impl IcecastOutput {
     pub fn new(
         config: OutputConfig,
-        source: Box<dyn AudioSource>,
+        rx: Receiver<Arc<AudioFrame>>,
         sample_rate: u32,
         chans: usize,
-        frames_per_buffer: usize,
     ) -> Self {
         Self {
             config,
-            source,
+            rx,
             sample_rate,
             chans,
-            frames_per_buffer,
             shout: None,
             encoder: None,
             last_title: String::new(),
@@ -137,8 +139,8 @@ impl IcecastOutput {
         }
     }
 
-    fn update_metadata(&mut self) {
-        let title = self.source.label().unwrap_or_default();
+    fn update_metadata(&mut self, frame: &AudioFrame) {
+        let title = frame.label.as_deref().unwrap_or_default().to_string();
         if let Some(status) = &self.status {
             status.set_current(&title);
         }
@@ -166,50 +168,23 @@ impl IcecastOutput {
         }
     }
 
-    /// Run the pump loop until the source is exhausted. Blocks the caller.
+    /// Consume frames from the tap until the stream ends (senders dropped)
+    /// or shutdown is requested.
     pub fn run(&mut self) -> Result<()> {
-        let mut buf = vec![0f32; self.frames_per_buffer * self.chans];
-        // Wall-clock pacing: consume input no faster than real time so the
-        // encoder and Icecast are fed at stream rate.
-        let start = std::time::Instant::now();
-        let mut frames_pulled = 0u64;
-
-        loop {
+        while let Ok(frame) = self.rx.recv() {
             if self.shutdown.load(Ordering::SeqCst) {
                 log::info!("shutdown requested, ending stream");
                 break;
             }
+            self.update_metadata(&frame);
 
-            // Pull at real-time rate: sleep until the next buffer is due.
-            let elapsed_us = start.elapsed().as_micros() as u64;
-            let next_due_us = frames_pulled * 1_000_000 / self.sample_rate as u64;
-            if elapsed_us < next_due_us {
-                std::thread::sleep(Duration::from_micros(next_due_us - elapsed_us));
-            }
-
-            let n = self.source.next_buffer(&mut buf);
-            if n == 0 && self.source.is_exhausted() {
-                break;
-            }
-            if n == 0 {
-                log::debug!("pump: source underflow, pacing");
-                std::thread::sleep(Duration::from_millis(10));
-                continue;
-            }
-            frames_pulled += (n / self.chans) as u64;
-            self.update_metadata();
-
-            let encoded = self.encoder.as_mut().unwrap().encode(&buf[..n]);
+            let encoded = self.encoder.as_mut().unwrap().encode(&frame.pcm);
             if encoded.is_empty() {
                 // The encoder accumulates internally (LAME needs 1152-sample
-                // frames); nothing to send yet. Back off briefly.
-                std::thread::sleep(Duration::from_millis(1));
+                // frames); nothing to send yet.
                 continue;
             }
-            match self.send_or_reconnect(&encoded) {
-                SendResult::Sent => {}
-                SendResult::Dropped => continue,
-            }
+            self.send_or_reconnect(&encoded);
         }
 
         // Flush encoder tail and close cleanly.
