@@ -36,8 +36,8 @@ use rand::{Rng, SeedableRng};
 use symphonia::core::audio::SignalSpec;
 
 use crate::config::{
-    collect_audio, ControlConfig, FileOutputConfig, LiveConfig, MixerConfig, OutputConfig,
-    OutputFormat, StreamConfig,
+    collect_audio, ControlConfig, FileOutputConfig, HlsOutputConfig, LiveConfig, MixerConfig,
+    OutputConfig, OutputFormat, StreamConfig,
 };
 use crate::engine::effects::{Agc, Amplify, Compressor, EffectSource};
 use crate::engine::mixer::CrossfadeMixer;
@@ -54,6 +54,7 @@ pub struct ScriptResult {
     pub control: Option<ControlConfig>,
     pub outputs: Vec<OutputConfig>,
     pub file_outputs: Vec<FileOutputConfig>,
+    pub hls_outputs: Vec<HlsOutputConfig>,
     /// The engine's root source, taken from `output.icecast`.
     pub root: Option<Box<dyn AudioSource>>,
     /// The root source from `output.preview` (used when no icecast output).
@@ -70,6 +71,7 @@ struct ScriptState {
     control: Option<ControlConfig>,
     outputs: Vec<OutputConfig>,
     file_outputs: Vec<FileOutputConfig>,
+    hls_outputs: Vec<HlsOutputConfig>,
     /// The shared root source graph. First `output.icecast` call steals the
     /// box; later calls must pass the same `Arc` (checked via `ptr_eq`).
     root: Option<Box<dyn AudioSource>>,
@@ -785,6 +787,24 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
             Ok(())
         })?,
     )?;
+    let hls_state = state.clone();
+    output.set(
+        "hls",
+        lua.create_function(move |_, (opts, mut source): (Table, LuaSource)| {
+            let directory: String = opts
+                .get("directory")
+                .map_err(|_| mlua::Error::runtime("output.hls: directory is required"))?;
+            let cfg = HlsOutputConfig {
+                directory: directory.into(),
+                segment_seconds: opts.get("segment_seconds").unwrap_or(5.0),
+                retention: opts.get("retention").unwrap_or(12),
+            };
+            let mut s = hls_state.borrow_mut();
+            claim_root(&mut s, &mut source)?;
+            s.hls_outputs.push(cfg);
+            Ok(())
+        })?,
+    )?;
     globals.set("output", output)?;
 
     // ---- metadata hooks (Liquidsoap `on_metadata`) ------------------------
@@ -815,6 +835,7 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         control: s.control.take(),
         outputs: std::mem::take(&mut s.outputs),
         file_outputs: std::mem::take(&mut s.file_outputs),
+        hls_outputs: std::mem::take(&mut s.hls_outputs),
         root: s.root.take(),
         preview: s.preview.take(),
     };
@@ -1044,6 +1065,37 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("share the same root source"));
+    }
+
+    #[test]
+    fn hls_output_registers_and_defaults() {
+        let (_rt, res) = run(
+            r#"
+            src = sine({freq = 440, duration = 1})
+            output.hls({directory = "/tmp/crabsoup-hls"}, src)
+            output.icecast({mount = "/x.mp3"}, src)
+            "#,
+        )
+        .expect("script runs");
+        assert_eq!(res.hls_outputs.len(), 1);
+        assert_eq!(res.outputs.len(), 1);
+        assert!(res.root.is_some());
+        assert_eq!(res.hls_outputs[0].directory.to_str(), Some("/tmp/crabsoup-hls"));
+        assert_eq!(res.hls_outputs[0].segment_seconds, 5.0);
+        assert_eq!(res.hls_outputs[0].retention, 12);
+    }
+
+    #[test]
+    fn hls_output_requires_directory() {
+        let err = match run(
+            r#"
+            output.hls({}, sine({freq = 440}))
+            "#,
+        ) {
+            Ok(_) => panic!("output.hls without directory must fail"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("directory is required"));
     }
 
     #[test]

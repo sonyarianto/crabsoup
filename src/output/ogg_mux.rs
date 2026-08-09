@@ -101,13 +101,20 @@ fn segment_table(len: usize) -> Vec<u8> {
     segs
 }
 
-/// The Ogg CRC-32 (poly 0x04c11db7, no reflection, no final xor).
+/// The Ogg CRC-32 (poly 0x04c11db7, no reflection, no final xor). Also the
+/// CRC-32/MPEG-2 used by MPEG-TS sections, so MPEG-TS muxing reuses it.
 ///
 /// Table-driven MSB-first update: the next input byte xors into the *index*
 /// (the crc's top byte), not into the result.
-fn crc32(header: &[u8], body: &[u8]) -> u32 {
+pub(crate) fn crc32(header: &[u8], body: &[u8]) -> u32 {
+    crc32_init(0, header, body)
+}
+
+/// Like [`crc32`] but with an explicit initial register value. Ogg pages start
+/// from 0; MPEG-TS sections start from 0xffff_ffff.
+pub(crate) fn crc32_init(init: u32, header: &[u8], body: &[u8]) -> u32 {
     let table = CRC_TABLE.get_or_init(crc_table);
-    let mut crc: u32 = 0;
+    let mut crc = init;
     for &b in header.iter().chain(body) {
         let idx = (((crc >> 24) ^ b as u32) & 0xff) as usize;
         crc = table[idx] ^ (crc << 8);

@@ -167,12 +167,24 @@ no contention with Part B.
       justification). Raw ADTS framing over the existing `IcecastClient`;
       `audio/aac` content-type branch next to the MP3/Opus branches. Low
       risk, runnable alongside Phase 2. (Landed — see Done section.)
-- [ ] **C3 — HLS output** (needs C2): new module — segmenter rotating the
-      encoder output into fixed-length chunks (4–6s), `.m3u8` media playlist
-      writer, segment lifecycle (naming, retention window, cleanup). AAC is
-      the practical HLS codec, so sequence after C2. Acceptance: a real HLS
-      player (hls.js/VLC/Safari) plays a live segment window.
-- [ ] **C4 — Shoutcast v1/v2** (only if a concrete need shows up): alternate
+- [x] **C3 — HLS output** (needs C2): `src/output/hls.rs` + `src/output/mpegts.rs`
+      — minimal MPEG-TS muxer (PAT/PMT sections per segment, PES-wrapped
+      ADTS on one audio PID, PCR every ~100 ms, per-PID continuity
+      counters; section CRC reuses the shared MPEG-2/Ogg table) and a
+      segmenter that rotates the tap's AAC stream into `seg-NNNNNN.ts`
+      files plus `playlist.m3u8` (`#EXT-X-VERSION:3`, sliding
+      `MEDIA-SEQUENCE`, `TARGETDURATION`, `ENDLIST` on graceful shutdown).
+      `output.hls({directory, segment_seconds, retention}, source)` in
+      script.rs; directory prepared in `connect()` so a bad path fails at
+      startup; one tap-consumer thread per HLS output. Acceptance:
+      `ffmpeg -f hls -i playlist.m3u8` decodes a live window cleanly (sine
+      and real-MP3 playlist runs), ffprobe sees AAC 44.1 kHz stereo on the
+      90 kHz TS clock, SIGINT closes the final segment and ends the list.
+      (Note: decoding a *single* segment through the ffmpeg CLI at
+      `-v warning`+ can report "Output file is empty" — an upstream
+      `discard_unused_programs` race in ffmpeg 7's threaded input path,
+      not a crabsoup defect; ffprobe and full-playlist decode are clean.)
+- [x] **C4 — Shoutcast v1/v2** (only if a concrete need shows up): alternate
       handshake inside `icecast_client.rs`, exposed as `protocol =
       "icecast" | "shoutcast"` on `output.icecast`'s config table.
 

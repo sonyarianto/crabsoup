@@ -10,6 +10,7 @@ use crabsoup::engine::mixer::{MixCommand, PriorityMixer, StatusHandle};
 use crabsoup::engine::tap::{AudioFrame, EngineTap};
 use crabsoup::live::harbor::Harbor;
 use crabsoup::output::file::FileOutput;
+use crabsoup::output::hls::HlsOutput;
 use crabsoup::output::icecast::IcecastOutput;
 use crabsoup::script::{self, ScriptResult};
 use crabsoup::source::AudioSource;
@@ -161,6 +162,22 @@ fn main() -> crabsoup::Result<()> {
         handles.push(std::thread::spawn(move || output.run()));
     }
 
+    // HLS outputs: the directory is prepared up front so a bad path fails
+    // fast; the consumer thread then rotates the segment window.
+    let hls = if cli.preview {
+        Vec::new()
+    } else {
+        result.hls_outputs.clone()
+    };
+    for cfg in &hls {
+        let mut output = HlsOutput::new(cfg.clone(), tap.register(), spec.rate, chans);
+        output.set_shutdown(shutdown.clone());
+        output
+            .connect()
+            .map_err(|e| format!("output.hls: {e}"))?;
+        handles.push(std::thread::spawn(move || output.run()));
+    }
+
     // The tap pulls on its own thread; the Lua-owning main thread runs the
     // script event loop.
     let tap_shutdown = shutdown.clone();
@@ -218,7 +235,18 @@ fn print_result(result: &ScriptResult, preview: bool) {
         for rec in &result.file_outputs {
             lines.push(format!("record: {:?} to {}", rec.format, rec.path.display()));
         }
-        if result.outputs.is_empty() && result.file_outputs.is_empty() {
+        for hls in &result.hls_outputs {
+            lines.push(format!(
+                "hls: AAC segments to {} ({:.1}s x {})",
+                hls.directory.display(),
+                hls.segment_seconds,
+                hls.retention
+            ));
+        }
+        if result.outputs.is_empty()
+            && result.file_outputs.is_empty()
+            && result.hls_outputs.is_empty()
+        {
             lines.push("output: preview only".to_string());
         }
     }

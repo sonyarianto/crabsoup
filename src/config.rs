@@ -88,6 +88,29 @@ pub struct FileOutputConfig {
     pub bitrate: u32,
 }
 
+/// Config for `output.hls`: encode the tap to AAC and slice it into a
+/// sliding window of MPEG-TS HLS segments with a media playlist.
+#[derive(Debug, Clone)]
+pub struct HlsOutputConfig {
+    /// Directory the segments and `playlist.m3u8` are written to. Old
+    /// `seg-*.ts` files from previous runs are cleared at connect.
+    pub directory: PathBuf,
+    /// Nominal segment length in seconds.
+    pub segment_seconds: f64,
+    /// How many completed segments the on-disk window keeps.
+    pub retention: usize,
+}
+
+impl Default for HlsOutputConfig {
+    fn default() -> Self {
+        Self {
+            directory: "hls".into(),
+            segment_seconds: 5.0,
+            retention: 12,
+        }
+    }
+}
+
 impl Default for OutputConfig {
     fn default() -> Self {
         Self {
