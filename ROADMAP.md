@@ -134,9 +134,9 @@ buffer; audio-rate callbacks need their own budget/backpressure story.
       file sink — part of C1.
 
 #### Phase 5 — scheduling (dayparting)
-- [ ] `switch` source with time-based brackets (liq `switch` semantics:
+- [x] `switch` source with time-based brackets (liq `switch` semantics:
       weekday/hour ranges, default child).
-- [ ] `rotate` source (sequential/even rotation over children).
+- [x] `rotate` source (sequential/even rotation over children).
 
 #### Phase 6 — metadata hooks (needs A2)
 - [x] `on_metadata(callback, source)`: A2 event loop, metadata table
@@ -233,6 +233,30 @@ practice).
       of a staged jingle preempts the looping playlist (`request queue:
       playing ...`), `queue.skip` returns to the playlist, `queue.clear`
       flushes, unknown commands are rejected.
+- [x] Phase 5 (scheduling / dayparting): one `ScheduleSource` in `script.rs`
+      powers both `switch` and `rotate`. The active child plays the whole
+      current track; a re-pick happens only at a track boundary (the
+      child's `label` changes or it exhausts) — at most one buffer of the
+      next track comes from the old child (20 ms). `switch({ {when = ...,
+      src = ...}, ... }, {track_sensitive = ...})`: each slot carries a
+      `TimePredicate` (`days` as weekday names or 0=Sunday..6=Saturday,
+      `from`/`to` as `"HH:MM"`; overnight windows wrap past midnight,
+      `from == to` never matches); slots are checked from the top at every
+      boundary, so a window opening grabs the next track; a slot without
+      `when` is the required default child. `track_sensitive = false`
+      re-evaluates the predicates every pull and cuts mid-track.
+      `rotate({...}, {weights = ...})`: weighted round-robin, a weight `w`
+      holds a child for `w` consecutive tracks, exhausted children are
+      skipped. Boundary re-picks, exhaustion handover, and the injected
+      clock (`Fn() -> LocalTime`, chrono `Local::now()` by default) are
+      unit-tested with `LabelCycler` fakes (117 -> 117 suite overall,
+      +14 for Phase 5: predicate windows/days/overnight/empty, track-
+      sensitive hold-then-switch, non-sensitive mid-track cut, rotate
+      cycling, weighted rotate, exhausted-child skip, `skip()` repick,
+      Lua registration + default-child and bad-time/weekday errors).
+      Verified live: `switch` with `days = {"sun"}` picked the Sunday
+      branch on-air; telnet `skip` through `rotate({a, b})` alternated
+      children track-by-track.
 - [x] C1 (`output.file`): `src/output/file.rs` — `FileOutput`, a tap
       consumer mirroring `IcecastOutput` minus the network: no pacing, no
       reconnect; the encoder and file are created in `connect()` so a bad

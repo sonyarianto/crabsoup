@@ -415,6 +415,274 @@ impl AudioSource for RandomSource {
     }
 }
 
+/// A wall-clock instant for `switch` predicates. Weekday uses the C
+/// convention 0 = Sunday .. 6 = Saturday; `minutes` is minutes since
+/// midnight in the local timezone.
+#[derive(Clone, Copy, Debug)]
+struct LocalTime {
+    weekday: u8,
+    minutes: u32,
+}
+
+impl LocalTime {
+    fn now() -> Self {
+        use chrono::{Datelike, Timelike};
+        let now = chrono::Local::now();
+        Self {
+            weekday: now.weekday().num_days_from_sunday() as u8,
+            minutes: (now.hour() * 60 + now.minute()),
+        }
+    }
+}
+
+/// A `switch` child schedule: weekday set and/or a `[from, to)` window in
+/// minutes since midnight. An omitted window means "always" (the default
+/// child). `from > to` wraps past midnight (e.g. 22:00-06:00); `from == to`
+/// is an empty window that never matches.
+#[derive(Clone, Debug)]
+struct TimePredicate {
+    days: Option<Vec<u8>>,
+    from: Option<u32>,
+    to: Option<u32>,
+}
+
+impl TimePredicate {
+    fn always() -> Self {
+        Self {
+            days: None,
+            from: None,
+            to: None,
+        }
+    }
+
+    fn is_always(&self) -> bool {
+        self.days.is_none() && self.from.is_none() && self.to.is_none()
+    }
+
+    fn matches(&self, t: &LocalTime) -> bool {
+        if let Some(days) = &self.days
+            && !days.contains(&t.weekday)
+        {
+            return false;
+        }
+        match (self.from, self.to) {
+            (Some(f), Some(to)) if f == to => false,
+            (Some(f), Some(to)) if f < to => t.minutes >= f && t.minutes < to,
+            (Some(f), Some(to)) => t.minutes >= f || t.minutes < to,
+            (Some(f), None) => t.minutes >= f,
+            (None, Some(to)) => t.minutes < to,
+            (None, None) => true,
+        }
+    }
+}
+
+/// One `switch` slot: a predicate plus its child index.
+struct SwitchSlot {
+    when: TimePredicate,
+    child: usize,
+}
+
+/// How a [`ScheduleSource`] picks its next child at a track boundary.
+enum ScheduleKind {
+    /// Liquidsoap `switch`: the first slot whose predicate matches (and
+    /// whose child still has audio) wins; slots are re-checked from the top
+    /// at every boundary, so a slot's window opening grabs the next track.
+    Switch(Vec<SwitchSlot>),
+    /// Liquidsoap `rotate`: round-robin with per-child weights. A weight of
+    /// `w` keeps the child for `w` consecutive tracks.
+    Rotate {
+        weights: Vec<usize>,
+        cursor: usize,
+        spins: usize,
+    },
+}
+
+/// Track-sensitive scheduling of child sources (Liquidsoap `switch` /
+/// `rotate`). The active child plays to the end of its current track; a new
+/// child is selected only when a track boundary is observed (the child's
+/// `label` changes, or it exhausts). With `track_sensitive = false` the
+/// schedule is re-evaluated on every pull and children are cut abruptly.
+///
+/// Boundary detection is sample-accurate enough for scheduling: a label
+/// change is noticed on the pull that returns the new track's first buffer,
+/// so the re-pick happens on the following pull (at most one buffer of the
+/// next track comes from the old child).
+struct ScheduleSource {
+    children: Vec<LuaSource>,
+    kind: ScheduleKind,
+    current: usize,
+    /// A boundary was observed; re-select at the start of the next pull.
+    pending: bool,
+    /// First pull of the freshly-selected child: record its label without
+    /// treating it as a boundary.
+    primed: bool,
+    last_label: Option<String>,
+    track_sensitive: bool,
+    /// Injectable wall clock for tests.
+    now: Box<dyn Fn() -> LocalTime + Send + Sync>,
+}
+
+impl ScheduleSource {
+    fn new(kind: ScheduleKind, children: Vec<LuaSource>, track_sensitive: bool) -> Self {
+        ScheduleSource {
+            children,
+            kind,
+            current: 0,
+            pending: true,
+            primed: false,
+            last_label: None,
+            track_sensitive,
+            now: Box::new(LocalTime::now),
+        }
+    }
+
+    /// First `switch` slot whose predicate matches and whose child still
+    /// produces audio.
+    fn first_matching(&self) -> Option<usize> {
+        let now = (self.now)();
+        let ScheduleKind::Switch(slots) = &self.kind else {
+            return None;
+        };
+        slots.iter().find_map(|slot| {
+            if !slot.when.matches(&now) {
+                return None;
+            }
+            let child = self.children.get(slot.child)?.0.lock().unwrap();
+            if child.is_exhausted() { None } else { Some(slot.child) }
+        })
+    }
+
+    /// Pick the next child as the schedule dictates and reset the label
+    /// priming state.
+    fn select(&mut self) {
+        match &mut self.kind {
+            ScheduleKind::Switch(_) => {
+                if let Some(i) = self.first_matching() {
+                    self.current = i;
+                }
+            }
+            ScheduleKind::Rotate {
+                weights,
+                cursor,
+                spins,
+            } => {
+                let n = self.children.len();
+                let mut guard = 0;
+                loop {
+                    let c = *cursor % n;
+                    if !self.children[c].0.lock().unwrap().is_exhausted() {
+                        self.current = c;
+                        break;
+                    }
+                    *spins += 1;
+                    if *spins >= weights[c] {
+                        *spins = 0;
+                        *cursor = (*cursor + 1) % n;
+                    }
+                    guard += 1;
+                    if guard > n {
+                        // Everything exhausted; keep whatever is current.
+                        break;
+                    }
+                }
+                // Advance the rotation so the next boundary moves on, and
+                // a weight of `w` keeps the child for `w` consecutive tracks.
+                if guard <= n && !self.children.is_empty() {
+                    *spins += 1;
+                    if *spins >= weights[*cursor % n] {
+                        *spins = 0;
+                        *cursor = (*cursor + 1) % n;
+                    }
+                }
+            }
+        }
+        self.primed = false;
+        self.last_label = None;
+    }
+
+    /// Re-pick, honouring a boundary noticed at a previous pull.
+    fn choose(&mut self) {
+        if self.pending {
+            self.select();
+            self.pending = false;
+        }
+    }
+}
+
+impl AudioSource for ScheduleSource {
+    fn next_buffer(&mut self, buffer: &mut [f32]) -> usize {
+        self.choose();
+        for _ in 0..self.children.len() {
+            if !self.track_sensitive {
+                // Immediate scheduling: switch children mid-track as soon as
+                // the predicates change.
+                if let ScheduleKind::Switch(_) = self.kind
+                    && let Some(i) = self.first_matching()
+                    && i != self.current
+                {
+                    self.current = i;
+                    self.primed = false;
+                }
+            }
+            let (n, ended) = {
+                let mut child = self.children[self.current].0.lock().unwrap();
+                let n = child.next_buffer(buffer);
+                if n == 0 {
+                    (0, child.is_exhausted())
+                } else {
+                    let label = child.label();
+                    let started_new = self.primed && label != self.last_label;
+                    self.last_label = label;
+                    self.primed = true;
+                    (n, started_new)
+                }
+            };
+            if n > 0 {
+                if ended {
+                    // A new track started inside this buffer; re-pick at the
+                    // next pull so the next buffer comes from the right child.
+                    self.pending = true;
+                }
+                return n;
+            }
+            if !ended {
+                // Active child is temporarily silent; hold until it speaks.
+                return 0;
+            }
+            // Active child exhausted: pick the next child right away so this
+            // pull can hand over seamlessly.
+            self.select();
+            self.pending = false;
+        }
+        0
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.children.iter().all(|c| c.0.lock().unwrap().is_exhausted())
+    }
+
+    fn remaining_seconds(&self) -> Option<f64> {
+        self.children
+            .get(self.current)
+            .and_then(|c| c.0.lock().unwrap().remaining_seconds())
+    }
+
+    fn label(&self) -> Option<String> {
+        self.children
+            .get(self.current)
+            .and_then(|c| c.0.lock().unwrap().label())
+    }
+
+    fn skip(&mut self) {
+        // A skip is a track boundary too: the current track ends now, and
+        // the schedule re-picks on the next pull.
+        self.pending = true;
+        if let Some(child) = self.children.get_mut(self.current) {
+            child.0.lock().unwrap().skip();
+        }
+    }
+}
+
 /// Read an optional numeric table field with a default.
 fn opt_f64(opts: &Option<Table>, key: &str, default: f64) -> mlua::Result<f64> {
     match opts {
@@ -435,6 +703,73 @@ fn source_list(table: &Table) -> mlua::Result<Vec<LuaSource>> {
         return Err(mlua::Error::runtime("expected a list of sources"));
     }
     Ok(sources)
+}
+
+/// Parse a `"HH:MM"` clock time into minutes since midnight.
+fn parse_hhmm(value: &str) -> mlua::Result<u32> {
+    let mut parts = value.split(':');
+    let (h, m) = match (parts.next(), parts.next(), parts.next()) {
+        (Some(h), Some(m), None) => (h, m),
+        _ => return Err(mlua::Error::runtime(format!("switch: bad time {value:?}, use \"HH:MM\""))),
+    };
+    let h: u32 = h.parse().map_err(|_| mlua::Error::runtime(format!("switch: bad time {value:?}")))?;
+    let m: u32 = m.parse().map_err(|_| mlua::Error::runtime(format!("switch: bad time {value:?}")))?;
+    if h > 23 || m > 59 {
+        return Err(mlua::Error::runtime(format!("switch: bad time {value:?}")));
+    }
+    Ok(h * 60 + m)
+}
+
+/// Weekday name ("mon".."sun" or full names) to 0=Sunday..6=Saturday.
+fn weekday_number(name: &str) -> mlua::Result<u8> {
+    let n = match name.to_ascii_lowercase().as_str() {
+        "sun" | "sunday" => 0,
+        "mon" | "monday" => 1,
+        "tue" | "tuesday" => 2,
+        "wed" | "wednesday" => 3,
+        "thu" | "thursday" => 4,
+        "fri" | "friday" => 5,
+        "sat" | "saturday" => 6,
+        other => {
+            return Err(mlua::Error::runtime(format!(
+                "switch: unknown weekday {other:?} (use \"mon\"..\"sun\" or 0=Sunday..6=Saturday)"
+            )))
+        }
+    };
+    Ok(n)
+}
+
+/// Parse a `switch` slot's `when` table: optional `days` (names or 0-6,
+/// 0=Sunday), optional `from`/`to` (`"HH:MM"`). An empty table means
+/// always (the default child).
+fn parse_when(table: &Table) -> mlua::Result<TimePredicate> {
+    let days = match table.get::<Option<Table>>("days")? {
+        Some(days) => {
+            let mut out = Vec::new();
+            for i in 1..=days.len()? {
+                match days.get::<LValue>(i)? {
+                    LValue::String(s) => out.push(weekday_number(&s.to_str()?)?),
+                    LValue::Integer(n) if (0..=6).contains(&n) => out.push(n as u8),
+                    _ => {
+                        return Err(mlua::Error::runtime(
+                            "switch: `days` entries must be weekday names or 0-6",
+                        ))
+                    }
+                }
+            }
+            Some(out)
+        }
+        None => None,
+    };
+    let from = match table.get::<Option<String>>("from")? {
+        Some(s) => Some(parse_hhmm(&s)?),
+        None => None,
+    };
+    let to = match table.get::<Option<String>>("to")? {
+        Some(s) => Some(parse_hhmm(&s)?),
+        None => None,
+    };
+    Ok(TimePredicate { days, from, to })
 }
 
 /// Signal spec + frames-per-buffer from the current script settings.
@@ -673,6 +1008,77 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
             })?,
         )?;
     }
+
+    // ---- daypart scheduling (Liquidsoap `switch`, `rotate`) --------------
+    globals.set(
+        "switch",
+        lua.create_function(
+            |_lua, (slots, opts): (Table, Option<Table>)| {
+                let track_sensitive: bool = match &opts {
+                    Some(t) => t.get("track_sensitive").unwrap_or(true),
+                    None => true,
+                };
+                let len = slots.len()?;
+                if len == 0 {
+                    return Err(mlua::Error::runtime(
+                        "switch: expected a list of {when = ..., src = ...} slots",
+                    ));
+                }
+                let mut children = Vec::new();
+                let mut predicates = Vec::new();
+                for i in 1..=len {
+                    let slot: Table = slots.get(i)?;
+                    let src: LuaSource = slot.get("src")?;
+                    let child = children.len();
+                    children.push(src);
+                    let when = match slot.get::<Option<Table>>("when")? {
+                        Some(t) => parse_when(&t)?,
+                        None => TimePredicate::always(),
+                    };
+                    predicates.push(SwitchSlot { when, child });
+                }
+                if !predicates.iter().any(|s| s.when.is_always()) {
+                    return Err(mlua::Error::runtime(
+                        "switch: expected a default child (a slot without `when`)",
+                    ));
+                }
+                let composed: Box<dyn AudioSource> = Box::new(ScheduleSource::new(
+                    ScheduleKind::Switch(predicates),
+                    children,
+                    track_sensitive,
+                ));
+                Ok(LuaSource::new(composed))
+            },
+        )?,
+    )?;
+
+    globals.set(
+        "rotate",
+        lua.create_function(|_lua, (children, opts): (Table, Option<Table>)| {
+            let sources = source_list(&children)?;
+            let n = sources.len();
+            let weights: Vec<usize> = match &opts {
+                Some(t) => t.get("weights").unwrap_or_default(),
+                None => Vec::new(),
+            };
+            let weights = if weights.is_empty() {
+                vec![1; n]
+            } else {
+                if weights.len() != n {
+                    return Err(mlua::Error::runtime(
+                        "rotate: `weights` must have one entry per child",
+                    ));
+                }
+                weights
+            };
+            let composed: Box<dyn AudioSource> = Box::new(ScheduleSource::new(
+                ScheduleKind::Rotate { weights, cursor: 0, spins: 0 },
+                sources,
+                true,
+            ));
+            Ok(LuaSource::new(composed))
+        })?,
+    )?;
 
     // ---- jingles ----------------------------------------------------------
     let jingle_state = state.clone();
@@ -1206,5 +1612,372 @@ mod tests {
         // 0.02 is -34 dB; reaching -6 needs +28 dB, clamped to the 20 dB
         // max boost: 0.02 * 10 = 0.2.
         assert!((peak - 0.2).abs() < 0.01, "normalized peak {peak}");
+    }
+
+    // ---- Phase 5: switch / rotate ----------------------------------------
+
+    /// Injects a fixed wall clock into a [`ScheduleSource`].
+    fn fake_clock(src: &mut ScheduleSource, time: std::sync::Arc<std::sync::Mutex<LocalTime>>) {
+        src.now = Box::new(move || *time.lock().unwrap());
+    }
+
+    /// Infinite child that emits a constant level and cycles through the
+    /// given labels every `frames_per_track` frames (a mock of a
+    /// crossfading playlist's label behaviour).
+    struct LabelCycler {
+        level: f32,
+        labels: Vec<&'static str>,
+        frames_per_track: usize,
+        emitted: usize,
+    }
+
+    impl LabelCycler {
+        fn new(level: f32, labels: &[&'static str], frames_per_track: usize) -> Self {
+            Self {
+                level,
+                labels: labels.to_vec(),
+                frames_per_track,
+                emitted: 0,
+            }
+        }
+    }
+
+    impl AudioSource for LabelCycler {
+        fn next_buffer(&mut self, buffer: &mut [f32]) -> usize {
+            let n = buffer.len();
+            buffer.fill(self.level);
+            self.emitted += n;
+            n
+        }
+
+        fn is_exhausted(&self) -> bool {
+            false
+        }
+
+        fn label(&self) -> Option<String> {
+            Some(self.labels[(self.emitted / self.frames_per_track) % self.labels.len()].into())
+        }
+    }
+
+    #[test]
+    fn time_predicate_matches_windows_and_days() {
+        let always = TimePredicate::always();
+        assert!(always.is_always());
+        assert!(always.matches(&LocalTime { weekday: 3, minutes: 0 }));
+
+        let window = TimePredicate {
+            days: Some(vec![1, 2, 3, 4, 5]),
+            from: Some(9 * 60),
+            to: Some(17 * 60),
+        };
+        let t = LocalTime { weekday: 2, minutes: 12 * 60 };
+        assert!(window.matches(&t));
+        assert!(!window.matches(&LocalTime { weekday: 6, minutes: 12 * 60 }));
+        assert!(!window.matches(&LocalTime { weekday: 2, minutes: 8 * 60 }));
+        assert!(!window.matches(&LocalTime { weekday: 2, minutes: 17 * 60 }));
+        // `to` is exclusive.
+        assert!(!window.matches(&LocalTime { weekday: 2, minutes: 17 * 60 }));
+    }
+
+    #[test]
+    fn time_predicate_wraps_past_midnight() {
+        let overnight = TimePredicate {
+            days: None,
+            from: Some(22 * 60),
+            to: Some(6 * 60),
+        };
+        assert!(overnight.matches(&LocalTime { weekday: 0, minutes: 23 * 60 }));
+        assert!(overnight.matches(&LocalTime { weekday: 0, minutes: 3 * 60 }));
+        assert!(!overnight.matches(&LocalTime { weekday: 0, minutes: 12 * 60 }));
+        // from == to is an empty window.
+        let empty = TimePredicate { days: None, from: Some(0), to: Some(0) };
+        assert!(!empty.matches(&LocalTime { weekday: 0, minutes: 0 }));
+    }
+
+    #[test]
+    fn switch_stays_in_a_window_and_moves_to_the_default_when_it_closes() {
+        let clock = Arc::new(Mutex::new(LocalTime { weekday: 1, minutes: 9 * 60 }));
+        let fpb = 100;
+        let mut a = LuaSource::new(Box::new(LabelCycler::new(0.25, &["a1", "a2"], 300)));
+        let mut b = LuaSource::new(Box::new(LabelCycler::new(0.75, &["b1", "b2"], 300)));
+        let mut src = ScheduleSource::new(
+            ScheduleKind::Switch(vec![
+                SwitchSlot {
+                    when: TimePredicate {
+                        days: None,
+                        from: Some(9 * 60),
+                        to: Some(17 * 60),
+                    },
+                    child: 0,
+                },
+                SwitchSlot { when: TimePredicate::always(), child: 1 },
+            ]),
+            vec![a.clone(), b.clone()],
+            true,
+        );
+        fake_clock(&mut src, clock.clone());
+
+        let mut buf = vec![0f32; fpb];
+        // Inside the window: plays child A (0.25).
+        assert_eq!(src.next_buffer(&mut buf), fpb);
+        assert!(buf.iter().all(|&s| s == 0.25));
+        // After the window closes, A's next track boundary hands over to B.
+        clock.lock().unwrap().minutes = 18 * 60;
+        for _ in 0..3 {
+            src.next_buffer(&mut buf);
+        }
+        assert!(src.next_buffer(&mut buf) > 0);
+        assert!(buf.iter().all(|&s| s == 0.75), "expected the default child");
+        assert_eq!(src.label().as_deref(), Some("b1"));
+    }
+
+    #[test]
+    fn switch_track_sensitive_holds_mid_track_until_the_boundary() {
+        let clock = Arc::new(Mutex::new(LocalTime { weekday: 1, minutes: 9 * 60 }));
+        let fpb = 100;
+        let a = LuaSource::new(Box::new(LabelCycler::new(0.25, &["a1", "a2"], 300)));
+        let b = LuaSource::new(Box::new(LabelCycler::new(0.75, &["b1", "b2"], 300)));
+        let mut src = ScheduleSource::new(
+            ScheduleKind::Switch(vec![
+                SwitchSlot {
+                    when: TimePredicate {
+                        days: None,
+                        from: Some(9 * 60),
+                        to: Some(10 * 60),
+                    },
+                    child: 0,
+                },
+                SwitchSlot { when: TimePredicate::always(), child: 1 },
+            ]),
+            vec![a.clone(), b.clone()],
+            true,
+        );
+        fake_clock(&mut src, clock.clone());
+
+        let mut buf = vec![0f32; fpb];
+        // Two pulls inside the window, then the window closes mid-track.
+        src.next_buffer(&mut buf);
+        src.next_buffer(&mut buf);
+        clock.lock().unwrap().minutes = 10 * 60 + 1;
+        // The third track still plays out from A (0.25) despite the window
+        // having closed — track-sensitive.
+        src.next_buffer(&mut buf);
+        assert!(buf.iter().all(|&s| s == 0.25));
+        // Boundary after A's track (3 pulls = 300 frames = one track): B now.
+        src.next_buffer(&mut buf);
+        assert!(buf.iter().all(|&s| s == 0.75));
+    }
+
+    #[test]
+    fn switch_with_track_sensitive_false_cuts_mid_track() {
+        let clock = Arc::new(Mutex::new(LocalTime { weekday: 1, minutes: 9 * 60 }));
+        let fpb = 100;
+        let a = LuaSource::new(Box::new(LabelCycler::new(0.25, &["a1", "a2"], 300)));
+        let b = LuaSource::new(Box::new(LabelCycler::new(0.75, &["b1", "b2"], 300)));
+        let mut src = ScheduleSource::new(
+            ScheduleKind::Switch(vec![
+                SwitchSlot {
+                    when: TimePredicate {
+                        days: None,
+                        from: Some(9 * 60),
+                        to: Some(10 * 60),
+                    },
+                    child: 0,
+                },
+                SwitchSlot { when: TimePredicate::always(), child: 1 },
+            ]),
+            vec![a.clone(), b.clone()],
+            false,
+        );
+        fake_clock(&mut src, clock.clone());
+
+        let mut buf = vec![0f32; fpb];
+        src.next_buffer(&mut buf);
+        assert!(buf.iter().all(|&s| s == 0.25));
+        clock.lock().unwrap().minutes = 10 * 60 + 1;
+        // The very next pull already abandons A mid-track.
+        src.next_buffer(&mut buf);
+        assert!(buf.iter().all(|&s| s == 0.75));
+    }
+
+    #[test]
+    fn rotate_cycles_children_one_track_at_a_time() {
+        let fpb = 100;
+        let a = LuaSource::new(Box::new(LabelCycler::new(0.25, &["a1", "a2"], 300)));
+        let b = LuaSource::new(Box::new(LabelCycler::new(0.75, &["b1", "b2"], 300)));
+        let mut src = ScheduleSource::new(
+            ScheduleKind::Rotate { weights: vec![1, 1], cursor: 0, spins: 0 },
+            vec![a.clone(), b.clone()],
+            true,
+        );
+
+        let mut buf = vec![0f32; fpb];
+        let mut seen = Vec::new();
+        for _ in 0..12 {
+            src.next_buffer(&mut buf);
+            seen.push(buf[0]);
+        }
+        // One track = 300 frames = 3 pulls: A, A, A, B, B, B, A, ...
+        assert_eq!(seen, vec![0.25, 0.25, 0.25, 0.75, 0.75, 0.75, 0.25, 0.25, 0.25, 0.75, 0.75, 0.75]);
+    }
+
+    #[test]
+    fn rotate_with_weights_keeps_a_child_for_more_tracks() {
+        let fpb = 100;
+        let a = LuaSource::new(Box::new(LabelCycler::new(0.25, &["a1", "a2"], 300)));
+        let b = LuaSource::new(Box::new(LabelCycler::new(0.75, &["b1", "b2"], 300)));
+        let mut src = ScheduleSource::new(
+            ScheduleKind::Rotate { weights: vec![1, 2], cursor: 0, spins: 0 },
+            vec![a.clone(), b.clone()],
+            true,
+        );
+
+        let mut buf = vec![0f32; fpb];
+        let mut seen = Vec::new();
+        for _ in 0..15 {
+            src.next_buffer(&mut buf);
+            seen.push(buf[0]);
+        }
+        // 1x A, 2x B: A A A, B B B, B B B, A A A, B B B, B B B, A A A.
+        assert_eq!(
+            seen,
+            vec![
+                0.25, 0.25, 0.25, 0.75, 0.75, 0.75, 0.75, 0.75, 0.75,
+                0.25, 0.25, 0.25, 0.75, 0.75, 0.75,
+            ]
+        );
+    }
+
+    #[test]
+    fn rotate_skips_an_exhausted_child() {
+        let fpb = 20;
+        // B is exhausted from the start (zero-length blank).
+        let a = LuaSource::new(Box::new(LabelCycler::new(0.25, &["a1", "a2"], 100)));
+        let b = LuaSource::new(Box::new(BlankSource::with_duration(0.0, 100)));
+        let mut src = ScheduleSource::new(
+            ScheduleKind::Rotate { weights: vec![1, 1], cursor: 0, spins: 0 },
+            vec![a.clone(), b.clone()],
+            true,
+        );
+
+        let mut buf = vec![0f32; fpb];
+        let mut seen = Vec::new();
+        for _ in 0..6 {
+            src.next_buffer(&mut buf);
+            seen.push(buf[0]);
+        }
+        // B is skipped forever: all audio comes from A (0.25).
+        assert!(seen.iter().all(|&s| s == 0.25));
+    }
+
+    #[test]
+    fn switch_skip_forces_a_repick() {
+        let clock = Arc::new(Mutex::new(LocalTime { weekday: 1, minutes: 9 * 60 }));
+        let fpb = 100;
+        // A's first track is one buffer long (100 frames).
+        let a = LuaSource::new(Box::new(LabelCycler::new(0.25, &["a1", "a2"], 100)));
+        let b = LuaSource::new(Box::new(LabelCycler::new(0.75, &["b1", "b2"], 100)));
+        let mut src = ScheduleSource::new(
+            ScheduleKind::Switch(vec![
+                SwitchSlot {
+                    when: TimePredicate {
+                        days: None,
+                        from: Some(9 * 60),
+                        to: Some(10 * 60),
+                    },
+                    child: 0,
+                },
+                SwitchSlot { when: TimePredicate::always(), child: 1 },
+            ]),
+            vec![a.clone(), b.clone()],
+            true,
+        );
+        fake_clock(&mut src, clock.clone());
+
+        let mut buf = vec![0f32; fpb];
+        src.next_buffer(&mut buf);
+        assert!(buf.iter().all(|&s| s == 0.25));
+        // A skip lands on the default child even though the window is open:
+        // the schedule is re-evaluated and the first match wins.
+        clock.lock().unwrap().minutes = 11 * 60;
+        src.skip();
+        src.next_buffer(&mut buf);
+        assert!(buf.iter().all(|&s| s == 0.75));
+    }
+
+    #[test]
+    fn switch_registers_in_lua_with_a_default_child() {
+        let (_rt, res) = run(
+            r#"
+            day = sine({freq = 440})
+            night = sine({freq = 880})
+            output.preview(switch({
+                {when = {days = {"mon", "tue", "wed", "thu", "fri"}, from = "09:00", to = "17:00"}, src = day},
+                {src = night}
+            }))
+            "#,
+        )
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        root.next_buffer(&mut buf);
+        assert_eq!(root.label().as_deref(), Some("sine 880 Hz"));
+    }
+
+    #[test]
+    fn switch_requires_a_default_child() {
+        let err = run(
+            r#"
+            output.preview(switch({
+                {when = {from = "09:00", to = "17:00"}, src = sine({freq = 440})}
+            }))
+            "#,
+        )
+        .err()
+        .expect("script fails");
+        assert!(err.to_string().contains("default child"));
+    }
+
+    #[test]
+    fn switch_rejects_bad_times_and_weekdays() {
+        let err = run(
+            r#"
+            output.preview(switch({
+                {when = {from = "25:00", to = "17:00"}, src = sine({freq = 440})},
+                {src = sine({freq = 880})}
+            }))
+            "#,
+        )
+        .err()
+        .expect("script fails");
+        assert!(err.to_string().contains("bad time"));
+
+        let err = run(
+            r#"
+            output.preview(switch({
+                {when = {days = {"funday"}}, src = sine({freq = 440})},
+                {src = sine({freq = 880})}
+            }))
+            "#,
+        )
+        .err()
+        .expect("script fails");
+        assert!(err.to_string().contains("unknown weekday"));
+    }
+
+    #[test]
+    fn rotate_registers_in_lua() {
+        let (_rt, res) = run(
+            r#"
+            a = sine({freq = 440, duration = 0.2})
+            b = sine({freq = 880, duration = 0.2})
+            output.preview(rotate({a, b}, {weights = {1, 2}}))
+            "#,
+        )
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        root.next_buffer(&mut buf);
+        assert_eq!(root.label().as_deref(), Some("sine 440 Hz"));
     }
 }

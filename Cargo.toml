@@ -20,6 +20,8 @@ log = "0.4"
 env_logger = "0.11"
 # Track ordering randomness
 rand = { version = "0.8", features = ["small_rng"] }
+# Local time for dayparting (`switch` predicates)
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # Opus encoding (libopus FFI) + Ogg muxing
 audiopus = "0.3.0-rc.0"
 ogg = "0.9"

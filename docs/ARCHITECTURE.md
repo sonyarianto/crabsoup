@@ -33,9 +33,9 @@ One engine thread plus one thread per output:
 
 - Registers the Liquidsoap-flavoured Lua stdlib: `playlist`, `single`,
   `blank`, `sine`, `amplify`, `compress`, `normalize`, `jingles`,
-  `fallback`/`sequence`/`random`, `input.harbor`, `output.icecast`,
-  `output.file`, `output.preview`, `server.telnet`, `on_metadata`, `set`,
-  `log`.
+  `fallback`/`sequence`/`random`, `switch`, `rotate`, `input.harbor`,
+  `output.icecast`, `output.file`, `output.preview`, `server.telnet`,
+  `on_metadata`, `set`, `log`.
 - Sources are Lua userdata wrapping `Arc<Mutex<Box<dyn AudioSource>>>` so they
   compose; `LuaSource::take` steals the box via `mem::replace` (mlua keeps a
   clone on the stack during the call, so `Arc::try_unwrap` would fail).
@@ -50,6 +50,15 @@ One engine thread plus one thread per output:
   `on_metadata(callback, source)` wraps the source in `OnMetadataSource`,
   which sends `ScriptEvent::Metadata { hook_id, title }` over an `mpsc`
   channel; the Lua-owning main thread invokes the callback.
+- `switch`/`rotate` share one `ScheduleSource`: the active child plays the
+  whole track, and a new child is re-picked only at a track boundary
+  (child `label` change or exhaustion). `switch` slots are `when` predicates
+  (`days` names/0-6, `from`/`to` `"HH:MM"`, overnight wrap; omitted `when` =
+  default child) checked from the top, so a window opening grabs the next
+  track; `rotate` advances a weighted round-robin cursor per boundary.
+  `track_sensitive = false` re-evaluates every pull and cuts mid-track.
+  The clock is an injected `Fn() -> LocalTime` (chrono `Local::now()` by
+  default) so tests pin wall time.
 
 ## Mixer control (`src/engine/mixer.rs`)
 

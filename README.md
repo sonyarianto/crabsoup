@@ -7,8 +7,8 @@ Opus) to an Icecast server.
 
 - `.lua` scripting: real Lua with Liquidsoap-style functions — `playlist`,
   `single`, `blank`, `sine`, `amplify`, `compress`, `normalize`, `fallback`,
-  `sequence`, `random`, `jingles`, `input.harbor`, `output.icecast`,
-  `output.preview`, `server.telnet`, `set`, `log`
+  `sequence`, `random`, `switch`, `rotate`, `jingles`, `input.harbor`,
+  `output.icecast`, `output.preview`, `server.telnet`, `set`, `log`
 - Playlist scheduling: recursive directory scan, explicit file lists, loop and shuffle
 - Gapless crossfades with configurable overlap and fade curve
 - Live DJ harbor: an Icecast source-protocol listener (`PUT /live`); the
@@ -110,11 +110,27 @@ output.icecast({host = "localhost", port = 8000,
 
 Named options are passed as Lua tables; most have defaults. `format` is
 `"mp3"` or `"opus"`. Composable sources: `playlist`, `single`, `jingles`,
-`fallback`/`sequence`, `random` (non-repeating shuffle), `blank`/`sine`
+`fallback`/`sequence`, `random` (non-repeating shuffle), `switch`
+(dayparting), `rotate` (weighted round-robin), `blank`/`sine`
 (test tones, both accept an optional `duration`), and the DSP operators
 `amplify(source, gain)`, `compress(source, opts)`, `normalize(source, opts)`
 (run inline in the pull chain). `output.preview(...)` runs without
 broadcasting.
+
+Dayparting with `switch` — slots with a `when` predicate (weekday `days` as
+names or 0-6, `from`/`to` in `"HH:MM"`, overnight windows wrap; `from == to`
+never matches) are checked at each track boundary; the last slot must be a
+default without `when`. `track_sensitive = false` re-checks every buffer and
+cuts mid-track. `rotate({a, b}, {weights = {1, 2}})` holds a child for
+`weights[n]` consecutive tracks.
+
+```lua
+daytime = playlist({directory = "./media/day"})
+overnight = playlist({directory = "./media/night"})
+pl = switch({{when = {days = {"mon", "tue", "wed", "thu", "fri"},
+                      from = "09:00", to = "17:00"}, src = daytime},
+             {src = overnight}})
+```
 
 ### Control port
 
@@ -154,7 +170,7 @@ phase).
 | live DJ ducking (`mksafe`/`switch` + request scheduling) | `input.harbor` + `PriorityMixer` ducking (harbor connect/disconnect drives the mixer) | done |
 | one-shot jingles (`switch` + request scheduling) | `jingles({directory})` + telnet `jingles.play` | done |
 | `request.queue` + telnet `queue.push` | planned (Phase 3) | planned |
-| `switch` (dayparting), `rotate` | planned (Phase 5) | planned |
+| `switch` (dayparting), `rotate` | `switch({ {when = {days, from, to}, src = ...}, {src = default} })`, `rotate({...}, {weights = ...})` | done |
 | `on_metadata` / `on_track` | planned (Phase 6) | planned |
 | `http://` request resolution | planned (Phase 7) | planned |
 
