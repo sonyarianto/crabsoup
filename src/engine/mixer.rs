@@ -788,8 +788,19 @@ mod tests {
             .filter(|p| p.extension().map(|x| x == "mp3").unwrap_or(false))
             .collect();
         files.sort();
-        let playlist =
-            crate::source::playlist::Playlist::new(files, false, true, spec, 4096, None);
+        let files: Vec<_> = files
+            .into_iter()
+            .map(crate::request::RequestUri::Local)
+            .collect();
+        let playlist = crate::source::playlist::Playlist::new(
+            files,
+            false,
+            true,
+            crate::request::RequestConfig::default(),
+            spec,
+            4096,
+            None,
+        );
         let cfg = mixer_config(0.2);
         let cross = CrossfadeMixer::new(Box::new(playlist), &cfg, 44100, 2);
         let (tx, rx) = mpsc::channel();

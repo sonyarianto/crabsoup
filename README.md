@@ -52,6 +52,7 @@ Source layout:
 | `src/engine/` | `CrossfadeMixer`, `PriorityMixer`, `MixCommand` |
 | `src/live/` | DJ harbor (Icecast source protocol listener) |
 | `src/output/` | `encoder.rs` (LAME/libopus/fdk-aac), `ogg_mux.rs`, `icecast_client.rs` (native source protocol), `icecast.rs` (pump + reconnect) |
+| `src/request.rs` | `RequestUri` (local path or `http://` URL), download-then-play HTTP client, `RequestConfig` |
 
 ## Building
 
@@ -169,10 +170,10 @@ phase).
 | telnet `skip` / `status` / `uptime` | same | done |
 | live DJ ducking (`mksafe`/`switch` + request scheduling) | `input.harbor` + `PriorityMixer` ducking (harbor connect/disconnect drives the mixer) | done |
 | one-shot jingles (`switch` + request scheduling) | `jingles({directory})` + telnet `jingles.play` | done |
-| `request.queue` + telnet `queue.push` | planned (Phase 3) | planned |
+| `request.queue` + telnet `queue.push` | done |
 | `switch` (dayparting), `rotate` | `switch({ {when = {days, from, to}, src = ...}, {src = default} })`, `rotate({...}, {weights = ...})` | done |
 | `on_metadata` / `on_track` | `on_metadata(fn, src)` (title table), `on_track(fn, src)` (boundary, no args) | done |
-| `http://` request resolution | planned (Phase 7) | planned |
+| `http://` request resolution | `single("http://...")`, `playlist(entries)`, `queue.push <url>` — download-then-play with retry/timeout, temp files auto-removed | done |
 
 ## Testing
 

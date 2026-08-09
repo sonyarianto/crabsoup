@@ -41,7 +41,7 @@ use crate::config::{
 };
 use crate::engine::effects::{Agc, Amplify, Compressor, EffectSource};
 use crate::engine::mixer::CrossfadeMixer;
-use crate::source::file::FileSource;
+use crate::request::{resolve, RequestConfig, RequestUri};
 use crate::source::playlist::Playlist;
 use crate::source::request::{RequestQueue, RequestQueueSource};
 use crate::source::{AudioSource, BlankSource, SilenceSource, SineSource};
@@ -70,6 +70,8 @@ pub struct ScriptResult {
 struct ScriptState {
     stream: StreamConfig,
     mixer: MixerConfig,
+    /// Request/download settings for URI-resolving sources.
+    request: RequestConfig,
     jingles: Vec<PathBuf>,
     harbor: Option<LiveConfig>,
     control: Option<ControlConfig>,
@@ -319,6 +321,8 @@ impl ScriptState {
             "crossfade_seconds" => num!(self.mixer.crossfade_seconds, f64),
             "fade_curve" => num!(self.mixer.fade_curve, f64),
             "duck_seconds" => num!(self.mixer.duck_seconds, f64),
+            "request_timeout" => num!(self.request.timeout_secs, u64),
+            "request_retries" => num!(self.request.retries, u32),
             other => {
                 return Err(mlua::Error::runtime(format!("unknown setting \"{other}\"")))
             }
@@ -860,7 +864,7 @@ fn bus(state: &Rc<RefCell<ScriptState>>) -> (SignalSpec, usize) {
 /// A playlist whose tracks crossfade into each other, presented as a plain
 /// source so it composes inside fallback/random.
 fn crossfading_playlist(
-    paths: Vec<PathBuf>,
+    requests: Vec<RequestUri>,
     shuffle: bool,
     loop_playlist: bool,
     state: &Rc<RefCell<ScriptState>>,
@@ -868,7 +872,8 @@ fn crossfading_playlist(
     let (spec, fpb) = bus(state);
     let chans = spec.channels.count();
     let mixer_cfg = state.borrow().mixer.clone();
-    let playlist = Playlist::new(paths, shuffle, loop_playlist, spec, fpb, None);
+    let request = state.borrow().request;
+    let playlist = Playlist::new(requests, shuffle, loop_playlist, request, spec, fpb, None);
     Box::new(CrossfadeMixer::new(Box::new(playlist), &mixer_cfg, spec.rate, chans))
 }
 
@@ -910,19 +915,22 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
             let shuffle: bool = opts.get("shuffle").unwrap_or(false);
             let loop_playlist: bool = opts.get("loop").unwrap_or(true);
 
-            let mut paths = Vec::new();
+            let mut requests = Vec::new();
             if let Some(dir) = &directory {
+                let mut paths = Vec::new();
                 collect_audio(&PathBuf::from(dir), &mut paths);
+                requests.extend(paths.into_iter().map(|p| RequestUri::new(p.to_str().unwrap_or_default())));
             }
-            paths.extend(files.iter().map(PathBuf::from));
-            paths.sort();
-            paths.dedup();
-            if paths.is_empty() {
+            // `files` entries may be paths or http:// URLs.
+            requests.extend(files.iter().map(|f| RequestUri::new(f)));
+            requests.sort();
+            requests.dedup();
+            if requests.is_empty() {
                 return Err(mlua::Error::runtime(
                     "playlist: no audio files found (check `directory`/`files`)",
                 ));
             }
-            let src = crossfading_playlist(paths, shuffle, loop_playlist, &pl_state);
+            let src = crossfading_playlist(requests, shuffle, loop_playlist, &pl_state);
             Ok(LuaSource::new(src))
         })?,
     )?;
@@ -932,9 +940,10 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         "single",
         lua.create_function(move |_, path: String| {
             let (spec, fpb) = bus(&single_state);
-            let src = FileSource::open(&PathBuf::from(&path), spec, fpb)
-                .map_err(mlua::Error::runtime)?;
-            Ok(LuaSource::new(Box::new(src)))
+            let uri = RequestUri::new(&path);
+            let request = single_state.borrow().request;
+            let src = resolve(&uri, &request, spec, fpb).map_err(mlua::Error::runtime)?;
+            Ok(LuaSource::new(src))
         })?,
     )?;
 
@@ -942,9 +951,10 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
     let queue_state = state.clone();
     let request_fn = lua.create_function(move |_, _: ()| {
         let (spec, fpb) = bus(&queue_state);
+        let request = queue_state.borrow().request;
         let queue = Arc::new(RequestQueue::new());
         queue_state.borrow_mut().request_queue = Some(queue.clone());
-        let src = RequestQueueSource::new(queue, spec, fpb);
+        let src = RequestQueueSource::new(queue, request, spec, fpb);
         Ok(LuaSource::new(Box::new(src)))
     })?;
     let request = lua.create_table()?;
@@ -1181,8 +1191,9 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
             // Registered for the telnet `jingles.play` command...
             jingle_state.borrow_mut().jingles.extend(paths.clone());
             // ...and returned as a plain (non-looped) playlist source so it
-            // composes like any other source.
-            let src = crossfading_playlist(paths, false, false, &jingle_state);
+            // composes like any other source (jingles stay local paths).
+            let requests = paths.into_iter().map(RequestUri::Local).collect();
+            let src = crossfading_playlist(requests, false, false, &jingle_state);
             Ok(LuaSource::new(src))
         })?,
     )?;
@@ -1493,8 +1504,11 @@ mod tests {
         .expect("script runs");
         let queue = res.request_queue.expect("queue registered");
         assert!(queue.is_empty());
-        queue.push("/tmp/x.mp3".into());
-        assert_eq!(queue.list(), vec![PathBuf::from("/tmp/x.mp3")]);
+        queue.push(RequestUri::new("/tmp/x.mp3"));
+        assert_eq!(
+            queue.list(),
+            vec![RequestUri::new("/tmp/x.mp3")]
+        );
     }
 
     #[test]
@@ -1521,12 +1535,12 @@ mod tests {
         assert_eq!(root.label().as_deref(), Some("sine 440 Hz"));
 
         // Pushing a request mid-stream: the queue preempts on the next pull.
-        queue.push(real.clone());
+        queue.push(RequestUri::Local(real.clone()));
         let n = root.next_buffer(&mut buf);
         assert!(n > 0);
         assert_eq!(
             root.label(),
-            Some(real.display().to_string()),
+            Some("sunset-house-grooves-deep-house-sunset-538759".to_string()),
             "queued track must take over"
         );
 

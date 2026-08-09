@@ -149,7 +149,7 @@ fn dispatch(
         "queue.push" => match parts.next() {
             Some(path) => match queue {
                 Some(q) => {
-                    q.push(path.into());
+                    q.push(crate::request::RequestUri::new(path));
                     CommandResult::Reply(format!("queued {path} ({})", q.len()))
                 }
                 None => CommandResult::Reply("ERROR: no request.queue source in script".into()),
@@ -162,7 +162,7 @@ fn dispatch(
                     .list()
                     .iter()
                     .enumerate()
-                    .map(|(i, p)| format!("{i}: {}", p.display()))
+                    .map(|(i, uri)| format!("{i}: {}", uri.raw()))
                     .collect();
                 if lines.is_empty() {
                     CommandResult::Reply("queue empty".into())

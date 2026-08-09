@@ -42,7 +42,8 @@ One engine thread plus one thread per output:
 - Returns `mlua::Result` — `mlua::Error` is `!Send`, so the crate `Result`
   alias cannot hold it; main maps it to a string.
 - `set` keys: `sample_rate`, `channels`, `frames_per_buffer`,
-  `crossfade_seconds`, `fade_curve`, `duck_seconds`.
+  `crossfade_seconds`, `fade_curve`, `duck_seconds`, `request_timeout`,
+  `request_retries`.
 - `script::run` returns `(ScriptRuntime, ScriptResult)`; `ScriptResult`
   carries `outputs: Vec<OutputConfig>` — multiple `output.icecast` calls are
   accepted iff they share the same source graph (`Arc::ptr_eq` check).
@@ -63,6 +64,26 @@ One engine thread plus one thread per output:
   `track_sensitive = false` re-evaluates every pull and cuts mid-track.
   The clock is an injected `Fn() -> LocalTime` (chrono `Local::now()` by
   default) so tests pin wall time.
+
+## Request protocols (`src/request.rs`)
+
+- `RequestUri` (`Local(PathBuf)` | `Url(String)`): `single`, `playlist`
+  entries, and the telnet request queue all carry URIs and resolve at
+  play time via `resolve()`. `Local` opens a `FileSource`; `Url` downloads
+  to `$TMPDIR/crabsoup-requests/{fnv1a}-{n}.part` (stable per-URL name +
+  per-process counter so concurrent same-URL downloads can't collide, and a
+  playlist loop re-requesting the URL re-downloads it) and wraps the file
+  in `DownloadSource`, whose `Drop` removes the temp file — a killed process
+  leaks `.part` files by design.
+- The HTTP client is stdlib-only: single connect per attempt, up to 4
+  redirects (`Location` resolved absolute/root/relative against the request
+  URL), `Content-Length` and chunked bodies, connection-close fallback,
+  connect+read `request_timeout`. https is rejected up front with a clear
+  error. `download()` retries `request_retries` times with a 500 ms backoff
+  and removes the partial file if all attempts fail.
+- `show_error`-style fallback semantics: a failed `resolve()` surfaces as an
+  error the caller decides on — the request queue drops the bad request and
+  plays the next one; the playlist plays silence for that slot.
 
 ## Mixer control (`src/engine/mixer.rs`)
 

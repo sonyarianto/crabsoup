@@ -9,6 +9,7 @@ pub mod control;
 pub mod engine;
 pub mod live;
 pub mod output;
+pub mod request;
 pub mod resample;
 pub mod script;
 pub mod source;

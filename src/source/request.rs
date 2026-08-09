@@ -1,17 +1,17 @@
-//! Request queue (Liquidsoap `request.queue`): a FIFO of file paths pushed
-//! at runtime via the telnet port, played ahead of the playlist when
-//! non-empty.
+//! Request queue (Liquidsoap `request.queue`): a FIFO of media requests
+//! (local paths or `http://` URLs) pushed at runtime via the telnet port,
+//! played ahead of the playlist when non-empty.
 //!
 //! The queue state is shared: the control port pushes paths and requests
-//! skips; the [`RequestQueueSource`] (pulled on the tap thread) pops them.
+//! skips; the [`RequestQueueSource`] (pulled on the tap thread) pops them
+//! and resolves each one (downloading URLs to a temp file).
 
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use symphonia::core::audio::SignalSpec;
 
-use crate::source::file::FileSource;
+use crate::request::{resolve, RequestConfig, RequestUri};
 use crate::source::AudioSource;
 
 /// Shared FIFO state. Methods used by the control port (`push`/`list`/
@@ -22,7 +22,7 @@ pub struct RequestQueue {
 
 #[derive(Default)]
 struct QueueState {
-    paths: VecDeque<PathBuf>,
+    requests: VecDeque<RequestUri>,
     /// One-shot skip requested by the control port; consumed when a queued
     /// track is actually playing.
     skip: bool,
@@ -35,28 +35,28 @@ impl RequestQueue {
         }
     }
 
-    /// Append a path at the end of the queue.
-    pub fn push(&self, path: PathBuf) {
-        self.inner.lock().unwrap().paths.push_back(path);
+    /// Append a request at the end of the queue.
+    pub fn push(&self, uri: RequestUri) {
+        self.inner.lock().unwrap().requests.push_back(uri);
     }
 
-    /// Number of queued (not yet playing) paths.
+    /// Number of queued (not yet playing) requests.
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().paths.len()
+        self.inner.lock().unwrap().requests.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Copy of the queued paths, oldest first.
-    pub fn list(&self) -> Vec<PathBuf> {
-        self.inner.lock().unwrap().paths.iter().cloned().collect()
+    /// Copy of the queued requests, oldest first.
+    pub fn list(&self) -> Vec<RequestUri> {
+        self.inner.lock().unwrap().requests.iter().cloned().collect()
     }
 
-    /// Drop every queued path (the playing track is unaffected).
+    /// Drop every queued request (a playing track is unaffected).
     pub fn clear(&self) {
-        self.inner.lock().unwrap().paths.clear();
+        self.inner.lock().unwrap().requests.clear();
     }
 
     /// Tell the source to skip the queued track it is playing.
@@ -64,12 +64,12 @@ impl RequestQueue {
         self.inner.lock().unwrap().skip = true;
     }
 
-    /// Pop the next path, dropping any pending skip (a skip only applies to
-    /// a track already playing).
-    fn pop(&self) -> Option<PathBuf> {
+    /// Pop the next request, dropping any pending skip (a skip only applies
+    /// to a track already playing).
+    fn pop(&self) -> Option<RequestUri> {
         let mut st = self.inner.lock().unwrap();
         st.skip = false;
-        st.paths.pop_front()
+        st.requests.pop_front()
     }
 
     /// True if a skip was requested; always consumes the request.
@@ -85,34 +85,38 @@ impl Default for RequestQueue {
     }
 }
 
-/// Plays queued files FIFO. Exhausts whenever the queue is empty; a control
-/// `queue.skip` drops the track currently playing (if any) and advances.
+/// Plays queued requests FIFO. Exhausts whenever the queue is empty; a
+/// control `queue.skip` drops the track currently playing (if any) and
+/// advances.
 pub struct RequestQueueSource {
     queue: Arc<RequestQueue>,
+    request: RequestConfig,
     target: SignalSpec,
     frames_per_buffer: usize,
-    current: Option<FileSource>,
-    current_path: Option<PathBuf>,
+    current: Option<Box<dyn AudioSource>>,
+    current_uri: Option<RequestUri>,
 }
 
 impl RequestQueueSource {
     pub fn new(
         queue: Arc<RequestQueue>,
+        request: RequestConfig,
         target: SignalSpec,
         frames_per_buffer: usize,
     ) -> Self {
         Self {
             queue,
+            request,
             target,
             frames_per_buffer,
             current: None,
-            current_path: None,
+            current_uri: None,
         }
     }
 
-    /// The path currently playing (metadata label), if any.
-    pub fn current_path(&self) -> Option<&Path> {
-        self.current_path.as_deref()
+    /// The URI currently playing (metadata label), if any.
+    pub fn current_uri(&self) -> Option<&RequestUri> {
+        self.current_uri.as_ref()
     }
 }
 
@@ -121,7 +125,10 @@ impl AudioSource for RequestQueueSource {
         loop {
             if let Some(src) = self.current.as_mut() {
                 if self.queue.take_skip() {
-                    log::info!("request queue: skipping {}", self.current_path.as_deref().unwrap().display());
+                    log::info!(
+                        "request queue: skipping {}",
+                        self.current_uri.as_ref().map(|u| u.display()).unwrap_or_default()
+                    );
                     self.current = None;
                     continue;
                 }
@@ -130,22 +137,29 @@ impl AudioSource for RequestQueueSource {
                     return n;
                 }
                 if src.is_exhausted() {
-                    log::info!("request queue: finished {}", self.current_path.as_deref().unwrap().display());
+                    log::info!(
+                        "request queue: finished {}",
+                        self.current_uri.as_ref().map(|u| u.display()).unwrap_or_default()
+                    );
                     self.current = None;
                     continue;
                 }
                 return 0;
             }
-            let Some(path) = self.queue.pop() else {
+            let Some(uri) = self.queue.pop() else {
                 return 0;
             };
-            match FileSource::open(&path, self.target, self.frames_per_buffer) {
+            match resolve(&uri, &self.request, self.target, self.frames_per_buffer) {
                 Ok(src) => {
                     self.current = Some(src);
-                    self.current_path = Some(path.clone());
-                    log::info!("request queue: playing {}", path.display());
+                    self.current_uri = Some(uri.clone());
+                    log::info!("request queue: playing {}", uri.display());
                 }
-                Err(e) => log::warn!("request queue: cannot play {}: {e}", path.display()),
+                Err(e) => {
+                    log::warn!("request queue: cannot play {}: {e}", uri.display());
+                    // Drop the bad request and move on to the next one.
+                    continue;
+                }
             }
         }
     }
@@ -155,9 +169,9 @@ impl AudioSource for RequestQueueSource {
     }
 
     fn label(&self) -> Option<String> {
-        self.current_path
+        self.current_uri
             .as_ref()
-            .map(|p| p.display().to_string())
+            .map(|uri| uri.display())
     }
 }
 
@@ -169,19 +183,22 @@ mod tests {
     #[test]
     fn queue_is_a_fifo() {
         let q = RequestQueue::new();
-        q.push("/a.mp3".into());
-        q.push("/b.mp3".into());
+        q.push(RequestUri::new("/a.mp3"));
+        q.push(RequestUri::new("/b.mp3"));
         assert_eq!(q.len(), 2);
-        assert_eq!(q.list(), vec![PathBuf::from("/a.mp3"), PathBuf::from("/b.mp3")]);
-        assert_eq!(q.pop(), Some(PathBuf::from("/a.mp3")));
-        assert_eq!(q.pop(), Some(PathBuf::from("/b.mp3")));
+        assert_eq!(
+            q.list(),
+            vec![RequestUri::new("/a.mp3"), RequestUri::new("/b.mp3")]
+        );
+        assert_eq!(q.pop(), Some(RequestUri::new("/a.mp3")));
+        assert_eq!(q.pop(), Some(RequestUri::new("/b.mp3")));
         assert_eq!(q.pop(), None);
     }
 
     #[test]
     fn clear_drops_pending_paths() {
         let q = RequestQueue::new();
-        q.push("/a.mp3".into());
+        q.push(RequestUri::new("/a.mp3"));
         q.clear();
         assert!(q.is_empty());
         assert_eq!(q.pop(), None);
@@ -192,9 +209,9 @@ mod tests {
         let q = RequestQueue::new();
         // Requested while nothing is queued: must not skip a future push.
         q.request_skip();
-        q.push("/a.mp3".into());
+        q.push(RequestUri::new("/a.mp3"));
         // pop() discards the stale skip so /a.mp3 plays normally.
-        assert_eq!(q.pop(), Some(PathBuf::from("/a.mp3")));
+        assert_eq!(q.pop(), Some(RequestUri::new("/a.mp3")));
         assert!(!q.take_skip(), "stale skip leaked into the next track");
 
         // Requested while a track is playing: take_skip reports it once.
@@ -206,21 +223,25 @@ mod tests {
     #[test]
     fn plays_a_pushed_real_file() {
         // A short jingle (~12 s) so the test can drain the track fully.
-        let real = PathBuf::from("jingles/mrwashingt0n-simple-radio-jingle-501090.mp3");
-        if !real.exists() {
+        let real = RequestUri::new("jingles/mrwashingt0n-simple-radio-jingle-501090.mp3");
+        let RequestUri::Local(path) = &real else {
+            return;
+        };
+        if !path.exists() {
             return;
         }
         let q = Arc::new(RequestQueue::new());
         q.push(real.clone());
         let mut src = RequestQueueSource::new(
             q,
+            RequestConfig::default(),
             SignalSpec::new(44_100, symphonia::core::audio::Channels::FRONT_CENTRE),
             4096,
         );
         assert!(src.label().is_none(), "no label before a track starts");
         let mut buf = vec![0f32; 4096];
         assert!(src.next_buffer(&mut buf) > 0, "file must start playing");
-        assert_eq!(src.label(), Some(real.display().to_string()));
+        assert_eq!(src.label(), Some(real.display()));
         let start = Instant::now();
         let mut total = 0usize;
         while total < 44_100 * 60 {
@@ -237,6 +258,6 @@ mod tests {
         );
         // The last label persists, like every other source (metadata hooks
         // fire on *changes*).
-        assert_eq!(src.label(), Some(real.display().to_string()));
+        assert_eq!(src.label(), Some(real.display()));
     }
 }

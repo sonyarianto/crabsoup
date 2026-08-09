@@ -1,21 +1,22 @@
-use std::path::PathBuf;
 
 use log::{info, warn};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use symphonia::core::audio::SignalSpec;
 
-use crate::source::file::FileSource;
+use crate::request::{resolve, RequestConfig, RequestUri};
 use crate::source::{AudioSource, SilenceSource, SourceProvider};
 
-/// A scheduled queue of media files. Exposes each file as its own source via
-/// [`SourceProvider`], so the mixer can preload the *next* track for a
-/// crossfade while the current one still plays.
+/// A scheduled queue of media requests (local files or `http://` URLs).
+/// Exposes each item as its own source via [`SourceProvider`], so the mixer
+/// can preload the *next* track for a crossfade while the current one still
+/// plays (a URL download happens inside that preload, on the puller thread).
 #[derive(Clone)]
 pub struct Playlist {
-    queue: Vec<PathBuf>,
+    queue: Vec<RequestUri>,
     next_index: usize,
     loop_playlist: bool,
+    request: RequestConfig,
     target: SignalSpec,
     frames_per_buffer: usize,
     rng: Option<SmallRng>,
@@ -24,9 +25,10 @@ pub struct Playlist {
 impl Playlist {
     /// `seed` makes shuffle deterministic (used by tests).
     pub fn new(
-        mut files: Vec<PathBuf>,
+        mut files: Vec<RequestUri>,
         shuffle: bool,
         loop_playlist: bool,
+        request: RequestConfig,
         target: SignalSpec,
         frames_per_buffer: usize,
         seed: Option<u64>,
@@ -43,6 +45,7 @@ impl Playlist {
             queue: files,
             next_index: 0,
             loop_playlist,
+            request,
             target,
             frames_per_buffer,
             rng: seed.map(SmallRng::seed_from_u64),
@@ -63,11 +66,11 @@ impl Playlist {
         self.next_index
     }
 
-    fn take_path(&mut self) -> Option<PathBuf> {
+    fn take_uri(&mut self) -> Option<RequestUri> {
         if self.queue.is_empty() {
             return None;
         }
-        let path = self.queue[self.next_index % self.queue.len()].clone();
+        let uri = self.queue[self.next_index % self.queue.len()].clone();
         self.next_index += 1;
         if self.next_index >= self.queue.len() && self.loop_playlist {
             self.next_index = 0;
@@ -79,29 +82,25 @@ impl Playlist {
                 }
             }
         }
-        Some(path)
+        Some(uri)
     }
 }
 
 impl SourceProvider for Playlist {
     fn next_source(&mut self) -> (Box<dyn AudioSource>, String) {
-        let Some(path) = self.take_path() else {
+        let Some(uri) = self.take_uri() else {
             let src: Box<dyn AudioSource> = Box::new(SilenceSource::new());
             return (src, "empty playlist".into());
         };
 
-        let label = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "unknown".into());
-
-        match FileSource::open(&path, self.target, self.frames_per_buffer) {
+        let label = uri.display();
+        match resolve(&uri, &self.request, self.target, self.frames_per_buffer) {
             Ok(source) => {
-                info!("loading track: {} ({})", path.display(), label);
-                (Box::new(source), label)
+                info!("loading track: {} ({})", uri.display(), label);
+                (source, label)
             }
             Err(e) => {
-                warn!("failed to open {}: {e}", path.display());
+                warn!("failed to load {}: {e}", uri.display());
                 (Box::new(SilenceSource::new()), label)
             }
         }
@@ -121,13 +120,13 @@ mod tests {
         SignalSpec::new(44100, Channels::FRONT_LEFT | Channels::FRONT_RIGHT)
     }
 
-    fn paths(names: &[&str]) -> Vec<PathBuf> {
-        names.iter().map(PathBuf::from).collect()
+    fn paths(names: &[&str]) -> Vec<RequestUri> {
+        names.iter().map(|n| RequestUri::new(n)).collect()
     }
 
     #[test]
     fn provides_every_track_then_stops() {
-        let mut pl = Playlist::new(paths(&["a.wav", "b.wav", "c.wav"]), false, false, spec(), 4096, None);
+        let mut pl = Playlist::new(paths(&["a.wav", "b.wav", "c.wav"]), false, false, RequestConfig::default(), spec(), 4096, None);
         let mut seen = Vec::new();
         while pl.has_next() {
             let (_, label) = pl.next_source();
@@ -139,7 +138,7 @@ mod tests {
 
     #[test]
     fn loops_forever_without_loop_flag_disabled_but_respects_loop() {
-        let mut pl = Playlist::new(paths(&["a.wav"]), false, true, spec(), 4096, None);
+        let mut pl = Playlist::new(paths(&["a.wav"]), false, true, RequestConfig::default(), spec(), 4096, None);
         let mut seen = Vec::new();
         for _ in 0..3 {
             let (_, label) = pl.next_source();
@@ -150,8 +149,8 @@ mod tests {
 
     #[test]
     fn shuffle_is_deterministic_with_seed() {
-        let a = Playlist::new(paths(&["a", "b", "c", "d", "e"]), true, false, spec(), 4096, Some(42));
-        let b = Playlist::new(paths(&["a", "b", "c", "d", "e"]), true, false, spec(), 4096, Some(42));
+        let a = Playlist::new(paths(&["a", "b", "c", "d", "e"]), true, false, RequestConfig::default(), spec(), 4096, Some(42));
+        let b = Playlist::new(paths(&["a", "b", "c", "d", "e"]), true, false, RequestConfig::default(), spec(), 4096, Some(42));
         let order = |pl: &mut Playlist| {
             let mut v = Vec::new();
             while pl.has_next() {

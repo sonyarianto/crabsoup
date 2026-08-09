@@ -145,7 +145,7 @@ buffer; audio-rate callbacks need their own budget/backpressure story.
       track boundary without full metadata.
 
 #### Phase 7 — request protocols (`http://` resolution, biggest lift)
-- [ ] `request` abstraction resolving URIs through pluggable protocols.
+- [x] `request` abstraction resolving URIs through pluggable protocols.
       Scope down to download-then-play first (retry/timeout, temp-file
       lifecycle) before attempting a streaming-decode path.
 
@@ -272,6 +272,36 @@ practice).
       `BurstySource` fake proving a resume-after-pause fires with an
       unchanged label. Verified live: three 1.5 s sine tracks in sequence
       logged `on_track #1/2/3` from the Lua callback on-air.
+- [x] Phase 7 (request protocols): `src/request.rs` — `RequestUri`
+      (`Local(PathBuf)` | `Url(String)`, `new`/`raw`/`display` where
+      `display` is the last path segment) and `RequestConfig`
+      (`request_timeout` secs, default 30; `request_retries`, default 2)
+      configurable via `set()`. `RequestQueue` and `Playlist` now hold
+      `Vec<RequestUri>` and resolve at pop/next-track time through
+      `resolve()`: `Local` opens a `FileSource` directly; `Url` is
+      downloaded to a per-URL temp file under
+      `$TMPDIR/crabsoup-requests/{fnv1a}-{n}.part` (stable name + per-process
+      counter, `.part` name kept for the played file) and wrapped in a
+      `DownloadSource` that removes the temp file on drop — the playlist
+      loop re-requests re-downloads. The HTTP client is hand-rolled on
+      `std::net` (no new crates): `http://` only (https rejected with a
+      clear error), redirects up to 4 (Location joined absolute/root/relative
+      against the request URL), `Content-Length` and `Transfer-Encoding:
+      chunked` bodies, connection-close, per-attempt connect+read timeout;
+      failed attempts retry with a 500 ms backoff and the partial file is
+      removed on final failure. `single(url)`, `playlist({directory=...,
+      files = {...}})` entries, and telnet `queue.push <url>` all accept
+      `http://` now (on-air label = URL display name). Inline tests
+      (120 -> 128): request-uri classification, content-length and chunked
+      bodies against tiny `TcpListener` servers (request-draining so
+      responses close cleanly without RST), relative `Location` redirect,
+      404 surfacing, https rejection, retry-then-fail cleanup, temp-path
+      stability/uniqueness, and queue/playlist resolution plumbing in
+      `script.rs`. Verified live: single played a 5.2 MB mp3 served by
+      `python3 -m http.server` (temp file appeared and was removed), on-air
+      label was the URL track name, telnet `queue.push` of a second HTTP
+      URL preempted and played, `queue.skip` dropped it and its temp file
+      vanished.
 - [x] C1 (`output.file`): `src/output/file.rs` — `FileOutput`, a tap
       consumer mirroring `IcecastOutput` minus the network: no pacing, no
       reconnect; the encoder and file are created in `connect()` so a bad
