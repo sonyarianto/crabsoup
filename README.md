@@ -145,7 +145,10 @@ printf 'shutdown\n' | nc localhost 1234
 ```
 
 Commands: `jingles.list`, `jingles.play [n|substr]`, `skip`, `status`,
-`uptime`, `shutdown`, `exit`, `help`.
+`uptime`, `shutdown`, `exit`, `help`, plus any commands registered in the
+script with `server.register("name", function(args) return reply end)` —
+the handler receives the rest of the line as one string and its return
+value is sent back; a Lua error becomes an `ERROR: ...` reply.
 
 ## Liquidsoap parity map
 
@@ -174,6 +177,7 @@ phase).
 | `switch` (dayparting), `rotate` | `switch({ {when = {days, from, to}, src = ...}, {src = default} })`, `rotate({...}, {weights = ...})` | done |
 | `on_metadata` / `on_track` | `on_metadata(fn, src)` (title table), `on_track(fn, src)` (boundary, no args) | done |
 | `http://` request resolution | `single("http://...")`, `playlist(entries)`, `queue.push <url>` — download-then-play with retry/timeout, temp files auto-removed | done |
+| `server.register` custom telnet commands | `server.register("name", function(args) return reply end)` | done |
 
 ## Testing
 

@@ -12,11 +12,13 @@
 //! - `uptime`                  — seconds since startup
 //! - `shutdown`                — stop the app (like Ctrl-C)
 //! - `exit` / `quit`           — close the connection
+//! - `<name> [args...]`        — any command registered with `server.register`
 //! - `help`                    — list commands
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
+use std::time::Duration;
 
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -25,6 +27,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::config::ControlConfig;
 use crate::engine::mixer::{MixCommand, StatusHandle};
+use crate::script::ScriptEvent;
 use crate::source::request::RequestQueue;
 
 /// Telnet command server. Owns one `mpsc::Sender` into the priority mixer.
@@ -34,6 +37,8 @@ pub struct ControlServer {
     queue: Option<Arc<RequestQueue>>,
     tx: mpsc::Sender<MixCommand>,
     status: StatusHandle,
+    custom_commands: Arc<Vec<String>>,
+    event_tx: mpsc::Sender<ScriptEvent>,
 }
 
 impl ControlServer {
@@ -43,6 +48,8 @@ impl ControlServer {
         queue: Option<Arc<RequestQueue>>,
         tx: mpsc::Sender<MixCommand>,
         status: StatusHandle,
+        custom_commands: Arc<Vec<String>>,
+        event_tx: mpsc::Sender<ScriptEvent>,
     ) -> Self {
         Self {
             config,
@@ -50,6 +57,8 @@ impl ControlServer {
             queue,
             tx,
             status,
+            custom_commands,
+            event_tx,
         }
     }
 
@@ -64,8 +73,9 @@ impl ControlServer {
             }
         };
         log::info!(
-            "control port listening on {addr} ({} jingle(s))",
-            self.jingles.len()
+            "control port listening on {addr} ({} jingle(s), {} custom command(s))",
+            self.jingles.len(),
+            self.custom_commands.len()
         );
 
         loop {
@@ -80,8 +90,11 @@ impl ControlServer {
             let queue = self.queue.clone();
             let tx = self.tx.clone();
             let status = self.status.clone();
+            let custom = self.custom_commands.clone();
+            let event_tx = self.event_tx.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(socket, &jingles, queue, tx, &status).await {
+                if let Err(e) = handle_connection(socket, &jingles, queue, tx, &status, &custom, &event_tx).await
+                {
                     log::warn!("control port ({peer}): {e}");
                 }
             });
@@ -95,6 +108,8 @@ async fn handle_connection(
     queue: Option<Arc<RequestQueue>>,
     tx: mpsc::Sender<MixCommand>,
     status: &StatusHandle,
+    custom: &[String],
+    event_tx: &mpsc::Sender<ScriptEvent>,
 ) -> Result<(), String> {
     let (reader, mut writer) = socket.into_split();
     let mut reader = BufReader::new(reader);
@@ -116,7 +131,15 @@ async fn handle_connection(
         if cmd.is_empty() {
             continue;
         }
-        match dispatch(cmd, jingles, queue.as_deref(), &mut rng, &tx, status) {
+        let ctx = DispatchCtx {
+            jingles,
+            queue: queue.as_deref(),
+            tx: &tx,
+            status,
+            custom,
+            event_tx,
+        };
+        match dispatch(cmd, &ctx, &mut rng) {
             CommandResult::Reply(text) => reply(&mut writer, &text).await?,
             CommandResult::Exit => return Ok(()),
         }
@@ -128,14 +151,18 @@ enum CommandResult {
     Exit,
 }
 
-fn dispatch(
-    cmd: &str,
-    jingles: &[PathBuf],
-    queue: Option<&RequestQueue>,
-    rng: &mut SmallRng,
-    tx: &mpsc::Sender<MixCommand>,
-    status: &StatusHandle,
-) -> CommandResult {
+/// Everything `dispatch` needs besides the raw command line. Kept in one
+/// struct so call sites (connection task, tests) stay short.
+struct DispatchCtx<'a> {
+    jingles: &'a [PathBuf],
+    queue: Option<&'a RequestQueue>,
+    tx: &'a mpsc::Sender<MixCommand>,
+    status: &'a StatusHandle,
+    custom: &'a [String],
+    event_tx: &'a mpsc::Sender<ScriptEvent>,
+}
+
+fn dispatch(cmd: &str, ctx: &DispatchCtx, rng: &mut SmallRng) -> CommandResult {
     let mut parts = cmd.split_whitespace();
     let verb = parts.next().unwrap_or("");
     match verb {
@@ -143,11 +170,11 @@ fn dispatch(
         "exit" | "quit" => CommandResult::Exit,
         "skip" => {
             log::info!("control port: skip requested");
-            let _ = tx.send(MixCommand::Skip);
+            let _ = ctx.tx.send(MixCommand::Skip);
             CommandResult::Reply("skipping".into())
         }
         "queue.push" => match parts.next() {
-            Some(path) => match queue {
+            Some(path) => match ctx.queue {
                 Some(q) => {
                     q.push(crate::request::RequestUri::new(path));
                     CommandResult::Reply(format!("queued {path} ({})", q.len()))
@@ -156,7 +183,7 @@ fn dispatch(
             },
             None => CommandResult::Reply("usage: queue.push <path>".into()),
         },
-        "queue.list" => match queue {
+        "queue.list" => match ctx.queue {
             Some(q) => {
                 let lines: Vec<String> = q
                     .list()
@@ -172,14 +199,14 @@ fn dispatch(
             }
             None => CommandResult::Reply("ERROR: no request.queue source in script".into()),
         },
-        "queue.clear" => match queue {
+        "queue.clear" => match ctx.queue {
             Some(q) => {
                 q.clear();
                 CommandResult::Reply("queue cleared".into())
             }
             None => CommandResult::Reply("ERROR: no request.queue source in script".into()),
         },
-        "queue.skip" => match queue {
+        "queue.skip" => match ctx.queue {
             Some(q) => {
                 q.request_skip();
                 CommandResult::Reply("skipping queued track".into())
@@ -188,38 +215,60 @@ fn dispatch(
         },
         "status" => CommandResult::Reply(format!(
             "playing: {}\nuptime: {}s",
-            status.current(),
-            status.uptime_seconds()
+            ctx.status.current(),
+            ctx.status.uptime_seconds()
         )),
-        "uptime" => CommandResult::Reply(format!("uptime: {}s", status.uptime_seconds())),
+        "uptime" => CommandResult::Reply(format!(
+            "uptime: {}s",
+            ctx.status.uptime_seconds()
+        )),
         "shutdown" => {
             log::info!("control port: shutdown requested");
-            let _ = tx.send(MixCommand::Shutdown);
+            let _ = ctx.tx.send(MixCommand::Shutdown);
             CommandResult::Reply("shutting down".into())
         }
-        "jingles.list" => CommandResult::Reply(list_jingles(jingles)),
+        "jingles.list" => CommandResult::Reply(list_jingles(ctx.jingles)),
         "jingles.play" => {
             let path = match parts.next() {
-                Some(arg) => match pick_jingle(jingles, arg) {
-                    Ok(i) => jingles[i].clone(),
+                Some(arg) => match pick_jingle(ctx.jingles, arg) {
+                    Ok(i) => ctx.jingles[i].clone(),
                     Err(e) => return CommandResult::Reply(format!("ERROR: {e}")),
                 },
                 None => {
-                    if jingles.is_empty() {
+                    if ctx.jingles.is_empty() {
                         return CommandResult::Reply("ERROR: no jingles configured".into());
                     }
-                    let idx = rng.gen_range(0..jingles.len());
-                    jingles[idx].clone()
+                    let idx = rng.gen_range(0..ctx.jingles.len());
+                    ctx.jingles[idx].clone()
                 }
             };
-            play_jingle(&path, tx)
+            play_jingle(&path, ctx.tx)
         }
-        _ => CommandResult::Reply(format!("unknown command: {cmd} (help for commands)")),
+        _ => match ctx.custom.iter().position(|n| *n == verb) {
+            Some(index) => {
+                let args = parts.collect::<Vec<_>>().join(" ");
+                let (reply_tx, reply_rx) = mpsc::channel();
+                let event = ScriptEvent::Custom {
+                    index,
+                    args,
+                    reply: reply_tx,
+                };
+                if ctx.event_tx.send(event).is_err() {
+                    return CommandResult::Reply("ERROR: script event loop is not running".into());
+                }
+                match reply_rx.recv_timeout(Duration::from_secs(5)) {
+                    Ok(Ok(text)) => CommandResult::Reply(text),
+                    Ok(Err(e)) => CommandResult::Reply(format!("ERROR: {e}")),
+                    Err(_) => CommandResult::Reply("ERROR: custom command timed out".into()),
+                }
+            }
+            None => CommandResult::Reply(format!("unknown command: {cmd} (help for commands)")),
+        },
     }
 }
 
 fn help_text() -> &'static str {
-    "commands: jingles.list | jingles.play [n|substr] | queue.push <path> | queue.list | queue.clear | queue.skip | skip | status | uptime | shutdown | exit | help"
+    "commands: jingles.list | jingles.play [n|substr] | queue.push <path> | queue.list | queue.clear | queue.skip | skip | status | uptime | shutdown | <custom commands> | exit | help"
 }
 
 fn list_jingles(jingles: &[PathBuf]) -> String {
@@ -302,7 +351,15 @@ mod tests {
     fn skip_sends_the_mix_command() {
         let (tx, rx) = mpsc::channel();
         let status = StatusHandle::new();
-        let reply = dispatch("skip", &jingles(), None, &mut SmallRng::from_entropy(), &tx, &status);
+        let ctx = DispatchCtx {
+            jingles: &jingles(),
+            queue: None,
+            tx: &tx,
+            status: &status,
+            custom: &[],
+            event_tx: &mpsc::channel().0,
+        };
+        let reply = dispatch("skip", &ctx, &mut SmallRng::from_entropy());
         match reply {
             CommandResult::Reply(text) => assert_eq!(text, "skipping"),
             CommandResult::Exit => panic!("skip must reply"),
@@ -315,14 +372,23 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let status = StatusHandle::new();
         status.set_current("some track");
-        match dispatch("status", &jingles(), None, &mut SmallRng::from_entropy(), &tx, &status) {
+        let event_tx = mpsc::channel().0;
+        let ctx = DispatchCtx {
+            jingles: &jingles(),
+            queue: None,
+            tx: &tx,
+            status: &status,
+            custom: &[],
+            event_tx: &event_tx,
+        };
+        match dispatch("status", &ctx, &mut SmallRng::from_entropy()) {
             CommandResult::Reply(text) => {
                 assert!(text.contains("playing: some track"));
                 assert!(text.contains("uptime: "));
             }
             CommandResult::Exit => panic!("status must reply"),
         }
-        match dispatch("uptime", &jingles(), None, &mut SmallRng::from_entropy(), &tx, &status) {
+        match dispatch("uptime", &ctx, &mut SmallRng::from_entropy()) {
             CommandResult::Reply(text) => assert!(text.starts_with("uptime: ")),
             CommandResult::Exit => panic!("uptime must reply"),
         }
@@ -334,27 +400,36 @@ mod tests {
         let status = StatusHandle::new();
         let queue = Arc::new(RequestQueue::new());
         let mut rng = SmallRng::from_entropy();
+        let event_tx = mpsc::channel().0;
+        let ctx = DispatchCtx {
+            jingles: &jingles(),
+            queue: Some(&queue),
+            tx: &tx,
+            status: &status,
+            custom: &[],
+            event_tx: &event_tx,
+        };
 
-        match dispatch("queue.push /tmp/a.mp3", &jingles(), Some(&queue), &mut rng, &tx, &status) {
+        match dispatch("queue.push /tmp/a.mp3", &ctx, &mut rng) {
             CommandResult::Reply(text) => assert!(text.contains("queued /tmp/a.mp3 (1)"), "{text}"),
             CommandResult::Exit => panic!("queue.push must reply"),
         }
-        match dispatch("queue.push /tmp/b.mp3", &jingles(), Some(&queue), &mut rng, &tx, &status) {
+        match dispatch("queue.push /tmp/b.mp3", &ctx, &mut rng) {
             CommandResult::Reply(text) => assert!(text.contains("(2)"), "{text}"),
             CommandResult::Exit => panic!("queue.push must reply"),
         }
-        match dispatch("queue.list", &jingles(), Some(&queue), &mut rng, &tx, &status) {
+        match dispatch("queue.list", &ctx, &mut rng) {
             CommandResult::Reply(text) => {
                 assert!(text.contains("0: /tmp/a.mp3"));
                 assert!(text.contains("1: /tmp/b.mp3"));
             }
             CommandResult::Exit => panic!("queue.list must reply"),
         }
-        match dispatch("queue.skip", &jingles(), Some(&queue), &mut rng, &tx, &status) {
+        match dispatch("queue.skip", &ctx, &mut rng) {
             CommandResult::Reply(text) => assert!(text.contains("skipping queued track"), "{text}"),
             CommandResult::Exit => panic!("queue.skip must reply"),
         }
-        match dispatch("queue.clear", &jingles(), Some(&queue), &mut rng, &tx, &status) {
+        match dispatch("queue.clear", &ctx, &mut rng) {
             CommandResult::Reply(text) => assert!(text.contains("cleared"), "{text}"),
             CommandResult::Exit => panic!("queue.clear must reply"),
         }
@@ -366,13 +441,80 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let status = StatusHandle::new();
         let mut rng = SmallRng::from_entropy();
+        let event_tx = mpsc::channel().0;
+        let ctx = DispatchCtx {
+            jingles: &jingles(),
+            queue: None,
+            tx: &tx,
+            status: &status,
+            custom: &[],
+            event_tx: &event_tx,
+        };
         for cmd in ["queue.push /tmp/a.mp3", "queue.list", "queue.skip", "queue.clear"] {
-            match dispatch(cmd, &jingles(), None, &mut rng, &tx, &status) {
+            match dispatch(cmd, &ctx, &mut rng) {
                 CommandResult::Reply(text) => {
                     assert!(text.contains("no request.queue source"), "{cmd}: {text}")
                 }
                 CommandResult::Exit => panic!("{cmd} must reply"),
             }
+        }
+    }
+
+    #[test]
+    fn custom_command_routes_through_the_event_channel() {
+        let (tx, _rx) = mpsc::channel();
+        let status = StatusHandle::new();
+        let custom = vec!["ping".to_string(), "greet".to_string()];
+        let (event_tx, event_rx) = mpsc::channel();
+        let handler = std::thread::spawn(move || {
+            while let Ok(ScriptEvent::Custom { index, args, reply }) = event_rx.recv() {
+                let text = match (index, args.as_str()) {
+                    (0, "") => "pong".to_string(),
+                    (0, a) => format!("pong {a}"),
+                    (1, a) => format!("hello {a}"),
+                    _ => unreachable!(),
+                };
+                let _ = reply.send(Ok(text));
+            }
+        });
+        let mut rng = SmallRng::from_entropy();
+        let ctx = DispatchCtx {
+            jingles: &jingles(),
+            queue: None,
+            tx: &tx,
+            status: &status,
+            custom: &custom,
+            event_tx: &event_tx,
+        };
+
+        match dispatch("ping", &ctx, &mut rng) {
+            CommandResult::Reply(text) => assert_eq!(text, "pong"),
+            CommandResult::Exit => panic!("ping must reply"),
+        }
+        match dispatch("greet world", &ctx, &mut rng) {
+            CommandResult::Reply(text) => assert_eq!(text, "hello world"),
+            CommandResult::Exit => panic!("greet must reply"),
+        }
+        drop(event_tx);
+        let _ = handler.join();
+    }
+
+    #[test]
+    fn unregistered_commands_are_still_unknown() {
+        let (tx, _rx) = mpsc::channel();
+        let status = StatusHandle::new();
+        let event_tx = mpsc::channel().0;
+        let ctx = DispatchCtx {
+            jingles: &jingles(),
+            queue: None,
+            tx: &tx,
+            status: &status,
+            custom: &[],
+            event_tx: &event_tx,
+        };
+        match dispatch("ping", &ctx, &mut SmallRng::from_entropy()) {
+            CommandResult::Reply(text) => assert!(text.contains("unknown command"), "{text}"),
+            CommandResult::Exit => panic!("must reply"),
         }
     }
 }

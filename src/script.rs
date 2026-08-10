@@ -59,6 +59,10 @@ pub struct ScriptResult {
     /// Shared state of the `request.queue` source, handed to the telnet
     /// server for `queue.push`/`queue.list`/`queue.clear`/`queue.skip`.
     pub request_queue: Option<Arc<RequestQueue>>,
+    /// Names of `server.register` commands, in registration order (same
+    /// order as the runtime's `custom_commands`), for the control port's
+    /// routing table.
+    pub custom_commands: Vec<String>,
     /// The engine's root source, taken from `output.icecast`.
     pub root: Option<Box<dyn AudioSource>>,
     /// The root source from `output.preview` (used when no icecast output).
@@ -79,6 +83,9 @@ struct ScriptState {
     file_outputs: Vec<FileOutputConfig>,
     hls_outputs: Vec<HlsOutputConfig>,
     request_queue: Option<Arc<RequestQueue>>,
+    /// Named telnet commands registered by `server.register(name, fn)`;
+    /// the names mirror into `ScriptResult` for the control port.
+    custom_commands: Vec<(String, mlua::Function)>,
     /// The shared root source graph. First `output.icecast` call steals the
     /// box; later calls must pass the same `Arc` (checked via `ptr_eq`).
     root: Option<Box<dyn AudioSource>>,
@@ -101,6 +108,13 @@ pub enum ScriptEvent {
     /// A source wrapped by `on_track` started a new track (boundary
     /// detected, metadata not required).
     Track { hook_id: usize },
+    /// A telnet `server.register` command: run the Lua handler with `args`
+    /// and send the reply back to the control port (which blocks on it).
+    Custom {
+        index: usize,
+        args: String,
+        reply: mpsc::Sender<Result<String, String>>,
+    },
     /// Request the engine stop (future `server.register` use).
     Shutdown,
 }
@@ -111,14 +125,22 @@ pub enum ScriptEvent {
 pub struct ScriptRuntime {
     pub lua: Lua,
     event_rx: mpsc::Receiver<ScriptEvent>,
+    event_tx: mpsc::Sender<ScriptEvent>,
     metadata_hooks: Vec<mlua::Function>,
     track_hooks: Vec<mlua::Function>,
+    custom_commands: Vec<(String, mlua::Function)>,
 }
 
 impl ScriptRuntime {
     /// Read a Lua global (used by tests; later `server.register`).
     pub fn global<T: mlua::FromLua>(&self, name: &str) -> mlua::Result<T> {
         self.lua.globals().get(name)
+    }
+
+    /// Sender used by the control port to ask the event loop to run a
+    /// `server.register` handler (and by tests).
+    pub fn event_tx(&self) -> mpsc::Sender<ScriptEvent> {
+        self.event_tx.clone()
     }
 
     /// Drive the Lua-owning event loop until the engine signals completion.
@@ -173,6 +195,21 @@ impl ScriptRuntime {
                 };
                 if let Err(e) = cb.call::<()>(()) {
                     log::warn!("on_track callback error: {e}");
+                }
+            }
+            ScriptEvent::Custom { index, args, reply } => {
+                let Some((_, cb)) = self.custom_commands.get(index) else {
+                    let _ = reply.send(Err(format!("no such custom command ({index})")));
+                    return;
+                };
+                match cb.call::<String>(args) {
+                    Ok(text) => {
+                        let _ = reply.send(Ok(text));
+                    }
+                    Err(e) => {
+                        log::warn!("custom command callback error: {e}");
+                        let _ = reply.send(Err(e.to_string()));
+                    }
                 }
             }
             ScriptEvent::Shutdown => {
@@ -1225,8 +1262,22 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         telnet_state.borrow_mut().control = Some(cfg);
         Ok(())
     })?;
+    let reg_state = state.clone();
+    let register_fn = lua.create_function(
+        move |_, (name, callback): (String, mlua::Function)| {
+            let trimmed = name.trim();
+            if trimmed.is_empty() || trimmed.split_whitespace().count() > 1 {
+                return Err(mlua::Error::runtime(
+                    "server.register: name must be a single non-empty word",
+                ));
+            }
+            reg_state.borrow_mut().custom_commands.push((trimmed.to_string(), callback));
+            Ok(())
+        },
+    )?;
     let server = lua.create_table()?;
     server.set("telnet", telnet_fn)?;
+    server.set("register", register_fn)?;
     globals.set("server", server)?;
 
     // ---- outputs ----------------------------------------------------------
@@ -1381,6 +1432,7 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         file_outputs: std::mem::take(&mut s.file_outputs),
         hls_outputs: std::mem::take(&mut s.hls_outputs),
         request_queue: s.request_queue.take(),
+        custom_commands: s.custom_commands.iter().map(|(n, _)| n.clone()).collect(),
         root: s.root.take(),
         preview: s.preview.take(),
     };
@@ -1392,8 +1444,10 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
     let runtime = ScriptRuntime {
         lua,
         event_rx,
+        event_tx,
         metadata_hooks: std::mem::take(&mut s.metadata_hooks),
         track_hooks: std::mem::take(&mut s.track_hooks),
+        custom_commands: std::mem::take(&mut s.custom_commands),
     };
     Ok((runtime, result))
 }
@@ -1435,6 +1489,70 @@ mod tests {
             .err()
             .expect("script fails");
         assert!(err.to_string().contains("no output"));
+    }
+
+    #[test]
+    fn server_register_runs_the_lua_handler_and_replies() {
+        let (rt, res) = run(
+            r#"
+            server.register("ping", function(args) return "pong [" .. args .. "]" end)
+            output.preview(sine({freq = 440, duration = 1}))
+            "#,
+        )
+        .expect("script runs");
+        assert_eq!(res.custom_commands, vec!["ping"]);
+        let (reply_tx, reply_rx) = mpsc::channel();
+        rt.event_tx()
+            .send(ScriptEvent::Custom {
+                index: 0,
+                args: "x y".into(),
+                reply: reply_tx,
+            })
+            .expect("event send");
+        rt.drain_metadata();
+        assert_eq!(reply_rx.recv().expect("reply").expect("ok"), "pong [x y]");
+    }
+
+    #[test]
+    fn server_register_reports_callback_errors() {
+        let (rt, _res) = run(
+            r#"
+            server.register("boom", function() error("kaput") end)
+            output.preview(sine({freq = 440, duration = 1}))
+            "#,
+        )
+        .expect("script runs");
+        let (reply_tx, reply_rx) = mpsc::channel();
+        rt.event_tx()
+            .send(ScriptEvent::Custom {
+                index: 0,
+                args: "".into(),
+                reply: reply_tx,
+            })
+            .expect("event send");
+        rt.drain_metadata();
+        let err = reply_rx.recv().expect("reply").expect_err("must error");
+        assert!(err.contains("kaput"), "{err}");
+    }
+
+    #[test]
+    fn server_register_rejects_bad_names() {
+        for (name, detail) in [
+            ("pong ping", "single non-empty word"),
+            ("", "non-empty"),
+            ("  ", "non-empty"),
+        ] {
+            let script = format!(
+                "server.register(\"{name}\", function() return \"x\" end)\n\
+                 output.preview(sine({{freq = 440, duration = 1}}))"
+            );
+            let err = run(&script).err().expect("script fails");
+            assert!(
+                err.to_string().contains(detail),
+                "{name:?}: {}",
+                err.to_string()
+            );
+        }
     }
 
     #[test]
@@ -2165,7 +2283,15 @@ mod tests {
         let mut root = res.preview.expect("preview source");
         let mut buf = vec![0f32; 4096 * 2];
         root.next_buffer(&mut buf);
-        assert_eq!(root.label().as_deref(), Some("sine 880 Hz"));
+        // Whichever branch the wall clock picks (the window is weekday/time
+        // dependent), switch must have composed and picked one of its
+        // children — deterministic branch choice is covered by the
+        // ScheduleSource tests with an injected clock.
+        let label = root.label().expect("label");
+        assert!(
+            label == "sine 440 Hz" || label == "sine 880 Hz",
+            "unexpected branch: {label}"
+        );
     }
 
     #[test]

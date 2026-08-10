@@ -83,12 +83,16 @@ fn main() -> crabsoup::Result<()> {
     if let Some(ctl_cfg) = &result.control {
         let jingles = result.jingles.clone();
         let queue = result.request_queue.clone();
+        let custom = Arc::new(result.custom_commands.clone());
+        let event_tx = runtime.event_tx();
         let server = crabsoup::control::ControlServer::new(
             ctl_cfg.clone(),
             jingles,
             queue,
             tx.clone(),
             status.clone(),
+            custom,
+            event_tx,
         );
         rt.spawn(async move { server.run().await });
     }
@@ -224,6 +228,9 @@ fn print_result(result: &ScriptResult, preview: bool) {
     }
     if let Some(ctl) = &result.control {
         lines.push(format!("telnet: {}:{}", ctl.host, ctl.port));
+    }
+    for name in &result.custom_commands {
+        lines.push(format!("custom command: {name}"));
     }
     if preview {
         lines.push("output: preview only (forced by --preview)".to_string());

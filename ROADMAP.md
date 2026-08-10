@@ -123,7 +123,7 @@ buffer; audio-rate callbacks need their own budget/backpressure story.
       when non-empty, exhausts when empty (composes in `fallback` before the
       playlist, like `request.queue`); `queue.list`, `queue.clear`; `skip`
       wired to the current track (playlist skip).
-- [ ] `server.register` (Lua API for custom telnet commands) — natural once
+- [x] `server.register` (Lua API for custom telnet commands) — natural once
       A2's event-loop pattern exists; until then, custom commands that do not
       call back into Lua only.
 
@@ -302,6 +302,30 @@ practice).
       label was the URL track name, telnet `queue.push` of a second HTTP
       URL preempted and played, `queue.skip` dropped it and its temp file
       vanished.
+- [x] `server.register` (custom telnet commands): `server.register(name,
+      fn)` registers a named command in `script.rs`; `ScriptResult` mirrors
+      the names (registration order = index into the runtime's callback vec)
+      to the control port, and `ScriptRuntime.event_tx()` hands the port a
+      `ScriptEvent` sender. The port routes any unrecognized first word that
+      matches a registered name to the Lua-owning event loop
+      (`ScriptEvent::Custom { index, args, reply }`, a fresh
+      `mpsc::Sender<Result<String, String>>` per call) and blocks up to 5 s
+      for the reply — the handler receives the rest of the line as one
+      string and returns the reply; a Lua `error()` becomes an `ERROR: ...`
+      reply with the traceback; a dead event loop replies "script event loop
+      is not running". `dispatch` was refactored into a `DispatchCtx` struct
+      (clippy arg-count). Inline tests (128 -> 133): Lua handler round-trip
+      with args through the real event loop, callback-error reporting, bad
+      names rejected (`server.register` name must be a single non-empty
+      word), control-port routing over the event channel, and
+      unregistered-name rejection. Also fixed a wall-clock flake:
+      `switch_registers_in_lua_with_a_default_child` asserted the default
+      branch, which only holds outside the weekday 09:00-17:00 window — it
+      now asserts *a* child label. Verified live: `ping hello world` ->
+      `pong [hello world]`, `stats 42` -> `stats: 42 track(s)`, `stats -1`
+      -> `ERROR: runtime error ... negative count` with traceback, `bogus`
+      still `unknown command`, `ping` -> `pong []`; `shutdown` stopped the
+      process cleanly.
 - [x] C1 (`output.file`): `src/output/file.rs` — `FileOutput`, a tap
       consumer mirroring `IcecastOutput` minus the network: no pacing, no
       reconnect; the encoder and file are created in `connect()` so a bad

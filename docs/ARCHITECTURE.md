@@ -55,6 +55,15 @@ One engine thread plus one thread per output:
   *any* track boundary: label change (even to `None`) or a resume after a
   non-exhausted silence — both hook registries are separate vectors, so a
   `Track` event never reaches an `on_metadata` callback.
+- `server.register(name, fn)` extends the same event-loop pattern to telnet:
+  `ScriptResult.custom_commands` mirrors the registered names (registration
+  order = index into the runtime's callback vec) into the control port's
+  routing table; `ScriptRuntime.event_tx()` gives the port a
+  `ScriptEvent` sender. A custom command becomes `ScriptEvent::Custom {
+  index, args, reply }` (fresh `mpsc::Sender<Result<String, String>>` per
+  call); the event loop runs the handler with the rest of the line as one
+  string and replies. The port blocks up to 5 s on the reply — callback
+  errors and a dead event loop both surface as `ERROR: ...` replies.
 - `switch`/`rotate` share one `ScheduleSource`: the active child plays the
   whole track, and a new child is re-picked only at a track boundary
   (child `label` change or exhaustion). `switch` slots are `when` predicates
