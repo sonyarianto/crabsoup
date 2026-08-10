@@ -173,6 +173,10 @@ impl AudioSource for RequestQueueSource {
             .as_ref()
             .map(|uri| uri.display())
     }
+
+    fn replaygain_db(&self) -> Option<f32> {
+        self.current.as_ref().and_then(|c| c.replaygain_db())
+    }
 }
 
 #[cfg(test)]

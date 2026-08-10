@@ -130,6 +130,10 @@ impl crate::source::AudioSource for DownloadSource {
         Some(self.name.clone())
     }
 
+    fn replaygain_db(&self) -> Option<f32> {
+        self.inner.replaygain_db()
+    }
+
     fn skip(&mut self) {
         self.inner.skip();
     }

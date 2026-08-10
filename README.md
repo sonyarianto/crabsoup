@@ -112,11 +112,15 @@ output.icecast({host = "localhost", port = 8000,
 Named options are passed as Lua tables; most have defaults. `format` is
 `"mp3"` or `"opus"`. Composable sources: `playlist`, `single`, `jingles`,
 `fallback`/`sequence`, `random` (non-repeating shuffle), `switch`
-(dayparting), `rotate` (weighted round-robin), `blank`/`sine`
-(test tones, both accept an optional `duration`), and the DSP operators
-`amplify(source, gain)`, `compress(source, opts)`, `normalize(source, opts)`
-(run inline in the pull chain). `output.preview(...)` runs without
-broadcasting.
+ (dayparting), `rotate` (weighted round-robin), `blank`/`sine`
+ (test tones, both accept an optional `duration`), and the DSP operators
+ `amplify(source, gain)`, `compress(source, opts)`, `normalize(source, opts)`
+ (run inline in the pull chain). `replaygain(source, opts)` applies a
+ per-track constant gain from the file's `REPLAYGAIN_TRACK_GAIN` tag
+ (`REPLAYGAIN_ALBUM_GAIN` as fallback; MP3 ID3v2 and Ogg Vorbis comments),
+ clamped to ±`max_boost`/`max_cut` dB (default 12 each, unity when
+ untagged) — compose `normalize(replaygain(src))` to feed AGC the loudness
+ baseline. `output.preview(...)` runs without broadcasting.
 
 Dayparting with `switch` — slots with a `when` predicate (weekday `days` as
 names or 0-6, `from`/`to` in `"HH:MM"`, overnight windows wrap; `from == to`
@@ -166,6 +170,7 @@ phase).
 | `sine(freq, duration)` | `sine({freq = 440, duration = 60, amplitude = 0.5})` | done |
 | `amplify(src, gain)` | `amplify(src, 0.5)` | done |
 | `compress(threshold, ratio, ...)`, `normalize(target, ...)` | `compress(src, {threshold = -12, ratio = 2})`, `normalize(src, {target = -13})` | done |
+| replaygain (liq `amplify` + RG tags) | `replaygain(src, {max_boost = 6, max_cut = 6})` | done |
 | `input.harbor(...)` | `input.harbor({...})` | done |
 | `output.icecast(...)` | `output.icecast({...}, src)` | done (single output; multi-mount in Phase 4) |
 | `output.file(...)` | `output.file({path, format}, src)` | planned (Phase 4) |

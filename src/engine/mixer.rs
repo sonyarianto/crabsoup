@@ -205,6 +205,10 @@ impl AudioSource for CrossfadeMixer {
         Some(self.active_label.clone())
     }
 
+    fn replaygain_db(&self) -> Option<f32> {
+        self.active.replaygain_db()
+    }
+
     /// Advance to the next track immediately, abandoning the current one.
     /// Used by the telnet `skip` command.
     fn skip(&mut self) {
@@ -463,6 +467,12 @@ impl AudioSource for PriorityMixer {
         } else {
             self.main.label()
         }
+    }
+
+    fn replaygain_db(&self) -> Option<f32> {
+        // The gain applies to the program material; a live DJ override uses
+        // its own loudness.
+        self.main.replaygain_db()
     }
 }
 

@@ -150,8 +150,9 @@ buffer; audio-rate callbacks need their own budget/backpressure story.
       lifecycle) before attempting a streaming-decode path.
 
 #### Phase 8 — loudness (replaygain / R128, stretch)
-- [ ] Feed ReplayGain/R128 tags into the Phase 2 `Agc`/`normalize` gain
-      baseline. Only once the envelope follower exists.
+- [x] Feed ReplayGain/R128 tags into the Phase 2 `Agc`/`normalize` gain
+      baseline. Only once the envelope follower exists. (Landed — see Done
+      section.)
 
 ### Part C — output-format & delivery track (parallel with Part B)
 
@@ -302,6 +303,30 @@ practice).
       label was the URL track name, telnet `queue.push` of a second HTTP
       URL preempted and played, `queue.skip` dropped it and its temp file
       vanished.
+- [x] Phase 8 (replaygain / R128 baseline): `AudioSource::replaygain_db()`
+      trait method (default `None`) added to `src/source.rs` and forwarded
+      by every wrapper (`CrossfadeMixer`/`PriorityMixer`, `EffectSource`,
+      `FallbackSource`/`SequenceSource`/`RandomSource`/`ScheduleSource`/
+      `OnMetadataSource`, `DownloadSource`, `RequestQueue`) like `label`.
+      `FileSource` parses `REPLAYGAIN_TRACK_GAIN` (fallback
+      `REPLAYGAIN_ALBUM_GAIN`) at open: symphonia 0.5 has no ID3v2 reader,
+      so MP3s go through a hand-rolled `id3_replaygain` (ID3v2.3
+      non-syncsafe + v2.4 syncsafe frame sizes, TXXX frames, encodings
+      0/1/2/3 with the UTF-16 `\0` byte dropped so ASCII keys survive,
+      Unicode minus U+2212 and `" dB"` suffix normalized) while the
+      symphonia path stays as the Ogg/Vorbis-comments fallback.
+      `src/source/replaygain.rs` — `ReplayGainSource`, a per-track constant
+      gain wrapper: re-reads the child's gain on label change, clamps to
+      ±`max_boost`/`max_cut` (default 12 dB each), unity when untagged;
+      `replaygain(src, {max_boost, max_cut})` registered in `script.rs`,
+      composing `normalize(replaygain(src))` gives AGC the RG baseline.
+      Inline tests (133 -> 140): tagged/album-fallback/no-suffix/untagged
+      parsing, gain applied + switched per track, clamp, unchanged within a
+      track, and Lua composition with an untagged track passing unity.
+      Verified live: a playlist of an untagged track + a track tagged
+      `REPLAYGAIN_TRACK_GAIN "-6.5 dB"` logged `replaygain: track gain -6.5
+      dB (applying -6.5 dB)` exactly at the tagged track's boundary and
+      stayed silent for the untagged one.
 - [x] `server.register` (custom telnet commands): `server.register(name,
       fn)` registers a named command in `script.rs`; `ScriptResult` mirrors
       the names (registration order = index into the runtime's callback vec)

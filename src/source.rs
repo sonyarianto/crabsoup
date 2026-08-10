@@ -1,5 +1,6 @@
 pub mod file;
 pub mod playlist;
+pub mod replaygain;
 pub mod request;
 
 use symphonia::core::audio::SignalSpec;
@@ -26,6 +27,14 @@ pub trait AudioSource: Send {
 
     /// Human-readable label (e.g. current track title) for Icecast metadata.
     fn label(&self) -> Option<String> {
+        None
+    }
+
+    /// Per-track ReplayGain baseline in dB (from `REPLAYGAIN_TRACK_GAIN` /
+    /// `REPLAYGAIN_ALBUM_GAIN` tags), if the source can determine one.
+    /// `None` = no tags (0 dB applied). Read once per track, at
+    /// construction.
+    fn replaygain_db(&self) -> Option<f32> {
         None
     }
 

@@ -27,6 +27,8 @@ pub struct FileSource {
     elapsed_seconds: f64,
     eof: bool,
     label: String,
+    /// ReplayGain track/album gain in dB from the file's tags, if present.
+    replaygain_db: Option<f32>,
 }
 
 impl FileSource {
@@ -59,6 +61,7 @@ impl FileSource {
             .map(|n| n as f64 / track.codec_params.sample_rate.unwrap_or(target.rate) as f64);
 
         let label = title_of(probed.format.as_mut(), path);
+        let replaygain_db = id3_replaygain(path).or_else(|| replaygain_of(probed.format.as_mut()));
         let converter = PcmConverter::new(target);
 
         Ok(Self {
@@ -73,6 +76,7 @@ impl FileSource {
             elapsed_seconds: 0.0,
             eof: false,
             label,
+            replaygain_db,
         })
     }
 
@@ -165,6 +169,135 @@ impl AudioSource for FileSource {
     fn label(&self) -> Option<String> {
         Some(self.label.clone())
     }
+
+    fn replaygain_db(&self) -> Option<f32> {
+        self.replaygain_db
+    }
+}
+
+/// Parse `REPLAYGAIN_TRACK_GAIN`, falling back to `REPLAYGAIN_ALBUM_GAIN`.
+/// Tag values look like `"-6.5 dB"`; tools also write the Unicode minus
+/// (U+2212). Returns `None` when absent or unparseable. symphonia's Ogg
+/// readers surface Vorbis comments here; MP3 files have no ID3 reader in
+/// symphonia 0.5, so those are handled by [`id3_replaygain`].
+fn replaygain_of(format: &mut dyn FormatReader) -> Option<f32> {
+    let metadata = format.metadata();
+    let revision = metadata.current()?;
+    let mut found: Option<f32> = None;
+    for tag in revision.tags() {
+        let key = tag.key.to_ascii_uppercase();
+        let db = match key.as_str() {
+            "REPLAYGAIN_TRACK_GAIN" => Some(parse_replaygain(tag.value.to_string())),
+            "REPLAYGAIN_ALBUM_GAIN" => {
+                if found.is_none() {
+                    Some(parse_replaygain(tag.value.to_string()))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(Some(v)) = db {
+            found = Some(v);
+        }
+    }
+    found
+}
+
+/// Read the file's own ID3v2 tag (any version) and look for a `TXXX`
+/// `REPLAYGAIN_TRACK_GAIN`/`REPLAYGAIN_ALBUM_GAIN` frame. symphonia 0.5
+/// has no ID3 reader for MP3, so this is the MP3 path.
+fn id3_replaygain(path: &Path) -> Option<f32> {
+    use std::io::Read;
+
+    let mut file = File::open(path).ok()?;
+    let mut header = [0u8; 10];
+    file.read_exact(&mut header).ok()?;
+    if &header[..3] != b"ID3" {
+        return None;
+    }
+    let version_major = header[3];
+    // ID3v2 sizes are syncsafe (7 bits per byte), including frame sizes in
+    // v2.4 but not in v2.3.
+    let size = ((header[6] as usize) << 21)
+        | ((header[7] as usize) << 14)
+        | ((header[8] as usize) << 7)
+        | (header[9] as usize);
+    if size == 0 || size > 64 * 1024 * 1024 {
+        return None;
+    }
+    let mut tag = vec![0u8; size];
+    file.read_exact(&mut tag).ok()?;
+    let syncsafe = version_major >= 4;
+
+    let mut found: Option<f32> = None;
+    let mut pos = 0usize;
+    while pos + 10 <= tag.len() {
+        let frame_id = &tag[pos..pos + 4];
+        let frame_size = if syncsafe {
+            ((tag[pos + 4] as usize) << 21)
+                | ((tag[pos + 5] as usize) << 14)
+                | ((tag[pos + 6] as usize) << 7)
+                | (tag[pos + 7] as usize)
+        } else {
+            u32::from_be_bytes([tag[pos + 4], tag[pos + 5], tag[pos + 6], tag[pos + 7]]) as usize
+        };
+        if frame_size == 0 {
+            break;
+        }
+        if pos + 10 + frame_size > tag.len() {
+            break;
+        }
+        let payload = &tag[pos + 10..pos + 10 + frame_size];
+        if frame_id == b"TXXX" {
+            let text = decode_id3_text(payload);
+            let (description, value) = text.split_once('\0').unwrap_or(("", &text[..]));
+            let db = match description.trim().to_ascii_uppercase().as_str() {
+                "REPLAYGAIN_TRACK_GAIN" => Some(parse_replaygain(value.trim().to_string())),
+                "REPLAYGAIN_ALBUM_GAIN" => {
+                    if found.is_none() {
+                        Some(parse_replaygain(value.trim().to_string()))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some(Some(v)) = db {
+                found = Some(v);
+            }
+        }
+        pos += 10 + frame_size;
+    }
+    found
+}
+
+/// Decode an ID3v2 text payload (first byte = encoding) into a string.
+/// UTF-16 descriptions of the ASCII keys we match are recovered by
+/// dropping the interleaved `\0` bytes.
+fn decode_id3_text(payload: &[u8]) -> String {
+    if payload.is_empty() {
+        return String::new();
+    }
+    let (encoding, bytes) = payload.split_at(1);
+    match encoding[0] {
+        1 | 2 => String::from_utf8_lossy(bytes).replace('\0', ""),
+        3 => String::from_utf8_lossy(bytes).into_owned(),
+        _ => {
+            // Latin-1 (0) — pass through as UTF-8 lossily.
+            String::from_utf8_lossy(bytes).into_owned()
+        }
+    }
+}
+
+fn parse_replaygain(value: String) -> Option<f32> {
+    let normalized = value.replace('\u{2212}', "-");
+    let digits: String = normalized
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit() && *c != '-')
+        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+        .collect();
+    digits.parse::<f32>().ok()
 }
 
 /// Best-effort "Artist - Title" from embedded tags, falling back to the filename.
@@ -249,4 +382,96 @@ mod tests {
         assert!(buf.iter().any(|&s| s.abs() > 0.1));
         assert_eq!(src.label().as_deref(), Some("sine"));
     }
+
+    /// Build a minimal ID3v2.3 tag containing one TXXX frame with the given
+    /// description/value, and prepend it to `base` (a copy of a real audio
+    /// file). Returns the path to the tagged copy.
+    fn write_id3_txxx(base: &Path, description: &str, value: &str) -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join("crabsoup-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!(
+            "rg-{}-{}.mp3",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let audio = std::fs::read(base).expect("base audio");
+
+        let mut body = Vec::new();
+        body.extend_from_slice(b"TXXX");
+        let payload = [0u8]
+            .iter()
+            .chain(description.as_bytes())
+            .chain([0u8].iter())
+            .chain(value.as_bytes())
+            .chain([0u8].iter())
+            .copied()
+            .collect::<Vec<_>>();
+        body.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        body.extend_from_slice(&[0u8, 0u8]);
+        body.extend_from_slice(&payload);
+
+        let mut tag = Vec::new();
+        tag.extend_from_slice(b"ID3");
+        tag.extend_from_slice(&[3, 0, 0]);
+        let size = body.len() as u32;
+        let syncsafe = [
+            ((size >> 21) & 0x7f) as u8,
+            ((size >> 14) & 0x7f) as u8,
+            ((size >> 7) & 0x7f) as u8,
+            (size & 0x7f) as u8,
+        ];
+        tag.extend_from_slice(&syncsafe);
+        tag.extend_from_slice(&body);
+
+        let mut out = std::fs::File::create(&path).unwrap();
+        out.write_all(&tag).unwrap();
+        out.write_all(&audio).unwrap();
+        path
+    }
+
+    #[test]
+    fn parses_replaygain_from_id3_txxx_tags() {
+        let real = Path::new("media/poshpony-shamanic-house-310684.mp3");
+        if !real.exists() {
+            return;
+        }
+        let tagged = write_id3_txxx(real, "REPLAYGAIN_TRACK_GAIN", "-6.5 dB");
+        let spec = symphonia::core::audio::SignalSpec::new(44100, symphonia::core::audio::Channels::FRONT_LEFT | symphonia::core::audio::Channels::FRONT_RIGHT);
+        let src = FileSource::open(&tagged, spec, 4096).unwrap();
+        assert_eq!(src.replaygain_db(), Some(-6.5));
+    }
+
+    #[test]
+    fn album_gain_is_the_fallback_and_untagged_files_report_none() {
+        let real = Path::new("media/poshpony-shamanic-house-310684.mp3");
+        if !real.exists() {
+            return;
+        }
+        let tagged =
+            write_id3_txxx(real, "REPLAYGAIN_ALBUM_GAIN", "\u{2212}4.25 dB");
+        let spec = symphonia::core::audio::SignalSpec::new(44100, symphonia::core::audio::Channels::FRONT_LEFT | symphonia::core::audio::Channels::FRONT_RIGHT);
+        let src = FileSource::open(&tagged, spec, 4096).unwrap();
+        // Tools write the Unicode minus; parse must normalize it.
+        assert_eq!(src.replaygain_db(), Some(-4.25));
+
+        let dir = std::env::temp_dir().join("crabsoup-test");
+        let path = dir.join("sine.wav");
+        write_sine_wav(&path, 0.1, 44100, 440.0);
+        let src = FileSource::open(&path, spec, 4096).unwrap();
+        assert_eq!(src.replaygain_db(), None);
+    }
+
+    #[test]
+    fn replaygain_tag_without_suffix_parses_too() {
+        let real = Path::new("media/poshpony-shamanic-house-310684.mp3");
+        if !real.exists() {
+            return;
+        }
+        let tagged = write_id3_txxx(real, "REPLAYGAIN_TRACK_GAIN", "3.0");
+        let spec = symphonia::core::audio::SignalSpec::new(44100, symphonia::core::audio::Channels::FRONT_LEFT | symphonia::core::audio::Channels::FRONT_RIGHT);
+        let src = FileSource::open(&tagged, spec, 4096).unwrap();
+        assert_eq!(src.replaygain_db(), Some(3.0));
+    }
 }
+

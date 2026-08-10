@@ -43,6 +43,7 @@ use crate::engine::effects::{Agc, Amplify, Compressor, EffectSource};
 use crate::engine::mixer::CrossfadeMixer;
 use crate::request::{resolve, RequestConfig, RequestUri};
 use crate::source::playlist::Playlist;
+use crate::source::replaygain::ReplayGainSource;
 use crate::source::request::{RequestQueue, RequestQueueSource};
 use crate::source::{AudioSource, BlankSource, SilenceSource, SineSource};
 
@@ -268,6 +269,10 @@ impl AudioSource for OnMetadataSource {
         self.child.label()
     }
 
+    fn replaygain_db(&self) -> Option<f32> {
+        self.child.replaygain_db()
+    }
+
     fn skip(&mut self) {
         self.child.skip();
     }
@@ -329,6 +334,10 @@ impl AudioSource for OnTrackSource {
 
     fn label(&self) -> Option<String> {
         self.child.label()
+    }
+
+    fn replaygain_db(&self) -> Option<f32> {
+        self.child.replaygain_db()
     }
 
     fn skip(&mut self) {
@@ -467,6 +476,15 @@ impl AudioSource for FallbackSource {
             .and_then(|c| c.0.lock().unwrap().label())
             .or_else(|| Some("(no source)".into()))
     }
+
+    fn replaygain_db(&self) -> Option<f32> {
+        if let Some(i) = self.active() {
+            return self.children[i].0.lock().unwrap().replaygain_db();
+        }
+        self.children
+            .get(self.current)
+            .and_then(|c| c.0.lock().unwrap().replaygain_db())
+    }
 }
 
 /// Picks a random remaining child each time one ends (Liquidsoap's `random`).
@@ -532,6 +550,12 @@ impl AudioSource for RandomSource {
         self.order
             .first()
             .and_then(|&i| self.children[i].0.lock().unwrap().label())
+    }
+
+    fn replaygain_db(&self) -> Option<f32> {
+        self.order
+            .first()
+            .and_then(|&i| self.children[i].0.lock().unwrap().replaygain_db())
     }
 }
 
@@ -793,6 +817,12 @@ impl AudioSource for ScheduleSource {
             .and_then(|c| c.0.lock().unwrap().label())
     }
 
+    fn replaygain_db(&self) -> Option<f32> {
+        self.children
+            .get(self.current)
+            .and_then(|c| c.0.lock().unwrap().replaygain_db())
+    }
+
     fn skip(&mut self) {
         // A skip is a track boundary too: the current track ends now, and
         // the schedule re-picks on the next pull.
@@ -1044,7 +1074,18 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         })?,
     )?;
 
-    // ---- effects (Liquidsoap `amplify`, `compress`, `normalize`) ---------
+    // ---- effects (Liquidsoap `amplify`, `compress`, `normalize`, `replaygain`) ---------
+    globals.set(
+        "replaygain",
+        lua.create_function(move |_, (mut source, opts): (LuaSource, Option<Table>)| {
+            let max_boost = opt_f64(&opts, "max_boost", 12.0)?;
+            let max_cut = opt_f64(&opts, "max_cut", 12.0)?;
+            let child = source.take();
+            let src = ReplayGainSource::new(child, max_boost as f32, max_cut as f32);
+            Ok(LuaSource::new(Box::new(src)))
+        })?,
+    )?;
+
     let amp_state = state.clone();
     globals.set(
         "amplify",
@@ -1685,6 +1726,23 @@ mod tests {
         let peak = buf.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
         // 0 dB peaks, -12 dB threshold, 2:1 -> the peak is cut by 6 dB.
         assert!((peak - 0.5).abs() < 0.01, "compressed peak {peak}");
+    }
+
+    #[test]
+    fn replaygain_composes_and_leaves_untagged_tracks_alone() {
+        let (_rt, res) = run(
+            r#"
+            output.preview(replaygain(sine({freq = 440, duration = 1, amplitude = 0.5}),
+                                       {max_boost = 6, max_cut = 6}))
+            "#,
+        )
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        let n = root.next_buffer(&mut buf);
+        // No ReplayGain tags on a sine: unity gain, samples pass untouched.
+        assert_eq!(root.label().as_deref(), Some("sine 440 Hz"));
+        assert!(buf[..n].iter().any(|&s| s.abs() > 0.3));
     }
 
     #[test]

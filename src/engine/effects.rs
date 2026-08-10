@@ -47,6 +47,10 @@ impl<E: Effect> AudioSource for EffectSource<E> {
         self.child.label()
     }
 
+    fn replaygain_db(&self) -> Option<f32> {
+        self.child.replaygain_db()
+    }
+
     fn skip(&mut self) {
         self.child.skip();
     }
@@ -71,7 +75,7 @@ impl Effect for Amplify {
     }
 }
 
-fn db_to_gain(db: f32) -> f32 {
+pub(crate) fn db_to_gain(db: f32) -> f32 {
     10f32.powf(db / 20.0)
 }
 

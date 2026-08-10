@@ -94,6 +94,26 @@ One engine thread plus one thread per output:
   error the caller decides on — the request queue drops the bad request and
   plays the next one; the playlist plays silence for that slot.
 
+## Loudness / ReplayGain (`src/source/replaygain.rs`)
+
+- `AudioSource::replaygain_db() -> Option<f32>` (default `None`) reports the
+  current track's ReplayGain in dB. Every wrapper forwards it to the active
+  child exactly like `label()`; only `FileSource` overrides it.
+- `FileSource` reads `REPLAYGAIN_TRACK_GAIN`, falling back to
+  `REPLAYGAIN_ALBUM_GAIN`, at open. symphonia 0.5 ships no ID3v2 reader
+  (MP3 metadata is empty), so MP3s go through the hand-rolled
+  `id3_replaygain` (ID3v2.3 non-syncsafe and v2.4 syncsafe frame sizes,
+  TXXX frames, encodings 0/1/2/3 — a UTF-16 key keeps a `\0` byte between
+  ASCII characters, so the first byte is dropped to recover the key;
+  U+2212 minus and a trailing `" dB"` are normalized away). The symphonia
+  path survives as the Ogg/Vorbis-comments fallback.
+- `ReplayGainSource` applies a constant per-track gain: it re-reads the
+  child's `replaygain_db()` whenever the label changes and clamps to
+  ±`max_boost`/`max_cut` (12 dB default). Untagged tracks get unity gain.
+  `normalize(replaygain(src))` feeds AGC the RG baseline; `replaygain`
+  logs `replaygain: track gain {raw:.1} dB (applying {gain:.1} dB)` on
+  change.
+
 ## Mixer control (`src/engine/mixer.rs`)
 
 - `MixCommand` is the mixer control channel (`SetLive`, `ClearLive`,
