@@ -188,6 +188,7 @@ phase).
 
 ```sh
 cargo test --lib
+cargo bench --bench engine   # hot-path baselines (mixers, resampler, effects, encoders)
 ```
 
 Tests are inline `#[cfg(test)]` modules per source file. A few tests use real

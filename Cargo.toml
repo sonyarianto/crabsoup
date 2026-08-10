@@ -29,5 +29,12 @@ ogg = "0.9"
 # no `send` feature: sources are Rc-based and stay on the main thread.
 mlua = { version = "0.10", default-features = false, features = ["lua54", "vendored"] }
 
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "engine"
+harness = false
+
 [profile.release]
 lto = true

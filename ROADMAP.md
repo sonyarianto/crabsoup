@@ -77,6 +77,34 @@ for what shipped.
 - SIMD is a later lever (sinc convolution, effect loops) — only after the
   benchmark harness shows it is the bottleneck.
 
+### Performance baseline (criterion 0.5, `cargo bench --bench engine`, release build)
+
+Machine: dev box (no CPU model recorded); ~5 % run-to-run variance between
+sessions, so compare *within one session* (criterion `--save-baseline` /
+`--load-baseline`) rather than against these absolute numbers. One 4096-frame
+stereo buffer = 92.9 ms of audio at 44.1 kHz. These are the "seems fine"
+anchors for later phases.
+
+| benchmark | per 92.9 ms buffer | vs real-time |
+|---|---|---|
+| mixers/crossfade/passthrough | 2 µs | 0.002 % |
+| mixers/crossfade/mixing (worst case: always crossfading) | 390 µs | 0.42 % |
+| mixers/priority/passthrough | 7 µs | 0.008 % |
+| mixers/priority/ducking (SetLive per buffer) | 9 µs | 0.01 % |
+| effects/compressor+agc+amplify | 604 µs | 0.65 % |
+| resampler/sinc16/44k_to_48k | 831 µs | 0.89 % |
+| resampler/sinc16/48k_to_44k1 | 795 µs | 0.86 % |
+| encode/mp3 (192 kbps) | 501 µs | 0.54 % |
+| encode/opus (128 kbps) | 1114 µs | 1.20 % |
+| encode/aac (128 kbps) | 269 µs | 0.29 % |
+
+Full path (crossfade + compressor/agc/amplify + resample + encode) ≈ 2.9 ms
+per 92.9 ms buffer ≈ 3 % of one core. The only hotspot worth attacking is
+`CrossfadeMixer`'s mixing loop: two `f64::powf` per sample make the mix path
+~200x the copy path — a power-curve lookup table or `f32` powf would cut it
+most. SIMD on the resampler/effects loops is not justified until these are
+the bottleneck (they are far from it: total chain ≈ 3 % of a core).
+
 ### Part A — architectural prerequisites (landed as one PR, see Done)
 
 A1 and A2 shipped together: the engine tap (single puller, fan-out) and the
@@ -213,6 +241,15 @@ approximates the operator surface, not the language); LADSPA plugin hosting
 practice).
 
 ## Done (cont.)
+- [x] Performance baseline harness: `benches/engine.rs` (criterion 0.5,
+      `harness = false`) covering the mixers (passthrough + worst-case
+      crossfade mixing + priority passthrough + ducking), the DSP chain
+      (compressor + agc + amplify), both resampler directions, and the three
+      encoders, on 4096-frame stereo buffers. Baselines recorded above under
+      "Performance baseline". First numbers: the full mix+effects+resample+
+      encode path runs ~3 % of one core per buffer — the crossfade mixing
+      loop's two `f64::powf` per sample is the only notable hotspot (mix
+      path ~200x the copy path).
 - [x] Phase 3 (request queue): `src/source/request.rs` — `RequestQueue`
       (FIFO of `Arc<str>` paths, `next()` pops under one lock, `skip()`
       jumps the current request instead of waiting, `Clear` command
