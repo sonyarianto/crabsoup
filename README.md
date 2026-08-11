@@ -6,10 +6,11 @@ input and one-shot jingles with crossfades, and broadcasts the result (MP3 or
 Opus) to an Icecast server.
 
 - `.lua` scripting: real Lua with Liquidsoap-style functions — `playlist`,
-  `single`, `blank`, `sine`, `amplify`, `compress`, `normalize`, `fallback`,
-  `sequence`, `random`, `switch`, `rotate`, `jingles`, `mksafe`, `add`,
-  `cue_cut`, `request.queue`, `request.dynamic`, `input.harbor`,
-  `output.icecast`, `output.preview`, `server.telnet`, `set`, `log`
+  `smart_crossfade`, `single`, `blank`, `sine`, `amplify`, `compress`,
+  `normalize`, `fallback`, `sequence`, `random`, `switch`, `rotate`,
+  `jingles`, `mksafe`, `add`, `cue_cut`, `request.queue`, `request.dynamic`,
+  `input.harbor`, `output.icecast`, `output.preview`, `server.telnet`,
+  `set`, `log`
 - Playlist scheduling: recursive directory scan, explicit file lists, loop and shuffle
 - Gapless crossfades with configurable overlap and fade curve
 - Live DJ harbor: an Icecast source-protocol listener (`PUT /live`); the
@@ -133,6 +134,13 @@ Named options are passed as Lua tables; most have defaults. `format` is
  baseline. `request.dynamic(function() return uri_or_nil end)` plays the
  requests its Lua callback returns, one ahead of the current track (nil
  ends the source) — a live-programming scheduler without a playlist file.
+ `smart_crossfade({directory = ...})` is a `playlist` whose transition
+ window is chosen by the outgoing track's measured tail level: a loud tail
+ gets a full `fade_out` crossfade, a quiet tail only a short `fade_mid`
+ fade (no point dragging a crossfade over silence; per-track
+ `annotate:`/`cue_cut` fade overrides still win). `fade_out` defaults to
+ `crossfade_seconds`, `fade_mid` to half of it, `threshold` (dBFS, default
+ -30) decides "quiet".
  `output.preview(...)` runs without broadcasting.
 
 Dayparting with `switch` — slots with a `when` predicate (weekday `days` as
@@ -201,6 +209,7 @@ phase).
 | `request.dynamic(fn)` | `request.dynamic(function() return "media/track.mp3" end)` — callback-driven requests, nil ends | done |
 | `annotate:` cue points + `cue_cut(src)` | `annotate:liq_cue_in="30",liq_cue_out="180":/path/track.mp3` on any request URI; `cue_cut(src, {cue_in, cue_out})` | done |
 | per-track crossfade (`liq_fade_in`/`liq_fade_out`) | `annotate:liq_fade_in="2",liq_fade_out="3":...` or `cue_cut(src, {fade_in, fade_out})` — overrides `crossfade_seconds` per track | done |
+| `smart_crossfade` (level-aware transitions) | `smart_crossfade({directory, fade_out, fade_mid, threshold})` — outgoing tail loudness picks the fade window | done |
 
 ## Testing
 

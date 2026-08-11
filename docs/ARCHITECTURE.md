@@ -31,12 +31,12 @@ One engine thread plus one thread per output:
 
 ## Script layer (`src/script.rs`)
 
-- Registers the Liquidsoap-flavoured Lua stdlib: `playlist`, `single`,
-  `blank`, `sine`, `amplify`, `compress`, `normalize`, `jingles`,
-  `fallback`/`sequence`/`random`, `switch`, `rotate`, `mksafe`, `add`,
-  `cue_cut`, `input.harbor`, `output.icecast`, `output.file`,
-  `output.preview`, `server.telnet`, `on_metadata`, `on_track`, `set`,
-  `log`.
+- Registers the Liquidsoap-flavoured Lua stdlib: `playlist`,
+  `smart_crossfade`, `single`, `blank`, `sine`, `amplify`, `compress`,
+  `normalize`, `jingles`, `fallback`/`sequence`/`random`, `switch`,
+  `rotate`, `mksafe`, `add`, `cue_cut`, `input.harbor`, `output.icecast`,
+  `output.file`, `output.preview`, `server.telnet`, `on_metadata`,
+  `on_track`, `set`, `log`.
 - `add({a, b}, {weights = {0.5, 1.0}})` sums N children sample-by-sample
   (`AddSource`): the first child writes straight into the output buffer,
   the rest pull into a reusable scratch that is added in (no per-call
@@ -151,12 +151,25 @@ One engine thread plus one thread per output:
 
 - `CrossfadeMixer` sizes each transition's overlap window at preload time:
   the incoming track's `fade_in` override, else the outgoing track's
-  `fade_out`, else  the global `crossfade_seconds` (frames re-derived per preload into a
-  `fade_frames` field). The preload margin uses the
+  `fade_out`, else the global `crossfade_seconds` (frames re-derived per
+  preload into a `fade_frames` field). The preload margin uses the
   outgoing track's `fade_out` too, so an annotated track starts its fade
   early enough; a `fade_in` longer than the margin degrades into the tail
   ramp, same as a track ending mid-fade. No override ⇒ global window,
   byte-identical to before.
+- `smart_crossfade(opts)` enables level-aware window selection via
+  `CrossfadeMixer::with_smart_fade(SmartFade { fade_out, fade_mid,
+  threshold_db })`. While no fade is in progress the mixer folds each
+  buffer into a rolling running sum of squares covering the active track's
+  last `fade_out` seconds (chunked `VecDeque`, trimmed per buffer — no
+  allocation), and at preload the RMS dBFS reading picks the window: a
+  loud tail (≥ `threshold_db`, default -30) gets the full `fade_out`, a
+  quiet one the short `fade_mid` (no point dragging a crossfade over
+  silence). Per-track `fade_in`/`fade_out` overrides still win over the
+  smart window, and the preload margin stays at `fade_out`, so a
+  quiet-tail fade simply completes early — the loud and quiet paths are
+  both exact integer-frame fades, covered by mixer tests that mirror the
+  override-case sample values.
 - `MixCommand` is the mixer control channel (`SetLive`, `ClearLive`,
   `PlayJingle(PathBuf)`, `Skip`, `Shutdown`) over `std::sync::mpsc`; the
   harbor and control port send into it. `Skip` calls `AudioSource::skip()`

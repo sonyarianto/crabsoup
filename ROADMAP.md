@@ -261,7 +261,8 @@ production use, not by build effort.
 - [x] **D4 — `request.dynamic`**: needs its own prefetch design; touches the
       same audio-thread/Lua-thread boundary as A2. (Landed — see Done
       section.)
-- [ ] **D5 — level-aware smart crossfade**: builds on D2; do last.
+- [x] **D5 — level-aware smart crossfade**: builds on D2; do last.
+      (Landed — see Done section.)
 
 ### Suggested execution order
 
@@ -274,10 +275,9 @@ production use, not by build effort.
 4. Track B, sequential: Phase 2 (DSP) — **done**; next Phase 3 → Phase 5 →
    Phase 6 (needs A2) → Phase 7 → Phase 8 (stretch).
 5. Track C once A1 lands: C1 → C2 → C3 (needs C2) → C4 (on request).
-6. Part D: D1 (`mksafe`) — **done**; D3 (`add()`) — **done**; D2
-   (`annotate:`/`cue_cut` + per-track fades) — **done**; D4
-   (`request.dynamic`) — **done**; next D5 (level-aware smart crossfade,
-   builds on D2).
+6. Part D — **complete**: D1 (`mksafe`), D3 (`add()`), D2
+   (`annotate:`/`cue_cut` + per-track fades), D4 (`request.dynamic`),
+   D5 (level-aware smart crossfade) — all **done** (see Done section).
 
 If effort is constrained to one track at a time, prioritize Track C through
 C1/C2 ahead of Track B phases 5–8 — output breadth (file recording, multiple
@@ -291,6 +291,29 @@ approximates the operator surface, not the language); LADSPA plugin hosting
 practice).
 
 ## Done (cont.)
+- [x] D5 (level-aware smart crossfade): `src/engine/mixer.rs` —
+      `SmartFade { fade_out, fade_mid, threshold_db }` and
+      `CrossfadeMixer::with_smart_fade` (builder; `None` = plain
+      crossfade). A rolling window keeps the running sum of squares of the
+      active track's last `fade_out` seconds (chunked `VecDeque` so the
+      window evicts per buffer, no reallocation); `tail_level_db` turns it
+      into an RMS dBFS reading, and at preload `smart_window()` picks the
+      full `fade_out` for a loud tail or the short `fade_mid` for a quiet
+      one (below `threshold_db`, default -30). The preload margin stays at
+      `fade_out` so a quiet-tail fade simply completes early (no audible
+      gap) while a loud tail gets the full overlap. Per-track `fade_in`/
+      `fade_out` overrides (D2) still win over the smart window. `src/
+      script.rs` — `playlist_requests` helper extracted (request collection
+      for `directory`/`files`, sorted/deduped) and shared by `playlist`
+      and the new `smart_crossfade(opts)` operator (`fade_out` defaults to
+      the global `crossfade_seconds`, `fade_mid` to half of it,
+      `threshold` in dBFS) which builds a level-aware crossfading playlist.
+      README + ARCHITECTURE updated. Inline tests (172 -> 175): a loud
+      (0 dBFS) tail gets the exact 40-frame `fade_out` ramp (same sample
+      values as the explicit override case), a quiet (-40 dBFS) tail
+      collapses to the 10-frame `fade_mid` window (complete a full buffer
+      earlier), and a script-level `smart_crossfade({directory = "./media"})`
+      plays a real directory with audio (skips when `media/` absent).
 - [x] D4 (`request.dynamic`): `src/script.rs` — `DynamicRequestSource`
       plays requests returned by a Lua callback, one ahead of the current
       track. The callback runs on the Lua-owning event loop through the A2
