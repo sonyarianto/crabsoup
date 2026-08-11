@@ -12,7 +12,7 @@ use symphonia::core::audio::{Channels, SignalSpec};
 
 use crabsoup::config::MixerConfig;
 use crabsoup::engine::effects::{Agc, Amplify, Compressor, EffectSource};
-use crabsoup::engine::mixer::{CrossfadeMixer, PriorityMixer};
+use crabsoup::engine::mixer::{CrossfadeMixer, PriorityMixer, SmartFade};
 use crabsoup::output::encoder::{AacEncoder, Encoder, Mp3Encoder, OpusEncoder};
 use crabsoup::resample::SincResampler;
 use crabsoup::source::{AudioSource, SineSource, SourceProvider};
@@ -151,6 +151,51 @@ fn mixers(c: &mut Criterion) {
     });
 }
 
+fn smart_crossfade(c: &mut Criterion) {
+    let cfg = MixerConfig::default();
+    let smart = SmartFade {
+        fade_out: 2.0,
+        fade_mid: 1.0,
+        threshold_db: -30.0,
+    };
+    let mut group = c.benchmark_group("smart_crossfade");
+    group.throughput(Throughput::Elements(BUF as u64));
+
+    group.bench_function("passthrough+measuring", |b| {
+        // Level-aware mode with no transition in sight: every buffer is
+        // passthrough plus the rolling tail-level accumulation (per-sample
+        // sum of squares + VecDeque window eviction) — the hot-path cost
+        // D5 adds on top of the plain crossfade passthrough row.
+        let mut mixer = CrossfadeMixer::new(Box::new(FakeProvider::new(2, None)), &cfg, RATE, CHANS)
+            .with_smart_fade(smart);
+        let mut buf = vec![0.0f32; BUF];
+        b.iter(|| {
+            mixer.next_buffer(&mut buf);
+            black_box(&buf);
+        });
+    });
+
+    group.bench_function("mixing (always crossfading)", |b| {
+        // ConstSource reports remaining = 1.0 s < the smart `fade_out`
+        // margin, so the mixer preloads and mixes every buffer; the tail
+        // measurement pauses during the fade (worst case, same as the
+        // plain crossfade/mixing row but through the smart branch).
+        let mut mixer = CrossfadeMixer::new(
+            Box::new(FakeProvider::new(2, Some(1.0))),
+            &cfg,
+            RATE,
+            CHANS,
+        )
+        .with_smart_fade(smart);
+        let mut buf = vec![0.0f32; BUF];
+        mixer.next_buffer(&mut buf);
+        b.iter(|| {
+            mixer.next_buffer(&mut buf);
+            black_box(&buf);
+        });
+    });
+}
+
 fn effects(c: &mut Criterion) {
     let mut group = c.benchmark_group("effects");
     group.throughput(Throughput::Elements(BUF as u64));
@@ -216,5 +261,5 @@ fn encode(c: &mut Criterion) {
     }
 }
 
-criterion::criterion_group!(benches, mixers, effects, resampler, encode);
+criterion::criterion_group!(benches, mixers, smart_crossfade, effects, resampler, encode);
 criterion::criterion_main!(benches);

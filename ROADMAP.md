@@ -98,6 +98,8 @@ anchors for later phases.
 |---|---|---|
 | mixers/crossfade/passthrough | 1.2 µs | 0.001 % |
 | mixers/crossfade/mixing (worst case: always crossfading) | 107 µs | 0.12 % |
+| smart_crossfade/passthrough+measuring | 9.3 µs | 0.01 % |
+| smart_crossfade/mixing (always crossfading) | 103 µs | 0.11 % |
 | mixers/priority/passthrough | 7 µs | 0.008 % |
 | mixers/priority/ducking (SetLive per buffer) | 9 µs | 0.01 % |
 | effects/compressor+agc+amplify | 604 µs | 0.65 % |
@@ -106,6 +108,14 @@ anchors for later phases.
 | encode/mp3 (192 kbps) | 501 µs | 0.54 % |
 | encode/opus (128 kbps) | 1114 µs | 1.20 % |
 | encode/aac (128 kbps) | 269 µs | 0.29 % |
+
+The D5 level-aware rows (recorded in the session that landed `smart_crossfade`,
+so compare against the plain rows *within* that session's variance):
+`passthrough+measuring` is 9.3 µs vs the plain passthrough's 1.2 µs — the
+rolling tail-level accumulation (sum of squares + VecDeque eviction) costs
+~8 µs per buffer, ~0.009 % of a core, and the always-mixing smart row (103 µs)
+is statistically identical to the plain mixing row (107 µs) because the
+measurement pauses while a fade is in progress.
 
 Full path (crossfade + compressor/agc/amplify + resample + encode) ≈ 2.6 ms
 per 92.9 ms buffer ≈ 2.8 % of one core. The one-time hotspot —
