@@ -329,6 +329,25 @@ practice).
       -> pull returns the newest window `[3,4,5,6]`), and the
       frames-then-silence-then-exhausted sequence. `ringbuf = "0.4"`
       moved to `[dependencies]`.
+- [x] Opus demux keeps every packet: `OggOpusDemux::pending` was a single
+      `Option<Vec<u8>>` overwritten on each completed packet, so real-world
+      Ogg files that pack many packets per page (ffmpeg: ~50 per page)
+      silently dropped all but the last packet of every page — an 8 s
+      ffmpeg Opus file decoded to ~0.17 s, and a fast `curl -T` Opus DJ
+      upload aired ~0.17 s before "end of stream". `pending` is now a
+      `VecDeque` FIFO (`push_back` on completion, `pop_front` on
+      `next_packet`; pending is drained before the EOS check, so packets
+      from the EOS page still come out). Caught live during the ring-swap
+      verification: the drain-wait held only 0 s because the ring was
+      already empty — the decode itself had produced 15,304 of ~706,000
+      samples. Inline test (176 -> 177): one page carrying three complete
+      packets must yield all three in order (fails on the old code — it
+      returned only the last). The drain-wait in `decode_live_stream`
+      (up to `DRAIN_WAIT_SECS` = 15 s, named const) delays `ClearLive`
+      until the consumer drains the ring, so a fast upload's buffered
+      tail plays out; verified live: 706,792 samples decoded, "LIVE DJ"
+      on status for the full 8 s tone, 660 Hz band -0.3 dB max in the
+      recording's DJ window vs -23 dB control.
 - [x] D5 (level-aware smart crossfade): `src/engine/mixer.rs` —
       `SmartFade { fade_out, fade_mid, threshold_db }` and
       `CrossfadeMixer::with_smart_fade` (builder; `None` = plain

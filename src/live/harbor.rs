@@ -23,6 +23,11 @@ use crate::source::{AudioSource, PcmConverter};
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_LIVE_FRAMES: usize = 5 * 44100 * 2; // ~5 s of stereo audio
+/// Upper bound on how long a fast upload's buffered tail may hold the
+/// decode thread open after the stream ends. The ring caps the tail at
+/// `MAX_LIVE_FRAMES` and drains at real time, so this only bites a stalled
+/// consumer.
+const DRAIN_WAIT_SECS: u64 = 15;
 
 /// The live DJ harbor: an Icecast source-protocol listener.
 ///
@@ -207,6 +212,20 @@ fn decode_live_stream(
     occupied: Arc<AtomicBool>,
 ) {
     decode_live_stream_inner(stream, content_type, chunked, respond_at_end, target, &mut sink);
+    log::debug!("live harbor: decode done, buffered={}", sink.buffered());
+    // A fast upload (e.g. `curl -T`) can land several seconds of audio in
+    // the ring before the mixer processes `SetLive`; a `ClearLive` sent
+    // here would then drop the whole tail in one command drain. Wait for
+    // the consumer to drain the ring first — the mixer auto-fades once the
+    // source drains, so `ClearLive` only confirms it. Bounded so a stalled
+    // consumer (ring full of audio nobody pulls) can't wedge the decode
+    // thread forever; the ring drains at real time, so 15 s covers the
+    // worst-case tail.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(DRAIN_WAIT_SECS);
+    while sink.buffered() > 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    log::debug!("live harbor: drain-wait done, buffered={}", sink.buffered());
     finish(&exhausted, &tx, &occupied);
 }
 
@@ -367,6 +386,7 @@ fn decode_opus_live<R: Read + Send>(reader: R, target: SignalSpec, sink: &mut Li
             return;
         }
     };
+    let mut pushed = 0usize;
     let mut buf = vec![0f32; MAX_LIVE_FRAMES];
     loop {
         let n = src.next_buffer(&mut buf);
@@ -377,7 +397,9 @@ fn decode_opus_live<R: Read + Send>(reader: R, target: SignalSpec, sink: &mut Li
             continue;
         }
         sink.push_samples(&buf[..n]);
+        pushed += n;
     }
+    log::debug!("live harbor: opus dj decode pushed {pushed} samples");
 }
 
 /// A read-only, non-seekable adapter so symphonia can consume a TCP stream.

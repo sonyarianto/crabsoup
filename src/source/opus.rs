@@ -6,6 +6,7 @@
 //! across pages), and decodes them with `audiopus` at 48 kHz, normalising to
 //! the bus spec with the shared [`PcmConverter`].
 
+use std::collections::VecDeque;
 use std::io::Read;
 
 use audiopus::coder::Decoder as OpusDecoder;
@@ -31,8 +32,10 @@ pub struct OggOpusDemux<R: Read> {
     serial: Option<u32>,
     /// An unfinished packet (last lace used was 255), carried to the next page.
     carry: Vec<u8>,
-    /// A completed audio packet waiting to be returned.
-    pending: Option<Vec<u8>>,
+    /// Completed audio packets waiting to be returned. A FIFO: real-world
+    /// Ogg files pack many packets per page (ffmpeg: ~50), and every
+    /// completed packet must survive until `next_packet` yields it.
+    pending: VecDeque<Vec<u8>>,
     /// Channels from OpusHead (1 or 2; other channel mappings are rejected).
     channels: u8,
     /// Pre-skip in samples at 48 kHz, declared in OpusHead.
@@ -60,7 +63,7 @@ impl<R: Read> OggOpusDemux<R> {
             reader,
             serial: None,
             carry: Vec::new(),
-            pending: None,
+            pending: VecDeque::new(),
             channels: 0,
             preskip: 0,
             granule: 0,
@@ -74,7 +77,7 @@ impl<R: Read> OggOpusDemux<R> {
     /// errors propagate as `Err`.
     pub fn next_packet(&mut self) -> Result<Option<Vec<u8>>> {
         loop {
-            if let Some(p) = self.pending.take() {
+            if let Some(p) = self.pending.pop_front() {
                 return Ok(Some(p));
             }
             if self.eos {
@@ -258,7 +261,7 @@ impl<R: Read> OggOpusDemux<R> {
             return Ok(());
         }
         if !pkt.is_empty() {
-            self.pending = Some(pkt);
+            self.pending.push_back(pkt);
         }
         Ok(())
     }
@@ -681,6 +684,52 @@ mod tests {
         rest.read_to_end(&mut rest_bytes).unwrap();
         rebuilt.extend_from_slice(&rest_bytes);
         assert_eq!(rebuilt, bytes);
+    }
+
+    #[test]
+    fn demux_keeps_every_packet_on_multi_packet_pages() {
+        // Real-world Ogg files pack many packets per page (ffmpeg: ~50). The
+        // demux used to keep only the last completed packet of a page and
+        // silently dropped the rest — an 8 s ffmpeg file decoded to ~0.17 s.
+        let mut stream = Vec::new();
+        let mut seq = 0u32;
+        let mut page = |stream: &mut Vec<u8>, flags: u8, granule: i64, laces: &[u8], body: &[u8]| {
+            let mut hdr = Vec::new();
+            hdr.extend_from_slice(b"OggS");
+            hdr.push(0);
+            hdr.push(flags);
+            hdr.extend_from_slice(&granule.to_le_bytes());
+            hdr.extend_from_slice(&1u32.to_le_bytes());
+            hdr.extend_from_slice(&seq.to_le_bytes());
+            hdr.extend_from_slice(&[0, 0, 0, 0]);
+            hdr.push(laces.len() as u8);
+            hdr.extend_from_slice(laces);
+            let crc = crc32(&hdr, body);
+            hdr[22..26].copy_from_slice(&crc.to_le_bytes());
+            stream.extend_from_slice(&hdr);
+            stream.extend_from_slice(body);
+            seq += 1;
+        };
+        page(&mut stream, 0x02, 0, &[19], &opus_head_packet(2));
+        let tags = opus_tags_packet("multi");
+        page(&mut stream, 0, 0, &[tags.len() as u8], &tags);
+        // One page carrying three complete packets (three laces, none 255).
+        page(
+            &mut stream,
+            0x04,
+            2880,
+            &[10, 20, 30],
+            &[vec![0xaa; 10], vec![0xbb; 20], vec![0xcc; 30]].concat(),
+        );
+
+        let mut demux = OggOpusDemux::new(Cursor::new(stream));
+        let p1 = demux.next_packet().unwrap().expect("packet 1");
+        let p2 = demux.next_packet().unwrap().expect("packet 2");
+        let p3 = demux.next_packet().unwrap().expect("packet 3");
+        assert_eq!(p1, vec![0xaa; 10]);
+        assert_eq!(p2, vec![0xbb; 20]);
+        assert_eq!(p3, vec![0xcc; 30]);
+        assert!(demux.next_packet().unwrap().is_none());
     }
 
     #[test]

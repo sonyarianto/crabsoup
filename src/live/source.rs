@@ -80,6 +80,11 @@ impl LiveSink {
             rest = &rest[n..];
         }
     }
+
+    /// Samples still in the ring waiting for the consumer to drain.
+    pub fn buffered(&self) -> usize {
+        self.producer.occupied_len()
+    }
 }
 
 #[cfg(test)]
