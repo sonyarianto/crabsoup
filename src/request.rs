@@ -149,19 +149,41 @@ pub fn resolve(
     frames_per_buffer: usize,
 ) -> crate::Result<Box<dyn crate::source::AudioSource>> {
     match uri {
-        RequestUri::Local(path) => {
-            let src = crate::source::file::FileSource::open(path, target, frames_per_buffer)?;
-            Ok(Box::new(src))
-        }
+        RequestUri::Local(path) => open_audio(path, target, frames_per_buffer),
         RequestUri::Url(url) => {
             let tmp = temp_path(url);
             download(url, &tmp, config)?;
-            let src = crate::source::file::FileSource::open(&tmp, target, frames_per_buffer)?;
-            Ok(Box::new(DownloadSource::new(
-                Box::new(src),
-                tmp,
-                uri.display(),
-            )))
+            let src = open_audio(&tmp, target, frames_per_buffer)?;
+            Ok(Box::new(DownloadSource::new(src, tmp, uri.display())))
+        }
+    }
+}
+
+/// Open a local file for playback: symphonia's [`FileSource`] first (MP3 /
+/// Vorbis / AAC-in-ADTS), falling back to the native Opus path when the
+/// probe fails (symphonia 0.5 has no Opus codec). The original probe error
+/// is reported when neither can read the file.
+pub fn open_audio(
+    path: &std::path::Path,
+    target: symphonia::core::audio::SignalSpec,
+    frames_per_buffer: usize,
+) -> crate::Result<Box<dyn crate::source::AudioSource>> {
+    match crate::source::file::FileSource::open(path, target, frames_per_buffer) {
+        Ok(src) => Ok(Box::new(src)),
+        Err(symphonia_err) => {
+            let label = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.display().to_string());
+            match crate::source::opus::OpusSource::open(
+                Box::new(std::fs::File::open(path)?),
+                target,
+                frames_per_buffer,
+                label,
+            ) {
+                Ok(src) => Ok(Box::new(src)),
+                Err(_) => Err(symphonia_err),
+            }
         }
     }
 }
@@ -363,7 +385,6 @@ fn read_chunked(reader: &mut BufReader<TcpStream>, file: &mut File) -> crate::Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
     use std::net::{TcpListener, TcpStream};
     use std::thread;
 
@@ -534,6 +555,74 @@ mod tests {
         let dest = std::env::temp_dir().join("crabsoup-test-refused.bin");
         let _ = std::fs::remove_file(&dest);
         let err = download("http://127.0.0.1:1/x.mp3", &dest, &config).expect_err("must fail");
+        assert!(!err.to_string().is_empty());
+    }
+
+    fn opus_test_bytes(seconds: f64) -> Vec<u8> {
+        use crate::output::encoder::{Encoder, OpusEncoder};
+        let mut enc = OpusEncoder::new(44_100, 2, 128_000, "test").unwrap();
+        let frames = (seconds * 44_100.0) as usize;
+        let mut out = Vec::new();
+        let mut pcm = Vec::with_capacity(1024);
+        for f in 0..frames {
+            let v = (f as f64 * 2.0 * std::f64::consts::PI * 440.0 / 44_100.0).sin() as f32 * 0.5;
+            pcm.extend_from_slice(&[v, v]);
+            if pcm.len() >= 1024 {
+                out.extend_from_slice(&enc.encode(&pcm));
+                pcm.clear();
+            }
+        }
+        if !pcm.is_empty() {
+            out.extend_from_slice(&enc.encode(&pcm));
+        }
+        out.extend_from_slice(&enc.finish());
+        out
+    }
+
+    #[test]
+    fn open_audio_plays_an_opus_file() {
+        let dest = std::env::temp_dir().join("crabsoup-test-opus.opus");
+        std::fs::write(&dest, opus_test_bytes(1.0)).expect("write");
+        let spec = symphonia::core::audio::SignalSpec::new(
+            44_100,
+            symphonia::core::audio::Channels::FRONT_LEFT
+                | symphonia::core::audio::Channels::FRONT_RIGHT,
+        );
+        let mut src = open_audio(&dest, spec, 4096).expect("open opus file");
+        let _ = std::fs::remove_file(&dest);
+        assert_eq!(src.label().as_deref(), Some("crabsoup-test-opus"));
+        let mut buf = vec![0f32; 4096 * 2];
+        let mut total = 0usize;
+        let mut energy = 0f64;
+        loop {
+            let n = src.next_buffer(&mut buf);
+            if n == 0 {
+                break;
+            }
+            total += n;
+            for &s in &buf[..n] {
+                energy += (s as f64).powi(2);
+            }
+        }
+        assert!(total > 80_000, "total={total}");
+        assert!(energy / total as f64 > 0.01, "energy={energy}");
+        assert!(src.is_exhausted());
+    }
+
+    #[test]
+    fn open_audio_reports_the_original_error_for_undecodable_files() {
+        let dest = std::env::temp_dir().join("crabsoup-test-garbage.mp3");
+        std::fs::write(&dest, b"not audio at all").expect("write");
+        let spec = symphonia::core::audio::SignalSpec::new(
+            44_100,
+            symphonia::core::audio::Channels::FRONT_LEFT
+                | symphonia::core::audio::Channels::FRONT_RIGHT,
+        );
+        let err = match open_audio(&dest, spec, 4096) {
+            Ok(_) => panic!("must fail"),
+            Err(e) => e,
+        };
+        let _ = std::fs::remove_file(&dest);
         assert!(!err.to_string().is_empty());
     }
 }

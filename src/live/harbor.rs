@@ -19,7 +19,7 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::config::LiveConfig;
 use crate::engine::mixer::MixCommand;
 use crate::live::source::LiveSource;
-use crate::source::PcmConverter;
+use crate::source::{AudioSource, PcmConverter};
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_LIVE_FRAMES: usize = 5 * 44100 * 2; // ~5 s of stereo audio
@@ -134,7 +134,17 @@ async fn handle_connection(
     }
 
     log::info!("live harbor: DJ connected to {}", config.mount);
-    respond(&mut socket, 200, "OK").await?;
+
+    // A bounded upload (`curl -T file`, Content-Length present) must not see
+    // the final 200 before its body: curl aborts the rest of the transfer the
+    // moment a complete response arrives mid-upload. Infinite streaming
+    // sources (ffmpeg, ices) need the 200 promptly or they refuse to start,
+    // so they keep receiving it immediately. The decode thread sends the
+    // deferred 200 when the bounded body has been fully consumed.
+    let respond_at_end = request.content_length.is_some();
+    if !respond_at_end {
+        respond(&mut socket, 200, "OK").await?;
+    }
 
     // Convert to a blocking stream *before* announcing the DJ: if this fails
     // we roll back the occupied flag. tokio leaves the fd non-blocking, and a
@@ -166,6 +176,7 @@ async fn handle_connection(
             std_stream,
             request.content_type.clone(),
             request.chunked,
+            respond_at_end,
             target,
             queue,
             exhausted,
@@ -177,23 +188,85 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Decode a DJ's encoded stream to target PCM and push it into the shared queue.
+/// Decode a DJ's encoded stream to target PCM and push it into the shared
+/// queue. When `respond_at_end` (bounded upload such as `curl -T file`), the
+/// final 200 is written only after the body has been fully consumed —
+/// sending it earlier makes curl abort the upload; infinite streaming
+/// sources get their 200 at connect instead and never hit this path.
 #[allow(clippy::too_many_arguments)]
 fn decode_live_stream(
     stream: std::net::TcpStream,
     content_type: Option<String>,
     chunked: bool,
+    respond_at_end: bool,
     target: SignalSpec,
     queue: Arc<Mutex<std::collections::VecDeque<f32>>>,
     exhausted: Arc<AtomicBool>,
     tx: mpsc::Sender<MixCommand>,
     occupied: Arc<AtomicBool>,
 ) {
-    let inner: Box<dyn Read + Send + Sync> = if chunked {
-        Box::new(ChunkedReader::new(stream))
-    } else {
-        Box::new(stream)
+    decode_live_stream_inner(
+        stream,
+        content_type,
+        chunked,
+        respond_at_end,
+        target,
+        &queue,
+        &exhausted,
+    );
+    finish(&exhausted, &tx, &occupied);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_live_stream_inner(
+    mut stream: std::net::TcpStream,
+    content_type: Option<String>,
+    chunked: bool,
+    respond_at_end: bool,
+    target: SignalSpec,
+    queue: &Arc<Mutex<std::collections::VecDeque<f32>>>,
+    exhausted: &Arc<AtomicBool>,
+) {
+    fn done(respond_at_end: bool, stream: &mut std::net::TcpStream) {
+        if respond_at_end {
+            let _ = std::io::Write::write_all(stream, OK_RESPONSE);
+        }
+    }
+    let Ok(reader_sock) = stream.try_clone() else {
+        log::warn!("live harbor: cannot clone live socket");
+        return;
     };
+    let inner: Box<dyn Read + Send + Sync> = if chunked {
+        Box::new(ChunkedReader::new(reader_sock))
+    } else {
+        Box::new(reader_sock)
+    };
+
+    // Peek the first Ogg page: an OpusHead stream takes the native
+    // `OpusSource` path (symphonia 0.5 has no Opus codec), anything else is
+    // probed by symphonia as before. Either way the sniffed bytes are fed
+    // back so the stream is never consumed past its head.
+    let (is_opus, prefix, rest) = match crate::source::opus::sniff_stream(inner) {
+        Ok(t) => t,
+        Err(e) => {
+            log::warn!("live harbor: sniffing DJ stream: {e}");
+            done(respond_at_end, &mut stream);
+            return;
+        }
+    };
+    if is_opus {
+        decode_opus_live(
+            crate::source::opus::PrependReader::new(prefix, rest),
+            target,
+            queue,
+            exhausted,
+        );
+        done(respond_at_end, &mut stream);
+        return;
+    }
+    let inner: Box<dyn Read + Send + Sync> =
+        Box::new(crate::source::opus::PrependReader::new(prefix, rest));
+
     let src = NonSeekableSource { inner };
     let mss = MediaSourceStream::new(Box::new(src), MediaSourceStreamOptions::default());
 
@@ -207,7 +280,7 @@ fn decode_live_stream(
         Ok(p) => p,
         Err(e) => {
             log::error!("live harbor: cannot probe DJ stream: {e}");
-            finish(&exhausted, &tx, &occupied);
+            done(respond_at_end, &mut stream);
             return;
         }
     };
@@ -215,7 +288,7 @@ fn decode_live_stream(
     let mut format = probed.format;
     let Some(track) = format.default_track().cloned() else {
         log::error!("live harbor: DJ stream has no default audio track");
-        finish(&exhausted, &tx, &occupied);
+        done(respond_at_end, &mut stream);
         return;
     };
     let track_id = track.id;
@@ -226,7 +299,7 @@ fn decode_live_stream(
         Ok(d) => d,
         Err(e) => {
             log::error!("live harbor: cannot create decoder: {e}");
-            finish(&exhausted, &tx, &occupied);
+            done(respond_at_end, &mut stream);
             return;
         }
     };
@@ -272,7 +345,7 @@ fn decode_live_stream(
     if !tail.is_empty() {
         live.push_samples(&tail);
     }
-    finish(&exhausted, &tx, &occupied);
+    done(respond_at_end, &mut stream);
 }
 
 fn finish(
@@ -289,24 +362,58 @@ fn finish(
     log::info!("live harbor: DJ disconnected");
 }
 
-/// A read-only, non-seekable adapter so symphonia can consume a TCP stream.
-struct NonSeekableSource {
-    inner: Box<dyn Read + Send + Sync>,
+/// Decode a DJ's Opus stream natively (audiopus) and push target-spec PCM
+/// into the shared queue. Uses the same [`OpusSource`] as file playback.
+fn decode_opus_live<R: Read + Send>(
+    reader: R,
+    target: SignalSpec,
+    queue: &Arc<Mutex<std::collections::VecDeque<f32>>>,
+    exhausted: &Arc<AtomicBool>,
+) {
+    let mut src = match crate::source::opus::OpusSource::open(
+        reader,
+        target,
+        target.rate as usize,
+        "LIVE DJ (opus)".into(),
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("live harbor: cannot decode opus dj stream: {e}");
+            return;
+        }
+    };
+    let live = LiveSource::new(queue.clone(), exhausted.clone(), MAX_LIVE_FRAMES);
+    let mut buf = vec![0f32; MAX_LIVE_FRAMES];
+    loop {
+        let n = src.next_buffer(&mut buf);
+        if n == 0 {
+            if src.is_exhausted() {
+                break;
+            }
+            continue;
+        }
+        live.push_samples(&buf[..n]);
+    }
 }
 
-impl Read for NonSeekableSource {
+/// A read-only, non-seekable adapter so symphonia can consume a TCP stream.
+struct NonSeekableSource<R: Read + Send + Sync> {
+    inner: R,
+}
+
+impl<R: Read + Send + Sync> Read for NonSeekableSource<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.inner.read(buf)
     }
 }
 
-impl Seek for NonSeekableSource {
+impl<R: Read + Send + Sync> Seek for NonSeekableSource<R> {
     fn seek(&mut self, _pos: SeekFrom) -> std::io::Result<u64> {
         Err(std::io::Error::other("live source is not seekable"))
     }
 }
 
-impl MediaSource for NonSeekableSource {
+impl<R: Read + Send + Sync> MediaSource for NonSeekableSource<R> {
     fn is_seekable(&self) -> bool {
         false
     }
@@ -421,6 +528,9 @@ struct SourceRequest {
     path: String,
     authorization: Option<String>,
     content_type: Option<String>,
+    /// `Content-Length` when the client sent one (a bounded upload such as
+    /// `curl -T file`). `None` for infinite streaming sources (ffmpeg etc.).
+    content_length: Option<u64>,
     /// `Transfer-Encoding: chunked` — the body must be de-chunked before
     /// decoding (ffmpeg's `-method PUT` uses this).
     chunked: bool,
@@ -440,6 +550,7 @@ fn parse_source_request(header: &[u8]) -> Result<SourceRequest, u16> {
 
     let mut authorization = None;
     let mut content_type = None;
+    let mut content_length = None;
     let mut chunked = false;
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
@@ -448,6 +559,7 @@ fn parse_source_request(header: &[u8]) -> Result<SourceRequest, u16> {
             match key.as_str() {
                 "authorization" => authorization = Some(val),
                 "content-type" => content_type = Some(val),
+                "content-length" => content_length = val.parse::<u64>().ok(),
                 "transfer-encoding" => chunked = val.to_ascii_lowercase().contains("chunked"),
                 _ => {}
             }
@@ -458,6 +570,7 @@ fn parse_source_request(header: &[u8]) -> Result<SourceRequest, u16> {
         path,
         authorization,
         content_type,
+        content_length,
         chunked,
     })
 }
@@ -493,6 +606,9 @@ fn hint_for_content_type(content_type: Option<&str>) -> Hint {
     }
     hint
 }
+
+const OK_RESPONSE: &[u8] =
+    b"HTTP/1.0 200 OK\r\nServer: Crabsoup Harbor\r\nContent-Length: 0\r\n\r\n";
 
 /// Read bytes up to and including CRLFCRLF, or until the size limit.
 async fn read_header(socket: &mut TcpStream) -> Result<Vec<u8>, String> {
@@ -539,11 +655,12 @@ mod tests {
 
     #[test]
     fn parses_put_request() {
-        let header = b"PUT /live HTTP/1.1\r\nAuthorization: Basic c291cmNlOnNlY3JldA==\r\nContent-Type: application/mpeg\r\n\r\n";
+        let header = b"PUT /live HTTP/1.1\r\nAuthorization: Basic c291cmNlOnNlY3JldA==\r\nContent-Type: application/mpeg\r\nContent-Length: 466982\r\n\r\n";
         let req = parse_source_request(header).unwrap();
         assert_eq!(req.path, "/live");
         assert_eq!(req.authorization.as_deref(), Some("Basic c291cmNlOnNlY3JldA=="));
         assert_eq!(req.content_type.as_deref(), Some("application/mpeg"));
+        assert_eq!(req.content_length, Some(466982));
         assert!(!req.chunked);
     }
 

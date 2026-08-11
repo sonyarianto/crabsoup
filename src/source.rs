@@ -1,4 +1,5 @@
 pub mod file;
+pub mod opus;
 pub mod playlist;
 pub mod replaygain;
 pub mod request;

@@ -456,10 +456,11 @@ mod tests {
         assert_eq!(src.replaygain_db(), Some(-4.25));
 
         let dir = std::env::temp_dir().join("crabsoup-test");
-        let path = dir.join("sine.wav");
+        let path = dir.join(format!("no-tags-{}.wav", std::process::id()));
         write_sine_wav(&path, 0.1, 44100, 440.0);
         let src = FileSource::open(&path, spec, 4096).unwrap();
         assert_eq!(src.replaygain_db(), None);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

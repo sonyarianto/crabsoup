@@ -29,9 +29,21 @@
 
 - [x] Live DJ harbor end-to-end: PUT + Basic auth (200 OK), mixer duck control
       verified (connect/disconnect events; broadcast RMS dips to ~25% then
-      recovers full level). Caveat: symphonia 0.5/0.6 has no Opus codec, so
-      MP3 uploads decode and air, while Opus uploads log "cannot create
-      decoder: unsupported codec" and air silence for the ducked window.
+      recovers full level). MP3 uploads decode via symphonia; Opus uploads
+      take the native decode path (next entry).
+- [x] Native Opus decode (`src/source/opus.rs`): symphonia 0.5 has no Opus
+      codec, so the built-in Ogg demuxer (page CRC against the shared
+      MPEG-2 table) + libopus via `audiopus` handle `.opus` files and live
+      DJ streams. `request.rs::open_audio` probes symphonia first (MP3 /
+      Vorbis / AAC), falling back to `OpusSource`; the harbor sniffs the
+      DJ stream's first Ogg page (fed back with `PrependReader`) and takes
+      the Opus path directly. Verified live: 96 kbps Opus DJ via ffmpeg
+      decoded clean end-to-end, full-file `curl -T` Opus uploads played,
+      real `.opus` files air through `single`/playlist. Also fixed bounded
+      uploads (`curl -T file`): the harbor deferred its final 200 until the
+      Content-Length body was fully consumed — curl aborts a transfer the
+      moment a complete response arrives mid-upload; streaming sources
+      (ffmpeg, ices) still get the 200 at connect.
 
 - [x] Opus stream title: investigated to the source. Icecast 2.4.4 never parses
       OpusTags titles (format_opus.c counts header packets only) and rejects URL
@@ -46,9 +58,6 @@
       title-less for Opus (documented server limitation).
 
 ## Known limitations
-- DJ uploads must be MP3 for now (symphonia has no Opus codec; 0.6.0 feature
-  list confirmed ogg/vorbis/mp3 but no opus). A native Opus decode path
-  (audiopus + our ogg demuxer) is future work.
 - Icecast 2.4.4 shows no Opus titles (see Done section); 2.5+ shows the
   stream-start title only.
 
