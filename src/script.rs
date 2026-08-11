@@ -41,7 +41,8 @@ use crate::config::{
 };
 use crate::engine::effects::{Agc, Amplify, Compressor, EffectSource};
 use crate::engine::mixer::CrossfadeMixer;
-use crate::request::{resolve, RequestConfig, RequestUri};
+use crate::request::{resolve, RequestConfig, RequestUri, TrackCues};
+use crate::source::cue_cut::CueCutSource;
 use crate::source::playlist::Playlist;
 use crate::source::replaygain::ReplayGainSource;
 use crate::source::request::{RequestQueue, RequestQueueSource};
@@ -99,6 +100,9 @@ struct ScriptState {
     /// separate from `metadata_hooks` so a `Track` event never calls an
     /// `on_metadata` callback (and vice versa).
     track_hooks: Vec<mlua::Function>,
+    /// Lua callbacks registered by `request.dynamic`; indexed by hook id.
+    /// Each returns the next request URI or nil to end the source.
+    dynamic_hooks: Vec<mlua::Function>,
 }
 
 /// Events sent from engine threads to the Lua-owning thread. The payload is
@@ -116,6 +120,10 @@ pub enum ScriptEvent {
         args: String,
         reply: mpsc::Sender<Result<String, String>>,
     },
+    /// `request.dynamic`: ask the Lua callback for the next request URI
+    /// (`Some(uri)`) or the end of the stream (`None`). The audio thread
+    /// never blocks on the reply — it polls and returns silence meanwhile.
+    NextRequest { index: usize, reply: mpsc::Sender<Option<String>> },
     /// Request the engine stop (future `server.register` use).
     Shutdown,
 }
@@ -130,6 +138,7 @@ pub struct ScriptRuntime {
     metadata_hooks: Vec<mlua::Function>,
     track_hooks: Vec<mlua::Function>,
     custom_commands: Vec<(String, mlua::Function)>,
+    dynamic_hooks: Vec<mlua::Function>,
 }
 
 impl ScriptRuntime {
@@ -213,6 +222,21 @@ impl ScriptRuntime {
                     }
                 }
             }
+            ScriptEvent::NextRequest { index, reply } => {
+                let Some(cb) = self.dynamic_hooks.get(index) else {
+                    let _ = reply.send(None);
+                    return;
+                };
+                let next = match cb.call::<Option<String>>(()) {
+                    Ok(Some(uri)) => Some(uri),
+                    Ok(None) => None,
+                    Err(e) => {
+                        log::warn!("request.dynamic callback error: {e}");
+                        None
+                    }
+                };
+                let _ = reply.send(next);
+            }
             ScriptEvent::Shutdown => {
                 end.store(true, std::sync::atomic::Ordering::SeqCst);
             }
@@ -271,6 +295,10 @@ impl AudioSource for OnMetadataSource {
 
     fn replaygain_db(&self) -> Option<f32> {
         self.child.replaygain_db()
+    }
+
+    fn crossfade_overrides(&self) -> Option<(Option<f64>, Option<f64>)> {
+        self.child.crossfade_overrides()
     }
 
     fn skip(&mut self) {
@@ -340,8 +368,194 @@ impl AudioSource for OnTrackSource {
         self.child.replaygain_db()
     }
 
+    fn crossfade_overrides(&self) -> Option<(Option<f64>, Option<f64>)> {
+        self.child.crossfade_overrides()
+    }
+
     fn skip(&mut self) {
         self.child.skip();
+    }
+}
+
+/// Liquidsoap `request.dynamic`: plays requests returned by a Lua callback,
+/// one ahead of the current track.
+///
+/// The callback (invoked on the Lua-owning thread through the A2 event
+/// loop) returns the next request URI as a string, or nil to end the
+/// source. The audio thread never blocks on the Lua reply: it sends a
+/// [`ScriptEvent::NextRequest`], polls the reply channel without waiting,
+/// and returns silence (or the current track's audio) until the answer
+/// lands. The next URI is requested as soon as a track is promoted, so a
+/// fast callback makes handovers gapless. Requests resolve like any other
+/// URI (`annotate:` prefixes, `http://` downloads, retries); a request that
+/// fails to resolve is logged and skipped, and the callback is asked again.
+/// While a reply is outstanding the source is *not* exhausted (it does not
+/// yet know if more tracks are coming), so a `fallback` holds on it rather
+/// than falling through — like a temporarily-silent child, unlike
+/// `request.queue` which reports exhausted when empty.
+struct DynamicRequestSource {
+    /// Channel to the Lua-owning thread's event loop.
+    event_tx: mpsc::Sender<ScriptEvent>,
+    /// Index into the runtime's `dynamic_hooks`.
+    index: usize,
+    request: RequestConfig,
+    target: SignalSpec,
+    frames_per_buffer: usize,
+    /// The track currently playing.
+    current: Option<Box<dyn AudioSource>>,
+    current_uri: Option<RequestUri>,
+    /// Resolved-but-not-yet-promoted next track (the prefetch).
+    next_uri: Option<RequestUri>,
+    /// A `NextRequest` reply outstanding; `Some(rx)` while we wait.
+    pending_reply: Option<mpsc::Receiver<Option<String>>>,
+    /// The callback returned nil: no tracks after the current one.
+    no_more: bool,
+}
+
+impl DynamicRequestSource {
+    fn new(
+        event_tx: mpsc::Sender<ScriptEvent>,
+        index: usize,
+        request: RequestConfig,
+        target: SignalSpec,
+        frames_per_buffer: usize,
+    ) -> Self {
+        Self {
+            event_tx,
+            index,
+            request,
+            target,
+            frames_per_buffer,
+            current: None,
+            current_uri: None,
+            next_uri: None,
+            pending_reply: None,
+            no_more: false,
+        }
+    }
+
+    /// Ask the Lua callback for the next request URI.
+    fn request_next(&mut self) {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        match self.event_tx.send(ScriptEvent::NextRequest {
+            index: self.index,
+            reply: reply_tx,
+        }) {
+            Ok(()) => self.pending_reply = Some(reply_rx),
+            // Event loop is gone: nothing more will ever come.
+            Err(_) => self.no_more = true,
+        }
+    }
+
+    /// Collect an outstanding Lua reply without blocking. Returns true when
+    /// a reply was consumed.
+    fn poll_reply(&mut self) -> bool {
+        let Some(rx) = self.pending_reply.take() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(Some(uri)) => {
+                self.next_uri = Some(RequestUri::new(&uri));
+                true
+            }
+            Ok(None) => {
+                self.no_more = true;
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                // Still waiting; check again on the next pull.
+                self.pending_reply = Some(rx);
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.no_more = true;
+                true
+            }
+        }
+    }
+}
+
+impl AudioSource for DynamicRequestSource {
+    fn next_buffer(&mut self, buffer: &mut [f32]) -> usize {
+        loop {
+            // Collect an outstanding reply, then ensure a request is in
+            // flight whenever we do not know the next track.
+            self.poll_reply();
+            if self.next_uri.is_none() && self.pending_reply.is_none() && !self.no_more {
+                self.request_next();
+            }
+            // Promote a known next track into the current slot and prefetch
+            // the one after it while it plays.
+            if self.current.is_none() {
+                if let Some(uri) = self.next_uri.take() {
+                    match resolve(&uri, &self.request, self.target, self.frames_per_buffer) {
+                        Ok(src) => {
+                            log::info!("request.dynamic: playing {}", uri.display());
+                            self.current = Some(src);
+                            self.current_uri = Some(uri);
+                            if self.next_uri.is_none()
+                                && self.pending_reply.is_none()
+                                && !self.no_more
+                            {
+                                self.request_next();
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("request.dynamic: cannot play {}: {e}", uri.display());
+                            // Skip the bad request and ask the callback again.
+                            continue;
+                        }
+                    }
+                } else {
+                    // No next track known: wait for Lua (or the end).
+                    return 0;
+                }
+            }
+            let Some(current) = self.current.as_mut() else {
+                return 0;
+            };
+            let n = current.next_buffer(buffer);
+            if n > 0 {
+                return n;
+            }
+            if current.is_exhausted() {
+                log::info!(
+                    "request.dynamic: finished {}",
+                    self.current_uri.as_ref().map(|u| u.display()).unwrap_or_default()
+                );
+                self.current = None;
+                self.current_uri = None;
+                continue;
+            }
+            // Current track is temporarily silent; hold on it.
+            return 0;
+        }
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.current.is_none() && self.next_uri.is_none() && self.no_more
+    }
+
+    fn remaining_seconds(&self) -> Option<f64> {
+        self.current.as_ref().and_then(|c| c.remaining_seconds())
+    }
+
+    fn label(&self) -> Option<String> {
+        self.current_uri.as_ref().map(|uri| uri.display())
+    }
+
+    fn replaygain_db(&self) -> Option<f32> {
+        self.current.as_ref().and_then(|c| c.replaygain_db())
+    }
+
+    fn crossfade_overrides(&self) -> Option<(Option<f64>, Option<f64>)> {
+        self.current.as_ref().and_then(|c| c.crossfade_overrides())
+    }
+
+    fn skip(&mut self) {
+        // Advance to the next prefetched track (a skip is a boundary).
+        self.current = None;
+        self.current_uri = None;
     }
 }
 
@@ -485,6 +699,15 @@ impl AudioSource for FallbackSource {
             .get(self.current)
             .and_then(|c| c.0.lock().unwrap().replaygain_db())
     }
+
+    fn crossfade_overrides(&self) -> Option<(Option<f64>, Option<f64>)> {
+        if let Some(i) = self.active() {
+            return self.children[i].0.lock().unwrap().crossfade_overrides();
+        }
+        self.children
+            .get(self.current)
+            .and_then(|c| c.0.lock().unwrap().crossfade_overrides())
+    }
 }
 
 /// Picks a random remaining child each time one ends (Liquidsoap's `random`).
@@ -556,6 +779,101 @@ impl AudioSource for RandomSource {
         self.order
             .first()
             .and_then(|&i| self.children[i].0.lock().unwrap().replaygain_db())
+    }
+
+    fn crossfade_overrides(&self) -> Option<(Option<f64>, Option<f64>)> {
+        self.order
+            .first()
+            .and_then(|&i| self.children[i].0.lock().unwrap().crossfade_overrides())
+    }
+}
+
+/// Sums N children sample-by-sample (Liquidsoap `add`): a background bed
+/// plus a voice-over, layered intros, etc. Optional per-child `weights`
+/// scale each source before summing (default 1.0). The mix is not
+/// normalized — clipping is the caller's concern (use `weights`).
+struct AddSource {
+    children: Vec<LuaSource>,
+    weights: Vec<f32>,
+    /// Reusable scratch for children after the first, sized on demand so
+    /// `next_buffer` never allocates on the hot path.
+    scratch: Vec<f32>,
+}
+
+impl AddSource {
+    fn new(children: Vec<LuaSource>, weights: Vec<f32>) -> Self {
+        Self {
+            children,
+            weights,
+            scratch: Vec::new(),
+        }
+    }
+}
+
+impl AudioSource for AddSource {
+    fn next_buffer(&mut self, buffer: &mut [f32]) -> usize {
+        let mut out_len = 0;
+        for (i, child) in self.children.iter().enumerate() {
+            let w = self.weights[i];
+            if i == 0 {
+                let n = child.0.lock().unwrap().next_buffer(buffer);
+                // Samples beyond the first child's fill are undefined; the
+                // other children are added into them below.
+                if n < buffer.len() {
+                    buffer[n..].fill(0.0);
+                }
+                for s in &mut buffer[..n] {
+                    *s *= w;
+                }
+                out_len = n;
+            } else {
+                if self.scratch.len() != buffer.len() {
+                    self.scratch.resize(buffer.len(), 0.0);
+                }
+                let n = child.0.lock().unwrap().next_buffer(&mut self.scratch);
+                for (out, s) in buffer[..n].iter_mut().zip(&self.scratch[..n]) {
+                    *out += *s * w;
+                }
+                out_len = out_len.max(n);
+            }
+        }
+        out_len
+    }
+
+    fn is_exhausted(&self) -> bool {
+        // The sum ends when every child has ended; a looping bed keeps the
+        // mix alive indefinitely.
+        self.children.iter().all(|c| c.0.lock().unwrap().is_exhausted())
+    }
+
+    fn remaining_seconds(&self) -> Option<f64> {
+        self.children
+            .first()
+            .and_then(|c| c.0.lock().unwrap().remaining_seconds())
+    }
+
+    fn label(&self) -> Option<String> {
+        self.children
+            .first()
+            .and_then(|c| c.0.lock().unwrap().label())
+    }
+
+    fn replaygain_db(&self) -> Option<f32> {
+        self.children
+            .first()
+            .and_then(|c| c.0.lock().unwrap().replaygain_db())
+    }
+
+    fn crossfade_overrides(&self) -> Option<(Option<f64>, Option<f64>)> {
+        self.children
+            .first()
+            .and_then(|c| c.0.lock().unwrap().crossfade_overrides())
+    }
+
+    fn skip(&mut self) {
+        for child in &self.children {
+            child.0.lock().unwrap().skip();
+        }
     }
 }
 
@@ -823,6 +1141,12 @@ impl AudioSource for ScheduleSource {
             .and_then(|c| c.0.lock().unwrap().replaygain_db())
     }
 
+    fn crossfade_overrides(&self) -> Option<(Option<f64>, Option<f64>)> {
+        self.children
+            .get(self.current)
+            .and_then(|c| c.0.lock().unwrap().crossfade_overrides())
+    }
+
     fn skip(&mut self) {
         // A skip is a track boundary too: the current track ends now, and
         // the schedule re-picks on the next pull.
@@ -1026,6 +1350,23 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
     })?;
     let request = lua.create_table()?;
     request.set("queue", request_fn)?;
+
+    // ---- dynamic requests (Liquidsoap `request.dynamic`) -----------------
+    // The callback runs on the Lua-owning event loop (A2 bridge); it
+    // returns the next request URI as a string, or nil to end the source.
+    let dyn_state = state.clone();
+    let dyn_tx = event_tx.clone();
+    request.set(
+        "dynamic",
+        lua.create_function(move |_, callback: mlua::Function| {
+            let (spec, fpb) = bus(&dyn_state);
+            let request = dyn_state.borrow().request;
+            let index = dyn_state.borrow().dynamic_hooks.len();
+            dyn_state.borrow_mut().dynamic_hooks.push(callback);
+            let src = DynamicRequestSource::new(dyn_tx.clone(), index, request, spec, fpb);
+            Ok(LuaSource::new(Box::new(src)))
+        })?,
+    )?;
     globals.set("request", request)?;
 
     // ---- test sources (Liquidsoap `blank`, `sine`) -----------------------
@@ -1176,6 +1517,76 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         )?;
     }
 
+    // ---- additive mix (Liquidsoap `add`) ----------------------------------
+    globals.set(
+        "add",
+        lua.create_function(|_lua, (children, opts): (Table, Option<Table>)| {
+            let sources = source_list(&children)?;
+            let n = sources.len();
+            let weights: Vec<f32> = match &opts {
+                Some(t) => t.get("weights").unwrap_or_default(),
+                None => Vec::new(),
+            };
+            let weights = if weights.is_empty() {
+                vec![1.0; n]
+            } else {
+                if weights.len() != n {
+                    return Err(mlua::Error::runtime(
+                        "add: `weights` must have one entry per source",
+                    ));
+                }
+                weights
+            };
+            let composed: Box<dyn AudioSource> = Box::new(AddSource::new(sources, weights));
+            Ok(LuaSource::new(composed))
+        })?,
+    )?;
+
+    // ---- cue cutting (Liquidsoap `annotate:`/`cue_cut`) --------------------
+    let cue_state = state.clone();
+    globals.set(
+        "cue_cut",
+        lua.create_function(move |_, (mut source, opts): (LuaSource, Option<Table>)| {
+            let cue_in = opt_f64(&opts, "cue_in", 0.0)?;
+            let cue_out = match &opts {
+                Some(t) => t.get::<Option<f64>>("cue_out")?,
+                None => None,
+            };
+            let fade_in = match &opts {
+                Some(t) => t.get::<Option<f64>>("fade_in")?,
+                None => None,
+            };
+            let fade_out = match &opts {
+                Some(t) => t.get::<Option<f64>>("fade_out")?,
+                None => None,
+            };
+            let (spec, _) = bus(&cue_state);
+            let child = source.take();
+            let cues = TrackCues {
+                cue_in,
+                cue_out,
+                fade_in,
+                fade_out,
+            };
+            let wrapped = CueCutSource::new(child, cues, spec.rate, spec.channels.count());
+            Ok(LuaSource::new(Box::new(wrapped)))
+        })?,
+    )?;
+
+    // ---- mksafe (Liquidsoap defensive wrapper) ---------------------------
+    // Wraps any source so it never fails outright: when the child exhausts
+    // (or is a request source that failed to resolve), an infinite blank
+    // produces silence instead of the engine erroring out. The child is
+    // re-checked from the top on every pull, so a `request.queue` that
+    // receives a push later preempts the silence again.
+    globals.set(
+        "mksafe",
+        lua.create_function(|_, source: LuaSource| {
+            let silence = LuaSource::new(Box::new(BlankSource::new()));
+            Ok(LuaSource::new(Box::new(FallbackSource::new(vec![source, silence]))))
+        })?,
+    )?;
+
     // ---- daypart scheduling (Liquidsoap `switch`, `rotate`) --------------
     globals.set(
         "switch",
@@ -1270,7 +1681,7 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
             jingle_state.borrow_mut().jingles.extend(paths.clone());
             // ...and returned as a plain (non-looped) playlist source so it
             // composes like any other source (jingles stay local paths).
-            let requests = paths.into_iter().map(RequestUri::Local).collect();
+            let requests = paths.into_iter().map(|p| RequestUri::Local(p, None)).collect();
             let src = crossfading_playlist(requests, false, false, &jingle_state);
             Ok(LuaSource::new(src))
         })?,
@@ -1489,6 +1900,7 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         metadata_hooks: std::mem::take(&mut s.metadata_hooks),
         track_hooks: std::mem::take(&mut s.track_hooks),
         custom_commands: std::mem::take(&mut s.custom_commands),
+        dynamic_hooks: std::mem::take(&mut s.dynamic_hooks),
     };
     Ok((runtime, result))
 }
@@ -1653,6 +2065,375 @@ mod tests {
     }
 
     #[test]
+    fn mksafe_never_exhausts_and_plays_silence_after_the_child_ends() {
+        let (_rt, res) = run(
+            r#"
+            output.preview(mksafe(sine({freq = 440, duration = 0.05})))
+            "#,
+        )
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        // The sine plays first...
+        let n = root.next_buffer(&mut buf);
+        assert!(n > 0);
+        assert!(buf[..n].iter().any(|&s| s.abs() > 0.01));
+        // ...then silence forever: the combined source never exhausts.
+        for _ in 0..10 {
+            let n = root.next_buffer(&mut buf);
+            assert_eq!(n, buf.len(), "mksafe must keep producing buffers");
+            assert!(
+                buf.iter().all(|&s| s == 0.0),
+                "mksafe fallback must be silence"
+            );
+            assert!(!root.is_exhausted(), "mksafe must never exhaust");
+        }
+    }
+
+    #[test]
+    fn mksafe_covers_a_failed_request_resolution_with_silence() {
+        let (_rt, res) = run(
+            r#"
+            q = request.queue()
+            output.preview(mksafe(q))
+            "#,
+        )
+        .expect("script runs");
+        let queue = res.request_queue.as_ref().expect("queue registered");
+        queue.push(RequestUri::new("/definitely/not/here.mp3"));
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        let n = root.next_buffer(&mut buf);
+        assert_eq!(
+            n, buf.len(),
+            "a failed resolve must yield silence, not an engine error"
+        );
+        assert!(buf[..n].iter().all(|&s| s == 0.0));
+        assert!(!root.is_exhausted(), "mksafe must never exhaust");
+    }
+
+    #[test]
+    fn add_sums_sources_sample_wise() {
+        let (_rt, res) = run(
+            r#"
+            output.preview(add({sine({freq = 440, amplitude = 0.5}),
+                                 sine({freq = 440, amplitude = 0.5})}))
+            "#,
+        )
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        root.next_buffer(&mut buf);
+        // Two in-phase 0.5-amplitude sines sum to a ~1.0 peak (a doubling or
+        // quadrupling bug would move it to 2.0/4.0 and must fail here).
+        let peak = buf.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert!((peak - 1.0).abs() < 0.01, "add did not sum the sines (peak {peak})");
+    }
+
+    #[test]
+    fn add_applies_per_source_weights() {
+        let (_rt, res) = run(
+            r#"
+            output.preview(add({sine({freq = 440, amplitude = 0.5}),
+                                 sine({freq = 440, amplitude = 0.5})},
+                                {weights = {0.5, 1.0}}))
+            "#,
+        )
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        root.next_buffer(&mut buf);
+        // 0.5 * 0.5 + 1.0 * 0.5 -> ~0.75 peak.
+        let peak = buf.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert!((peak - 0.75).abs() < 0.01, "weighted sum peak {peak}");
+    }
+
+    #[test]
+    fn add_keeps_playing_after_a_short_child_ends() {
+        // A short child over an infinite one: when the short child exhausts,
+        // the sum continues with the remaining child and never exhausts.
+        let (_rt, res) = run(
+            r#"
+            output.preview(add({sine({freq = 440, duration = 0.05, amplitude = 0.5}),
+                                 sine({freq = 220, amplitude = 0.5})}))
+            "#,
+        )
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        // Drain the short child's 4410 samples (0.05 s stereo at 44.1 kHz),
+        // then pull again and require the bed to still be audible.
+        let mut drained = 0usize;
+        while drained < 4410 {
+            let n = root.next_buffer(&mut buf);
+            assert!(n > 0, "add stalled while the short child was live");
+            drained += n;
+        }
+        let n = root.next_buffer(&mut buf);
+        assert!(n > 0, "add must keep producing the infinite child");
+        assert!(
+            buf[..n].iter().any(|&s| s.abs() > 0.01),
+            "bed must be audible after the short child ends"
+        );
+        assert!(!root.is_exhausted(), "add must not exhaust while one child lives");
+    }
+
+    #[test]
+    fn add_exhausts_when_every_child_ends() {
+        let (_rt, res) = run(
+            r#"
+            output.preview(add({sine({freq = 440, duration = 0.05, amplitude = 0.5}),
+                                 sine({freq = 220, duration = 0.05, amplitude = 0.5})}))
+            "#,
+        )
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        let mut total = 0usize;
+        while !root.is_exhausted() {
+            let n = root.next_buffer(&mut buf);
+            if n == 0 {
+                break;
+            }
+            total += n;
+        }
+        assert!(root.is_exhausted(), "add must exhaust once all children end");
+        // 0.05 s stereo at 44.1 kHz = 4410 samples, no matter the splits.
+        assert_eq!(total, 4410);
+    }
+
+    #[test]
+    fn add_rejects_bad_weight_counts() {
+        let err = run(
+            r#"
+            output.preview(add({sine({freq = 440}), sine({freq = 220})},
+                                {weights = {0.5}}))
+            "#,
+        )
+        .err()
+        .expect("script fails");
+        assert!(err.to_string().contains("weights"), "{}", err.to_string());
+    }
+
+    #[test]
+    fn add_rejects_an_empty_source_list() {
+        let err = run("output.preview(add({}))")
+            .err()
+            .expect("script fails");
+        assert!(err.to_string().contains("list of sources"), "{}", err.to_string());
+    }
+
+    #[test]
+    fn cue_cut_skips_and_truncates_a_sine() {
+        let (_rt, res) = run(
+            r#"
+            output.preview(cue_cut(sine({freq = 100, duration = 1, amplitude = 1.0}),
+                                    {cue_in = 0.05, cue_out = 0.15}))
+            "#,
+        )
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        let mut total = 0usize;
+        while !root.is_exhausted() {
+            let n = root.next_buffer(&mut buf);
+            if n == 0 {
+                break;
+            }
+            total += n;
+        }
+        // Window [0.05, 0.15) = 0.1 s stereo at 44.1 kHz = 8820 samples.
+        assert_eq!(total, 8820, "cue_cut window mismatch ({total})");
+    }
+
+    #[test]
+    fn annotate_uri_plays_through_single_with_cue_points() {
+        // A real file with an annotate: cue window; skipped when media/ is
+        // absent, like the other real-file tests.
+        let real = PathBuf::from("media/sunset-house-grooves-deep-house-sunset-538759.mp3");
+        if !real.exists() {
+            return;
+        }
+        let script = format!(
+            "output.preview(single(\"annotate:liq_cue_in=\\\"1\\\",liq_cue_out=\\\"2\\\":{}\"))",
+            real.display()
+        );
+        let (_rt, res) = run(&script).expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        let mut total = 0usize;
+        let mut non_silent = 0usize;
+        while !root.is_exhausted() {
+            let n = root.next_buffer(&mut buf);
+            if n == 0 {
+                break;
+            }
+            total += n;
+            if buf[..n].iter().any(|&s| s.abs() > 0.01) {
+                non_silent += n;
+            }
+        }
+        // Window [1, 2) = 1 s stereo at 44.1 kHz = 88200 samples; the track
+        // must end there, not at its natural length.
+        assert_eq!(total, 88200, "annotate window not respected ({total})");
+        assert!(non_silent > 0, "no audio through the annotated single");
+    }
+
+    #[test]
+    fn cue_cut_exposes_fade_overrides_to_the_mixer() {
+        // The `fade_in`/`fade_out` options are the D2 step-2 per-track
+        // crossfade override: the mixer reads them via `crossfade_overrides`
+        // instead of the global `crossfade_seconds`.
+        let (_rt, res) = run(
+            r#"
+            output.preview(cue_cut(sine({freq = 100, duration = 1, amplitude = 1.0}),
+                                    {cue_in = 0.05, cue_out = 0.15,
+                                     fade_in = 2, fade_out = 3}))
+            "#,
+        )
+        .expect("script runs");
+        let root = res.preview.expect("preview source");
+        assert_eq!(
+            root.crossfade_overrides(),
+            Some((Some(2.0), Some(3.0))),
+            "cue_cut must report fade overrides to the crossfade mixer"
+        );
+        // Without fades, no overrides are reported (global window applies).
+        let (_rt, res) = run(
+            r#"
+            output.preview(cue_cut(sine({freq = 100, duration = 1}),
+                                    {cue_in = 0.05, cue_out = 0.15}))
+            "#,
+        )
+        .expect("script runs");
+        let root = res.preview.expect("preview source");
+        assert_eq!(root.crossfade_overrides(), None);
+    }
+
+    #[test]
+    fn annotate_fade_keys_reach_the_resolved_source() {
+        // An `annotate:` prefix with only fade keys (no cue points) must
+        // still wrap the source so the mixer sees the overrides.
+        let real = PathBuf::from("media/sunset-house-grooves-deep-house-sunset-538759.mp3");
+        if !real.exists() {
+            return;
+        }
+        let script = format!(
+            "output.preview(single(\"annotate:liq_fade_in=\\\"2\\\",liq_fade_out=\\\"3\\\":{}\"))",
+            real.display()
+        );
+        let (_rt, res) = run(&script).expect("script runs");
+        let root = res.preview.expect("preview source");
+        assert_eq!(
+            root.crossfade_overrides(),
+            Some((Some(2.0), Some(3.0))),
+            "annotate fades must reach the mixer"
+        );
+    }
+
+    #[test]
+    fn request_dynamic_invokes_the_lua_callback_until_nil() {
+        // Two unresolvable requests are skipped, then nil ends the source.
+        // The audio thread polls the reply (never blocks), so the test
+        // drives the Lua event loop with drain_metadata on silent pulls.
+        let (rt, res) = run(
+            r#"
+            n = 0
+            d = request.dynamic(function()
+                n = n + 1
+                if n <= 2 then return "/definitely/not/here.mp3" else return nil end
+            end)
+            output.preview(d)
+            "#,
+        )
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        let mut pulls = 0;
+        while pulls < 500 && !root.is_exhausted() {
+            let n = root.next_buffer(&mut buf);
+            pulls += 1;
+            if n == 0 {
+                rt.drain_metadata();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert!(root.is_exhausted(), "source must end when the callback returns nil");
+        assert_eq!(
+            rt.global::<i64>("n").expect("lua n"),
+            3,
+            "callback must run once per request, ending on the nil"
+        );
+    }
+
+    #[test]
+    fn request_dynamic_plays_resolved_requests_in_order() {
+        // A real (generated) Opus file plays, then the callback's nil ends
+        // the source after the file finishes.
+        let dest = std::env::temp_dir().join("crabsoup-test-dynamic.opus");
+        write_test_opus(&dest, 0.3);
+        let script = format!(
+            r#"
+            n = 0
+            d = request.dynamic(function()
+                n = n + 1
+                if n == 1 then return "{path}" else return nil end
+            end)
+            output.preview(d)
+            "#,
+            path = dest.display()
+        );
+        let (rt, res) = run(&script).expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        let mut total = 0usize;
+        let mut silent_pulls = 0;
+        while !root.is_exhausted() && silent_pulls < 50 {
+            let n = root.next_buffer(&mut buf);
+            if n == 0 {
+                silent_pulls += 1;
+                rt.drain_metadata();
+                std::thread::sleep(Duration::from_millis(1));
+            } else {
+                silent_pulls = 0;
+            }
+            total += n;
+        }
+        let _ = std::fs::remove_file(&dest);
+        // 0.3 s stereo at 44.1 kHz = 26460 samples; the whole window plays.
+        assert!(total >= 26_000, "generated track not played (total {total})");
+        assert!(root.is_exhausted(), "source must end after the nil");
+        // Exactly two callback invocations: the file request and the nil.
+        assert_eq!(
+            rt.global::<i64>("n").expect("lua n"),
+            2,
+            "callback must run for the file and then the nil"
+        );
+    }
+
+    /// Encode a short sine into an Opus file at `path` (test helper).
+    fn write_test_opus(path: &std::path::Path, seconds: f64) {
+        use crate::output::encoder::{Encoder, OpusEncoder};
+        let mut enc = OpusEncoder::new(44_100, 2, 128_000, "test").expect("encoder");
+        let frames = (seconds * 44_100.0) as usize;
+        let mut out = Vec::new();
+        let mut pcm = Vec::with_capacity(1024);
+        for f in 0..frames {
+            let v = (f as f64 * 2.0 * std::f64::consts::PI * 440.0 / 44_100.0).sin() as f32 * 0.5;
+            pcm.extend_from_slice(&[v, v]);
+            if pcm.len() >= 1024 {
+                out.extend_from_slice(&enc.encode(&pcm));
+                pcm.clear();
+            }
+        }
+        if !pcm.is_empty() {
+            out.extend_from_slice(&enc.encode(&pcm));
+        }
+        out.extend_from_slice(&enc.finish());
+        std::fs::write(path, out).expect("write opus");
+    }
+
+    #[test]
     fn request_queue_registers_and_is_shared_with_the_control_port() {
         let (_rt, res) = run(
             r#"
@@ -1694,7 +2475,7 @@ mod tests {
         assert_eq!(root.label().as_deref(), Some("sine 440 Hz"));
 
         // Pushing a request mid-stream: the queue preempts on the next pull.
-        queue.push(RequestUri::Local(real.clone()));
+        queue.push(RequestUri::Local(real.clone(), None));
         let n = root.next_buffer(&mut buf);
         assert!(n > 0);
         assert_eq!(

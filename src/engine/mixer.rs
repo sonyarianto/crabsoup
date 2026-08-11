@@ -17,6 +17,11 @@ struct Tail {
     total: usize,
 }
 
+/// Points in the fade-curve lookup table. 2048 samples with linear
+/// interpolation is smooth enough for any fade curve and replaces the two
+/// `powf` calls per sample that made the mixing path ~200x the copy path.
+const CURVE_TABLE_SIZE: usize = 2048;
+
 /// A gapless track-to-track crossfade mixer.
 ///
 /// Holds the currently-playing source and lazily preloads the *next* source
@@ -34,9 +39,15 @@ pub struct CrossfadeMixer {
     next: Option<Box<dyn AudioSource>>,
     active_label: String,
     next_label: Option<String>,
-    crossfade_frames: usize,
+    /// Global crossfade window (seconds); per-track overrides replace it.
     crossfade_seconds: f64,
-    curve: f64,
+    /// The current transition's overlap window (frames): a per-track
+    /// `(fade_in, fade_out)` override replaces the global when present,
+    /// re-derived at every preload.
+    fade_frames: usize,
+    sample_rate: u32,
+    /// `f(t) = t^fade_curve` sampled at `CURVE_TABLE_SIZE + 1` points.
+    curve_table: Vec<f32>,
     channels: usize,
     fade_pos: usize,
     tail: Option<Tail>,
@@ -54,15 +65,22 @@ impl CrossfadeMixer {
         sample_rate: u32,
         channels: usize,
     ) -> Self {
+        let cf = (config.crossfade_seconds * sample_rate as f64).max(1.0) as usize;
         Self {
             provider,
             active: Box::new(SilenceSource::new()),
             next: None,
             active_label: String::new(),
             next_label: None,
-            crossfade_frames: (config.crossfade_seconds * sample_rate as f64).max(1.0) as usize,
             crossfade_seconds: config.crossfade_seconds,
-            curve: config.fade_curve,
+            fade_frames: cf,
+            sample_rate,
+            curve_table: (0..=CURVE_TABLE_SIZE)
+                .map(|k| {
+                    let t = k as f64 / CURVE_TABLE_SIZE as f64;
+                    t.powf(config.fade_curve) as f32
+                })
+                .collect(),
             channels,
             fade_pos: 0,
             tail: None,
@@ -70,6 +88,16 @@ impl CrossfadeMixer {
             scratch_a: Vec::new(),
             scratch_b: Vec::new(),
         }
+    }
+
+    /// Seconds before the active track's end at which the next track must be
+    /// preloaded: the active track's `fade_out` override, else the global
+    /// window.
+    fn preload_margin(&self) -> f64 {
+        self.active
+            .crossfade_overrides()
+            .and_then(|(_, fo)| fo)
+            .unwrap_or(self.crossfade_seconds)
     }
 
     fn ensure_started(&mut self) {
@@ -87,11 +115,38 @@ impl CrossfadeMixer {
         if self.next.is_none() && self.provider.has_next() {
             let (src, label) = self.provider.next_source();
             log::info!("crossfade: preloading next track");
+            // Per-track fade override: the incoming track's `fade_in` wins,
+            // then the outgoing track's `fade_out`, then the global window.
+            let window = src
+                .crossfade_overrides()
+                .and_then(|(fi, _)| fi)
+                .or_else(|| {
+                    self.active
+                        .crossfade_overrides()
+                        .and_then(|(_, fo)| fo)
+                })
+                .unwrap_or(self.crossfade_seconds);
+            self.fade_frames = (window * self.sample_rate as f64).max(1.0) as usize;
             self.next = Some(src);
             self.next_label = Some(label);
             self.fade_pos = 0;
             self.tail = None;
         }
+    }
+
+    /// Interpolated fade-curve value at `t` in `[0, 1]`. For a linear curve
+    /// this is exact; for curved fades the interpolation error is far below
+    /// audibility.
+    fn curve_gain(&self, t: f32) -> f32 {
+        let pos = t * CURVE_TABLE_SIZE as f32;
+        let i = pos as usize;
+        if i >= CURVE_TABLE_SIZE {
+            return 1.0;
+        }
+        let frac = pos - i as f32;
+        let a = self.curve_table[i];
+        let b = self.curve_table[i + 1];
+        a + (b - a) * frac
     }
 }
 
@@ -100,10 +155,11 @@ impl AudioSource for CrossfadeMixer {
         loop {
             self.ensure_started();
 
-            // Preload the next source once the active track nears its end.
+            // Preload the next source once the active track nears its end
+            // (at the per-track fade-out margin, or the global window).
             if self.next.is_none() {
                 let due = match self.active.remaining_seconds() {
-                    Some(rem) => rem <= self.crossfade_seconds,
+                    Some(rem) => rem <= self.preload_margin(),
                     None => self.active.is_exhausted(),
                 };
                 if due {
@@ -158,13 +214,14 @@ impl AudioSource for CrossfadeMixer {
             let out_len = n_a.max(n_b);
                 let chans = self.channels;
             let frames_out = out_len / chans;
-            let cf = self.crossfade_frames.max(1) as f64;
+            let cf = self.fade_frames.max(1) as f64;
             for (i, out) in buffer.iter_mut().take(out_len).enumerate() {
                 let f = i / chans;
-                let t = ((self.fade_pos + f) as f64 / cf).clamp(0.0, 1.0);
-                let gain_b = t.powf(self.curve);
-                let gain_a = (1.0 - t).powf(self.curve);
-                *out = (self.scratch_a[i] as f64 * gain_a + self.scratch_b[i] as f64 * gain_b) as f32;
+                let t = ((self.fade_pos + f) as f64 / cf).clamp(0.0, 1.0) as f32;
+                let gain_b = self.curve_gain(t);
+                let gain_a = self.curve_gain(1.0 - t);
+                *out = (self.scratch_a[i] as f64 * gain_a as f64
+                    + self.scratch_b[i] as f64 * gain_b as f64) as f32;
             }
             self.fade_pos += frames_out;
 
@@ -172,12 +229,12 @@ impl AudioSource for CrossfadeMixer {
                     let promoted = self.next.take().expect("next must exist");
                 self.active = promoted;
                 self.active_label = self.next_label.take().unwrap_or_default();
-                if self.fade_pos < self.crossfade_frames {
-                        let remaining = self.crossfade_frames - self.fade_pos;
+                if self.fade_pos < self.fade_frames {
+                        let remaining = self.fade_frames - self.fade_pos;
                         let t_end = self.fade_pos as f64 / cf;
-                        let gain_b = t_end.powf(self.curve);
+                        let gain_b = self.curve_gain(t_end as f32);
                         self.tail = Some(Tail {
-                            start_gain: gain_b,
+                            start_gain: gain_b as f64,
                             remaining,
                             total: remaining,
                         });
@@ -207,6 +264,10 @@ impl AudioSource for CrossfadeMixer {
 
     fn replaygain_db(&self) -> Option<f32> {
         self.active.replaygain_db()
+    }
+
+    fn crossfade_overrides(&self) -> Option<(Option<f64>, Option<f64>)> {
+        self.active.crossfade_overrides()
     }
 
     /// Advance to the next track immediately, abandoning the current one.
@@ -474,6 +535,10 @@ impl AudioSource for PriorityMixer {
         // its own loudness.
         self.main.replaygain_db()
     }
+
+    fn crossfade_overrides(&self) -> Option<(Option<f64>, Option<f64>)> {
+        self.main.crossfade_overrides()
+    }
 }
 
 #[cfg(test)]
@@ -488,6 +553,7 @@ mod tests {
         value: f32,
         total_frames: usize,
         pos_frames: usize,
+        fades: Option<(Option<f64>, Option<f64>)>,
     }
 
     impl AudioSource for FakeSource {
@@ -509,6 +575,9 @@ mod tests {
         fn label(&self) -> Option<String> {
             Some(format!("src({})", self.value))
         }
+        fn crossfade_overrides(&self) -> Option<(Option<f64>, Option<f64>)> {
+            self.fades
+        }
     }
 
     struct FakeProvider {
@@ -524,6 +593,24 @@ mod tests {
                         value: v,
                         total_frames: total,
                         pos_frames: 0,
+                        fades: None,
+                    })
+                })
+                .collect();
+            Self { sources }
+        }
+
+        /// Like [`Self::new`], but each source carries a per-track fade
+        /// override.
+        fn with_fades(values: Vec<(f32, usize, Option<(Option<f64>, Option<f64>)>)>) -> Self {
+            let sources = values
+                .into_iter()
+                .map(|(v, total, fades)| -> Box<dyn AudioSource> {
+                    Box::new(FakeSource {
+                        value: v,
+                        total_frames: total,
+                        pos_frames: 0,
+                        fades,
                     })
                 })
                 .collect();
@@ -623,6 +710,7 @@ mod tests {
             value: 1.0,
             total_frames: 100_000,
             pos_frames: 0,
+            fades: None,
         });
         let cfg = mixer_config(0.1);
         let cfg = MixerConfig {
@@ -642,6 +730,7 @@ mod tests {
             value: 3.0,
             total_frames: 100_000,
             pos_frames: 0,
+            fades: None,
         };
         tx.send(MixCommand::SetLive(Box::new(dj))).unwrap();
 
@@ -710,6 +799,72 @@ mod tests {
     }
 
     #[test]
+    fn fade_out_override_moves_the_preload_and_lengthens_the_fade() {
+        // Global window is 0.2s (20 frames). Track A overrides fade_out to
+        // 0.4s, so the next track is preloaded 0.4s early (not 0.2s) and the
+        // overlap spans 40 frames. Buffers are 10 frames (0.1s).
+        let provider = Box::new(FakeProvider::with_fades(vec![
+            (1.0, 1000, Some((None, Some(0.4)))),
+            (2.0, 1000, None),
+        ]));
+        let cfg = mixer_config(0.2);
+        let mut mix = CrossfadeMixer::new(provider, &cfg, RATE as u32, CHANS);
+
+        let mut buf = vec![0f32; 10 * CHANS];
+        // Buffers 1..=96: A has more than 0.4s left -> passthrough.
+        for _ in 0..96 {
+            mix.next_buffer(&mut buf);
+            assert!((buf[0] - 1.0).abs() < 1e-6);
+        }
+        // Buffer 97: A has 0.4s left -> preload, fade begins (t=0).
+        mix.next_buffer(&mut buf);
+        assert!((buf[0] - 1.0).abs() < 1e-6);
+        // Buffer 98: t=0.25 -> 0.75*A + 0.25*B = 1.25. (With the global 20
+        // frame window this would already be t=0.5 -> 1.5.)
+        mix.next_buffer(&mut buf);
+        assert!((buf[0] - 1.25).abs() < 1e-6);
+        mix.next_buffer(&mut buf);
+        assert!((buf[0] - 1.5).abs() < 1e-6);
+        mix.next_buffer(&mut buf);
+        assert!((buf[0] - 1.75).abs() < 1e-6);
+        // Buffer 101: fade complete (40 frames), B at full gain.
+        mix.next_buffer(&mut buf);
+        assert!((buf[0] - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn incoming_fade_in_override_lengthens_the_fade_into_a_tail_ramp() {
+        // Track B overrides fade_in to 0.4s while A keeps the global 0.2s
+        // margin: the fade window is 40 frames but A only has 20 frames left
+        // when it starts, so the remainder is finished by the tail ramp.
+        let provider = Box::new(FakeProvider::with_fades(vec![
+            (1.0, 1000, None),
+            (2.0, 1000, Some((Some(0.4), None))),
+        ]));
+        let cfg = mixer_config(0.2);
+        let mut mix = CrossfadeMixer::new(provider, &cfg, RATE as u32, CHANS);
+
+        let mut buf = vec![0f32; 10 * CHANS];
+        for _ in 0..98 {
+            mix.next_buffer(&mut buf);
+        }
+        // Buffer 99: A has 0.2s left -> preload, fade begins (t=0).
+        mix.next_buffer(&mut buf);
+        assert!((buf[0] - 1.0).abs() < 1e-6);
+        // Buffer 100: t=0.25 -> 1.25 (40-frame window; a 20-frame window
+        // would give 1.5). A exhausts here -> promoted mid-fade.
+        mix.next_buffer(&mut buf);
+        assert!((buf[0] - 1.25).abs() < 1e-6);
+        // Buffer 101: tail ramp starts at gain 0.5 (t=0.5 when promoted).
+        mix.next_buffer(&mut buf);
+        assert!((buf[0] - 1.0).abs() < 1e-6);
+        // Tail finished, B at full gain.
+        mix.next_buffer(&mut buf);
+        mix.next_buffer(&mut buf);
+        assert!((buf[0] - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
     fn status_handle_reports_current_and_uptime() {
         let status = StatusHandle::new();
         status.set_current("a track");
@@ -723,6 +878,7 @@ mod tests {
             value: 1.0,
             total_frames: 100_000,
             pos_frames: 0,
+            fades: None,
         });
         let cfg = mixer_config(0.2);
         let spec = symphonia::core::audio::SignalSpec::new(
@@ -800,7 +956,7 @@ mod tests {
         files.sort();
         let files: Vec<_> = files
             .into_iter()
-            .map(crate::request::RequestUri::Local)
+            .map(|p| crate::request::RequestUri::Local(p, None))
             .collect();
         let playlist = crate::source::playlist::Playlist::new(
             files,

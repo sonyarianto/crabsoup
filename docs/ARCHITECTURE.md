@@ -33,9 +33,17 @@ One engine thread plus one thread per output:
 
 - Registers the Liquidsoap-flavoured Lua stdlib: `playlist`, `single`,
   `blank`, `sine`, `amplify`, `compress`, `normalize`, `jingles`,
-  `fallback`/`sequence`/`random`, `switch`, `rotate`, `input.harbor`,
-  `output.icecast`, `output.file`, `output.preview`, `server.telnet`,
-  `on_metadata`, `on_track`, `set`, `log`.
+  `fallback`/`sequence`/`random`, `switch`, `rotate`, `mksafe`, `add`,
+  `cue_cut`, `input.harbor`, `output.icecast`, `output.file`,
+  `output.preview`, `server.telnet`, `on_metadata`, `on_track`, `set`,
+  `log`.
+- `add({a, b}, {weights = {0.5, 1.0}})` sums N children sample-by-sample
+  (`AddSource`): the first child writes straight into the output buffer,
+  the rest pull into a reusable scratch that is added in (no per-call
+  allocation); optional weights scale each child, mismatched counts are
+  rejected. Exhausts only when every child exhausts, so a looping bed keeps
+  a finite voice-over mix alive; label/remaining/replaygain come from the
+  first child, `skip` forwards to all children.
 - Sources are Lua userdata wrapping `Arc<Mutex<Box<dyn AudioSource>>>` so they
   compose; `LuaSource::take` steals the box via `mem::replace` (mlua keeps a
   clone on the stack during the call, so `Arc::try_unwrap` would fail).
@@ -55,6 +63,16 @@ One engine thread plus one thread per output:
   *any* track boundary: label change (even to `None`) or a resume after a
   non-exhausted silence — both hook registries are separate vectors, so a
   `Track` event never reaches an `on_metadata` callback.
+- `request.dynamic(fn)` extends the same event-loop pattern to live
+  request scheduling: `DynamicRequestSource` asks the Lua-owning thread for
+  the next request URI via `ScriptEvent::NextRequest { index, reply }` and
+  polls the reply with `try_recv` (the audio thread never blocks — it
+  returns silence while a reply is outstanding). The next URI is requested
+  as soon as a track is promoted, so a fast callback gives gapless
+  handovers; nil ends the source; unresolvable requests are skipped and
+  re-asked. Request URIs resolve through `resolve()` like every other
+  request (annotate, http download), so a `request.dynamic` callback can
+  feed paths or URLs.
 - `server.register(name, fn)` extends the same event-loop pattern to telnet:
   `ScriptResult.custom_commands` mirrors the registered names (registration
   order = index into the runtime's callback vec) into the control port's
@@ -76,14 +94,29 @@ One engine thread plus one thread per output:
 
 ## Request protocols (`src/request.rs`)
 
-- `RequestUri` (`Local(PathBuf)` | `Url(String)`): `single`, `playlist`
-  entries, and the telnet request queue all carry URIs and resolve at
-  play time via `resolve()`. `Local` opens a `FileSource`; `Url` downloads
-  to `$TMPDIR/crabsoup-requests/{fnv1a}-{n}.part` (stable per-URL name +
+- `RequestUri` (`Local(PathBuf, Option<TrackCues>)` | `Url(String,
+  Option<TrackCues>)`): `single`, `playlist` entries, and the telnet
+  request queue all carry URIs and resolve at play time via `resolve()`.
+  `new()` parses a Liquidsoap-style `annotate:` prefix (`liq_cue_in`,
+  `liq_cue_out`, `liq_fade_in`, `liq_fade_out`) into a `TrackCues`;
+  malformed prefixes fall back to the plain URI. `TrackCues` holds `f64`s,
+  so `RequestUri`'s `Eq`/`Ord` are hand-written (`None` < `Some`, values
+  by `total_cmp`). `Local` opens a `FileSource`; `Url` downloads to
+  `$TMPDIR/crabsoup-requests/{fnv1a}-{n}.part` (stable per-URL name +
   per-process counter so concurrent same-URL downloads can't collide, and a
   playlist loop re-requesting the URL re-downloads it) and wraps the file
   in `DownloadSource`, whose `Drop` removes the temp file — a killed process
   leaks `.part` files by design.
+- Requests carrying cue points are wrapped in `CueCutSource`
+  (`src/source/cue_cut.rs`) by `resolve()`: it skips `cue_in` seconds at
+  each track start and reports exhaustion at `cue_out`, so playlists,
+  `single`, and `queue.push` all honor `annotate:` windows with no extra
+  wiring. The `cue_cut(src, opts)` operator wraps any source the same way;
+  the window re-arms on every child label change (one `cue_cut` around a
+  playlist trims every track). `CueCutSource` also reports per-track
+  crossfade overrides via `AudioSource::crossfade_overrides()` (its
+  `fade_in`/`fade_out`), and `apply_cues` wraps even when *only* fades are
+  set, so `annotate:liq_fade_in=...` alone reaches the mixer.
 - The HTTP client is stdlib-only: single connect per attempt, up to 4
   redirects (`Location` resolved absolute/root/relative against the request
   URL), `Content-Length` and chunked bodies, connection-close fallback,
@@ -116,6 +149,14 @@ One engine thread plus one thread per output:
 
 ## Mixer control (`src/engine/mixer.rs`)
 
+- `CrossfadeMixer` sizes each transition's overlap window at preload time:
+  the incoming track's `fade_in` override, else the outgoing track's
+  `fade_out`, else  the global `crossfade_seconds` (frames re-derived per preload into a
+  `fade_frames` field). The preload margin uses the
+  outgoing track's `fade_out` too, so an annotated track starts its fade
+  early enough; a `fade_in` longer than the margin degrades into the tail
+  ramp, same as a track ending mid-fade. No override ⇒ global window,
+  byte-identical to before.
 - `MixCommand` is the mixer control channel (`SetLive`, `ClearLive`,
   `PlayJingle(PathBuf)`, `Skip`, `Shutdown`) over `std::sync::mpsc`; the
   harbor and control port send into it. `Skip` calls `AudioSource::skip()`

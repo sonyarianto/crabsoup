@@ -7,7 +7,8 @@ Opus) to an Icecast server.
 
 - `.lua` scripting: real Lua with Liquidsoap-style functions — `playlist`,
   `single`, `blank`, `sine`, `amplify`, `compress`, `normalize`, `fallback`,
-  `sequence`, `random`, `switch`, `rotate`, `jingles`, `input.harbor`,
+  `sequence`, `random`, `switch`, `rotate`, `jingles`, `mksafe`, `add`,
+  `cue_cut`, `request.queue`, `request.dynamic`, `input.harbor`,
   `output.icecast`, `output.preview`, `server.telnet`, `set`, `log`
 - Playlist scheduling: recursive directory scan, explicit file lists, loop and shuffle
 - Gapless crossfades with configurable overlap and fade curve
@@ -113,14 +114,26 @@ Named options are passed as Lua tables; most have defaults. `format` is
 `"mp3"` or `"opus"`. Composable sources: `playlist`, `single`, `jingles`,
 `fallback`/`sequence`, `random` (non-repeating shuffle), `switch`
  (dayparting), `rotate` (weighted round-robin), `blank`/`sine`
- (test tones, both accept an optional `duration`), and the DSP operators
- `amplify(source, gain)`, `compress(source, opts)`, `normalize(source, opts)`
+ (test tones, both accept an optional `duration`), `mksafe(src)`
+ (never fails outright — silence covers an exhausted or failed child),
+ `add({a, b}, {weights = {...}})`
+ (N-source sample-wise sum, optional per-source weights — background bed +
+ voice-over), `cue_cut(src, {cue_in, cue_out, fade_in, fade_out})`
+ (skip `cue_in` seconds into each track, end it at `cue_out`; a per-track
+ `fade_in`/`fade_out` overrides the global `crossfade_seconds` for that
+ track's crossfades),
+ and
+ the DSP operators `amplify(source, gain)`, `compress(source, opts)`,
+ `normalize(source, opts)`
  (run inline in the pull chain). `replaygain(source, opts)` applies a
  per-track constant gain from the file's `REPLAYGAIN_TRACK_GAIN` tag
  (`REPLAYGAIN_ALBUM_GAIN` as fallback; MP3 ID3v2 and Ogg Vorbis comments),
  clamped to ±`max_boost`/`max_cut` dB (default 12 each, unity when
  untagged) — compose `normalize(replaygain(src))` to feed AGC the loudness
- baseline. `output.preview(...)` runs without broadcasting.
+ baseline. `request.dynamic(function() return uri_or_nil end)` plays the
+ requests its Lua callback returns, one ahead of the current track (nil
+ ends the source) — a live-programming scheduler without a playlist file.
+ `output.preview(...)` runs without broadcasting.
 
 Dayparting with `switch` — slots with a `when` predicate (weekday `days` as
 names or 0-6, `from`/`to` in `"HH:MM"`, overnight windows wrap; `from == to`
@@ -183,6 +196,11 @@ phase).
 | `on_metadata` / `on_track` | `on_metadata(fn, src)` (title table), `on_track(fn, src)` (boundary, no args) | done |
 | `http://` request resolution | `single("http://...")`, `playlist(entries)`, `queue.push <url>` — download-then-play with retry/timeout, temp files auto-removed | done |
 | `server.register` custom telnet commands | `server.register("name", function(args) return reply end)` | done |
+| `mksafe(src)` (never fails outright; silence fallback) | `mksafe(src)` — composes `fallback({src, blank()})` | done |
+| `add([...])` (N-source additive mix) | `add({a, b}, {weights = {0.5, 1.0}})` — sample-wise sum, bed + voice-over | done |
+| `request.dynamic(fn)` | `request.dynamic(function() return "media/track.mp3" end)` — callback-driven requests, nil ends | done |
+| `annotate:` cue points + `cue_cut(src)` | `annotate:liq_cue_in="30",liq_cue_out="180":/path/track.mp3` on any request URI; `cue_cut(src, {cue_in, cue_out})` | done |
+| per-track crossfade (`liq_fade_in`/`liq_fade_out`) | `annotate:liq_fade_in="2",liq_fade_out="3":...` or `cue_cut(src, {fade_in, fade_out})` — overrides `crossfade_seconds` per track | done |
 
 ## Testing
 

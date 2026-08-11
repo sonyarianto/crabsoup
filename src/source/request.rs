@@ -177,6 +177,10 @@ impl AudioSource for RequestQueueSource {
     fn replaygain_db(&self) -> Option<f32> {
         self.current.as_ref().and_then(|c| c.replaygain_db())
     }
+
+    fn crossfade_overrides(&self) -> Option<(Option<f64>, Option<f64>)> {
+        self.current.as_ref().and_then(|c| c.crossfade_overrides())
+    }
 }
 
 #[cfg(test)]
@@ -228,7 +232,7 @@ mod tests {
     fn plays_a_pushed_real_file() {
         // A short jingle (~12 s) so the test can drain the track fully.
         let real = RequestUri::new("jingles/mrwashingt0n-simple-radio-jingle-501090.mp3");
-        let RequestUri::Local(path) = &real else {
+        let RequestUri::Local(path, _) = &real else {
             return;
         };
         if !path.exists() {

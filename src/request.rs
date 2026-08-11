@@ -14,6 +14,8 @@ use std::time::Duration;
 
 use log::warn;
 
+use crate::source::cue_cut::CueCutSource;
+
 /// Download settings, configurable through `set("request_timeout", ...)` /
 /// `set("request_retries", ...)`.
 #[derive(Clone, Copy, Debug)]
@@ -43,44 +45,203 @@ impl RequestConfig {
     }
 }
 
-/// A media item: a local file path or an HTTP(S) URL. URLs are downloaded to
-/// a temp file when resolved.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+/// Per-track cue points, from an `annotate:` URI prefix or the `cue_cut`
+/// operator. `cue_in`/`cue_out` bound the audible window (absolute seconds
+/// into the track); `fade_in`/`fade_out` override the global crossfade for
+/// this track (Part D step 2 — parsed here, consumed by `CrossfadeMixer`
+/// later).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TrackCues {
+    /// Skip this many seconds into the track before audio starts.
+    pub cue_in: f64,
+    /// End the track this many seconds in (early exhaustion); `None` = play
+    /// to the natural end.
+    pub cue_out: Option<f64>,
+    /// Per-track crossfade fade-in override in seconds, if set.
+    pub fade_in: Option<f64>,
+    /// Per-track crossfade fade-out override in seconds, if set.
+    pub fade_out: Option<f64>,
+}
+
+/// A media item: a local file path or an HTTP(S) URL, with optional per-track
+/// cue points from an `annotate:` prefix. URLs are downloaded to a temp file
+/// when resolved.
+#[derive(Clone, Debug)]
 pub enum RequestUri {
-    Local(PathBuf),
-    Url(String),
+    Local(PathBuf, Option<TrackCues>),
+    Url(String, Option<TrackCues>),
 }
 
 impl RequestUri {
     pub fn new(uri: &str) -> Self {
-        if uri.starts_with("http://") || uri.starts_with("https://") {
-            Self::Url(uri.to_string())
+        let (bare, cues) = parse_annotate(uri);
+        if bare.starts_with("http://") || bare.starts_with("https://") {
+            Self::Url(bare.to_string(), cues)
         } else {
-            Self::Local(uri.into())
+            Self::Local(bare.into(), cues)
         }
     }
 
     /// The value as given (full path or full URL) for queue listings.
     pub fn raw(&self) -> String {
         match self {
-            Self::Local(path) => path.display().to_string(),
-            Self::Url(url) => url.clone(),
+            Self::Local(path, _) => path.display().to_string(),
+            Self::Url(url, _) => url.clone(),
         }
     }
 
     /// Short display label for status/metadata (last path segment).
     pub fn display(&self) -> String {
         match self {
-            Self::Local(path) => path
+            Self::Local(path, _) => path
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.display().to_string()),
-            Self::Url(url) => url
+            Self::Url(url, _) => url
                 .split(['/', '?'])
                 .next_back()
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| url.to_string()),
+        }
+    }
+}
+
+impl PartialEq for RequestUri {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Local(a, ca), Self::Local(b, cb)) => a == b && ca == cb,
+            (Self::Url(a, ca), Self::Url(b, cb)) => a == b && ca == cb,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for RequestUri {}
+
+impl PartialOrd for RequestUri {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RequestUri {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match (self, other) {
+            (Self::Local(a, ca), Self::Local(b, cb)) => a.cmp(b).then_with(|| cmp_cues(ca, cb)),
+            (Self::Url(a, ca), Self::Url(b, cb)) => a.cmp(b).then_with(|| cmp_cues(ca, cb)),
+            (Self::Local(..), Self::Url(..)) => Ordering::Less,
+            (Self::Url(..), Self::Local(..)) => Ordering::Greater,
+        }
+    }
+}
+
+fn cmp_cues(a: &Option<TrackCues>, b: &Option<TrackCues>) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        (Some(x), Some(y)) => cmp_opt(&x.cue_out, &y.cue_out)
+            .then_with(|| cmp_opt(&x.fade_in, &y.fade_in))
+            .then_with(|| cmp_opt(&x.fade_out, &y.fade_out))
+            .then_with(|| x.cue_in.total_cmp(&y.cue_in)),
+    }
+}
+
+fn cmp_opt(a: &Option<f64>, b: &Option<f64>) -> std::cmp::Ordering {
+    match (a, b) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (Some(x), Some(y)) => x.total_cmp(y),
+    }
+}
+
+/// Parse a Liquidsoap-style `annotate:` prefix: `key="value",key="value":<uri>`.
+/// Recognized keys are `liq_cue_in`, `liq_cue_out`, `liq_fade_in`,
+/// `liq_fade_out`; other keys are ignored (they carry arbitrary metadata in
+/// Liquidsoap). Returns the bare URI and any cue points. Malformed prefixes
+/// fall back to the whole string as a plain URI with no cues.
+fn parse_annotate(uri: &str) -> (String, Option<TrackCues>) {
+    let Some(rest) = uri.strip_prefix("annotate:") else {
+        return (uri.to_string(), None);
+    };
+    let mut cues = TrackCues::default();
+    let mut found = false;
+    let mut cursor = 0usize;
+    let bytes = rest.as_bytes();
+    loop {
+        // Key: alphanumerics + underscore.
+        let key_start = cursor;
+        while cursor < bytes.len()
+            && (bytes[cursor].is_ascii_alphanumeric() || bytes[cursor] == b'_')
+        {
+            cursor += 1;
+        }
+        if key_start == cursor {
+            return (uri.to_string(), None); // no key: malformed
+        }
+        let key = &rest[key_start..cursor];
+        if cursor >= bytes.len() || bytes[cursor] != b'=' {
+            return (uri.to_string(), None);
+        }
+        cursor += 1;
+        if cursor >= bytes.len() || bytes[cursor] != b'"' {
+            return (uri.to_string(), None);
+        }
+        cursor += 1;
+        let val_start = cursor;
+        while cursor < bytes.len() && bytes[cursor] != b'"' {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() {
+            return (uri.to_string(), None); // unterminated value
+        }
+        let value = &rest[val_start..cursor];
+        cursor += 1; // closing quote
+        // Only finite, normalized values become cues: `inf` would saturate
+        // the sample skip to usize::MAX (silent endless skip) and NaN/-0.0
+        // break the Eq/Ord consistency of `TrackCues` (total_cmp vs ==).
+        if let Ok(v) = value.parse::<f64>()
+            && v.is_finite()
+        {
+            let v = if v == 0.0 { 0.0 } else { v }; // -0.0 == 0.0, same in total_cmp
+            match key {
+                "liq_cue_in" => {
+                    cues.cue_in = v;
+                    found = true;
+                }
+                "liq_cue_out" => {
+                    cues.cue_out = Some(v);
+                    found = true;
+                }
+                "liq_fade_in" => {
+                    cues.fade_in = Some(v);
+                    found = true;
+                }
+                "liq_fade_out" => {
+                    cues.fade_out = Some(v);
+                    found = true;
+                }
+                _ => {} // unknown annotate key: carried but ignored
+            }
+        }
+        // Separator: ',' continues metadata, ':' starts the URI.
+        if cursor >= bytes.len() {
+            return (uri.to_string(), None);
+        }
+        match bytes[cursor] {
+            b',' => cursor += 1,
+            b':' => {
+                let bare = &rest[cursor + 1..];
+                if bare.is_empty() {
+                    return (uri.to_string(), None);
+                }
+                return (bare.to_string(), found.then_some(cues));
+            }
+            _ => return (uri.to_string(), None),
         }
     }
 }
@@ -134,8 +295,32 @@ impl crate::source::AudioSource for DownloadSource {
         self.inner.replaygain_db()
     }
 
+    fn crossfade_overrides(&self) -> Option<(Option<f64>, Option<f64>)> {
+        self.inner.crossfade_overrides()
+    }
+
     fn skip(&mut self) {
         self.inner.skip();
+    }
+}
+
+/// Wrap a resolved source in [`CueCutSource`] when the request carries cue
+/// points or fade overrides; otherwise return it unchanged.
+fn apply_cues(
+    src: Box<dyn crate::source::AudioSource>,
+    cues: Option<TrackCues>,
+    target: symphonia::core::audio::SignalSpec,
+) -> Box<dyn crate::source::AudioSource> {
+    match cues {
+        Some(c)
+            if c.cue_in > 0.0
+                || c.cue_out.is_some()
+                || c.fade_in.is_some()
+                || c.fade_out.is_some() =>
+        {
+            Box::new(CueCutSource::new(src, c, target.rate, target.channels.count()))
+        }
+        _ => src,
     }
 }
 
@@ -149,12 +334,16 @@ pub fn resolve(
     frames_per_buffer: usize,
 ) -> crate::Result<Box<dyn crate::source::AudioSource>> {
     match uri {
-        RequestUri::Local(path) => open_audio(path, target, frames_per_buffer),
-        RequestUri::Url(url) => {
+        RequestUri::Local(path, cues) => {
+            let src = open_audio(path, target, frames_per_buffer)?;
+            Ok(apply_cues(src, *cues, target))
+        }
+        RequestUri::Url(url, cues) => {
             let tmp = temp_path(url);
             download(url, &tmp, config)?;
             let src = open_audio(&tmp, target, frames_per_buffer)?;
-            Ok(Box::new(DownloadSource::new(src, tmp, uri.display())))
+            let src = Box::new(DownloadSource::new(src, tmp, uri.display()));
+            Ok(apply_cues(src, *cues, target))
         }
     }
 }
@@ -517,17 +706,121 @@ mod tests {
     fn request_uri_classifies_and_displays() {
         assert_eq!(
             RequestUri::new("media/a.mp3"),
-            RequestUri::Local("media/a.mp3".into())
+            RequestUri::Local("media/a.mp3".into(), None)
         );
         assert_eq!(
             RequestUri::new("http://x.example/track.mp3"),
-            RequestUri::Url("http://x.example/track.mp3".into())
+            RequestUri::Url("http://x.example/track.mp3".into(), None)
         );
         assert_eq!(
             RequestUri::new("http://x.example/track.mp3").display(),
             "track.mp3"
         );
         assert_eq!(RequestUri::new("media/a.mp3").display(), "a");
+    }
+
+    #[test]
+    fn annotate_prefix_parses_cue_points_and_strips_to_the_uri() {
+        let uri = RequestUri::new(
+            "annotate:liq_cue_in=\"30\",liq_cue_out=\"180\":media/a.mp3",
+        );
+        assert_eq!(
+            uri,
+            RequestUri::Local(
+                "media/a.mp3".into(),
+                Some(TrackCues {
+                    cue_in: 30.0,
+                    cue_out: Some(180.0),
+                    fade_in: None,
+                    fade_out: None,
+                })
+            )
+        );
+        assert_eq!(uri.raw(), "media/a.mp3");
+        assert_eq!(uri.display(), "a");
+    }
+
+    #[test]
+    fn annotate_prefix_handles_http_uris_and_ignores_unknown_keys() {
+        let uri = RequestUri::new(
+            "annotate:title=\"intro\",liq_cue_in=\"5\":http://x.example/track.mp3",
+        );
+        assert_eq!(
+            uri,
+            RequestUri::Url(
+                "http://x.example/track.mp3".into(),
+                Some(TrackCues {
+                    cue_in: 5.0,
+                    cue_out: None,
+                    fade_in: None,
+                    fade_out: None,
+                })
+            )
+        );
+    }
+
+    #[test]
+    fn fade_only_annotate_carries_the_overrides() {
+        // No cue points, just fade overrides: parsed and reported for the
+        // CrossfadeMixer (step 2).
+        let uri = RequestUri::new("annotate:liq_fade_in=\"2\",liq_fade_out=\"3\":media/a.mp3");
+        assert_eq!(
+            uri,
+            RequestUri::Local(
+                "media/a.mp3".into(),
+                Some(TrackCues {
+                    cue_in: 0.0,
+                    cue_out: None,
+                    fade_in: Some(2.0),
+                    fade_out: Some(3.0),
+                })
+            )
+        );
+    }
+
+    #[test]
+    fn malformed_annotate_prefix_falls_back_to_a_plain_uri() {
+        // No separating ':' after the metadata: treat as a plain path.
+        let uri = RequestUri::new("annotate:liq_cue_in=\"30\"");
+        assert_eq!(
+            uri,
+            RequestUri::Local("annotate:liq_cue_in=\"30\"".into(), None)
+        );
+        // Unknown keys only: no cues (metadata is not acted on).
+        let uri = RequestUri::new("annotate:title=\"x\":/path/a.mp3");
+        assert_eq!(uri, RequestUri::Local("/path/a.mp3".into(), None));
+    }
+
+    #[test]
+    fn non_finite_cue_values_are_ignored() {
+        // `inf`/`NaN` would corrupt the sample-count math (and break the
+        // Eq/Ord consistency of TrackCues), so they must not become cues.
+        for bad in ["inf", "-inf", "NaN"] {
+            let uri = RequestUri::new(&format!(
+                "annotate:liq_cue_in=\"{bad}\":media/a.mp3"
+            ));
+            assert_eq!(
+                uri,
+                RequestUri::Local("media/a.mp3".into(), None),
+                "{bad} must not be accepted as a cue value"
+            );
+        }
+        // A good value next to a bad one still applies.
+        let uri = RequestUri::new(
+            "annotate:liq_cue_in=\"inf\",liq_cue_out=\"5\":media/a.mp3",
+        );
+        assert_eq!(
+            uri,
+            RequestUri::Local(
+                "media/a.mp3".into(),
+                Some(TrackCues {
+                    cue_in: 0.0,
+                    cue_out: Some(5.0),
+                    fade_in: None,
+                    fade_out: None,
+                })
+            )
+        );
     }
 
     #[test]

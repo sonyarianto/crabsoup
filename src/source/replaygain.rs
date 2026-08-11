@@ -76,6 +76,10 @@ impl AudioSource for ReplayGainSource {
         self.child.label()
     }
 
+    fn crossfade_overrides(&self) -> Option<(Option<f64>, Option<f64>)> {
+        self.child.crossfade_overrides()
+    }
+
     fn skip(&mut self) {
         self.child.skip();
     }

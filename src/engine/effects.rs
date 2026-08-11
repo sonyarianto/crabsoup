@@ -51,6 +51,10 @@ impl<E: Effect> AudioSource for EffectSource<E> {
         self.child.replaygain_db()
     }
 
+    fn crossfade_overrides(&self) -> Option<(Option<f64>, Option<f64>)> {
+        self.child.crossfade_overrides()
+    }
+
     fn skip(&mut self) {
         self.child.skip();
     }

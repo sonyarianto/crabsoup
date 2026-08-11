@@ -1,3 +1,4 @@
+pub mod cue_cut;
 pub mod file;
 pub mod opus;
 pub mod playlist;
@@ -36,6 +37,15 @@ pub trait AudioSource: Send {
     /// `None` = no tags (0 dB applied). Read once per track, at
     /// construction.
     fn replaygain_db(&self) -> Option<f32> {
+        None
+    }
+
+    /// Per-track crossfade override in seconds: `(fade_in, fade_out)` of the
+    /// current track, from `annotate:` / `cue_cut`. Each inner `None` = fall
+    /// back to the global `crossfade_seconds` for that edge; the outer
+    /// `None` = no overrides at all. Consumed by [`CrossfadeMixer`] to size
+    /// each transition's overlap window.
+    fn crossfade_overrides(&self) -> Option<(Option<f64>, Option<f64>)> {
         None
     }
 

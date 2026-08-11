@@ -96,8 +96,8 @@ anchors for later phases.
 
 | benchmark | per 92.9 ms buffer | vs real-time |
 |---|---|---|
-| mixers/crossfade/passthrough | 2 µs | 0.002 % |
-| mixers/crossfade/mixing (worst case: always crossfading) | 390 µs | 0.42 % |
+| mixers/crossfade/passthrough | 1.2 µs | 0.001 % |
+| mixers/crossfade/mixing (worst case: always crossfading) | 107 µs | 0.12 % |
 | mixers/priority/passthrough | 7 µs | 0.008 % |
 | mixers/priority/ducking (SetLive per buffer) | 9 µs | 0.01 % |
 | effects/compressor+agc+amplify | 604 µs | 0.65 % |
@@ -107,12 +107,14 @@ anchors for later phases.
 | encode/opus (128 kbps) | 1114 µs | 1.20 % |
 | encode/aac (128 kbps) | 269 µs | 0.29 % |
 
-Full path (crossfade + compressor/agc/amplify + resample + encode) ≈ 2.9 ms
-per 92.9 ms buffer ≈ 3 % of one core. The only hotspot worth attacking is
-`CrossfadeMixer`'s mixing loop: two `f64::powf` per sample make the mix path
-~200x the copy path — a power-curve lookup table or `f32` powf would cut it
-most. SIMD on the resampler/effects loops is not justified until these are
-the bottleneck (they are far from it: total chain ≈ 3 % of a core).
+Full path (crossfade + compressor/agc/amplify + resample + encode) ≈ 2.6 ms
+per 92.9 ms buffer ≈ 2.8 % of one core. The one-time hotspot —
+`CrossfadeMixer`'s mixing loop, two `f64::powf` per sample making the mix
+path ~200x the copy path — is fixed: the gain curve is now a 2048-entry
+lookup table with linear interpolation (built once at construction), cutting
+mixing from 390 µs to 107 µs per buffer (~3.6x). SIMD on the
+resampler/effects loops is not justified until these are the bottleneck
+(they are far from it: total chain ≈ 3 % of a core).
 
 ### Part A — architectural prerequisites (landed as one PR, see Done)
 
@@ -222,9 +224,44 @@ no contention with Part B.
       `-v warning`+ can report "Output file is empty" — an upstream
       `discard_unused_programs` race in ffmpeg 7's threaded input path,
       not a crabsoup defect; ffprobe and full-playlist decode are clean.)
-- [x] **C4 — Shoutcast v1/v2** (only if a concrete need shows up): alternate
+- [ ] **C4 — Shoutcast v1/v2** (only if a concrete need shows up): alternate
       handshake inside `icecast_client.rs`, exposed as `protocol =
       "icecast" | "shoutcast"` on `output.icecast`'s config table.
+      **Not built**: this checkbox previously read `[x]` but the source was
+      re-checked and nothing exists (`grep -rin shoutcast src/` finds only
+      this doc); un-checked by hand rather than left to self-correct.
+
+### Part D — scripting-operator parity (new track)
+
+Everything in this section is new scope, identified by comparing crabsoup's
+registered Lua operators against the operators real Liquidsoap scripts lean
+on most heavily. Ranked by how often you'd actually hit the gap in
+production use, not by build effort.
+
+- [x] **D1 — `mksafe`** (cheapest item in the whole plan): wraps any source
+      so it never fails outright — when the child exhausts (or a request
+      source fails to resolve), an infinite `blank` produces silence instead
+      of propagating an error up to the output; the child is re-checked from
+      the top on every pull, so a `request.queue` that receives a push later
+      preempts the silence again. Pure composition of existing pieces
+      (`fallback([src, blank()])`). (Landed — see Done section.)
+- [x] **D2 — per-track cue points (`annotate:` prefix + `cue_cut`)**: parse
+      `annotate:liq_cue_in="30",liq_cue_out="180":/path/track.mp3` in
+      playlist entries, carry cue points as per-track metadata alongside
+      `label()`, and add a `cue_cut` wrapper that skips ahead to `cue_in` and
+      treats `cue_out` as early exhaustion. Plus the per-track
+      `(fade_in, fade_out)` override in `CrossfadeMixer` (a real API change
+      — default behavior unchanged when no override is present). (Landed —
+      see Done section.)
+- [x] **D3 — `add()`**: general N-source sample-wise additive mixing as a
+      Lua operator (background bed + voice-over, layered intros); the
+      primitive Liquidsoap's own `smart_crossfade` is built on. Optional
+      per-source `weights` scale each child before summing (default 1.0,
+      mismatched counts rejected). (Landed — see Done section.)
+- [x] **D4 — `request.dynamic`**: needs its own prefetch design; touches the
+      same audio-thread/Lua-thread boundary as A2. (Landed — see Done
+      section.)
+- [ ] **D5 — level-aware smart crossfade**: builds on D2; do last.
 
 ### Suggested execution order
 
@@ -237,6 +274,10 @@ no contention with Part B.
 4. Track B, sequential: Phase 2 (DSP) — **done**; next Phase 3 → Phase 5 →
    Phase 6 (needs A2) → Phase 7 → Phase 8 (stretch).
 5. Track C once A1 lands: C1 → C2 → C3 (needs C2) → C4 (on request).
+6. Part D: D1 (`mksafe`) — **done**; D3 (`add()`) — **done**; D2
+   (`annotate:`/`cue_cut` + per-track fades) — **done**; D4
+   (`request.dynamic`) — **done**; next D5 (level-aware smart crossfade,
+   builds on D2).
 
 If effort is constrained to one track at a time, prioritize Track C through
 C1/C2 ahead of Track B phases 5–8 — output breadth (file recording, multiple
@@ -250,6 +291,111 @@ approximates the operator surface, not the language); LADSPA plugin hosting
 practice).
 
 ## Done (cont.)
+- [x] D4 (`request.dynamic`): `src/script.rs` — `DynamicRequestSource`
+      plays requests returned by a Lua callback, one ahead of the current
+      track. The callback runs on the Lua-owning event loop through the A2
+      bridge (`ScriptEvent::NextRequest { index, reply }`, a fresh
+      `mpsc::Sender<Option<String>>` per call; `dynamic_hooks` vec on
+      `ScriptState`/`ScriptRuntime`); it returns the next request URI as a
+      string or nil to end the source. The audio thread never blocks on the
+      reply — it polls `try_recv` and returns silence (or the current
+      track's audio) until the answer lands — and the next URI is requested
+      as soon as a track is promoted, so a fast callback makes handovers
+      gapless. Requests resolve through the normal `resolve()` path
+      (`annotate:` prefixes, `http://` download-then-play, retries); a
+      request that fails to resolve is logged and skipped and the callback
+      is asked again (one silent pull per failure, never a spin). A dead
+      event loop sets `no_more` so the source ends instead of stalling.
+      `skip` advances to the next prefetched track. Registered as
+      `request.dynamic(fn)` on the `request` table next to `queue`;
+      README + ARCHITECTURE updated. Inline tests (170 -> 172): a Lua
+      callback returning two unresolvable paths then nil drives the source
+      to exhaustion with exactly three invocations (verified via a Lua
+      counter through the real event loop), and a generated 0.3 s Opus
+      file plays end-to-end (26k+ samples) before nil ends the source.
+- [x] D2 step 2 (per-track crossfade override): `AudioSource::
+      crossfade_overrides() -> Option<(Option<f64>, Option<f64>)>`
+      (default `None`) added to `src/source.rs` and forwarded by every
+      wrapper (`EffectSource`, `FallbackSource`/`SequenceSource`/
+      `RandomSource`/`ScheduleSource`/`AddSource`, `OnMetadataSource`/
+      `OnTrackSource`, `ReplayGainSource`, `RequestQueueSource`,
+      `DownloadSource`, `CueCutSource`, `CrossfadeMixer`/`PriorityMixer`)
+      like `replaygain_db`. `CueCutSource` reports its `TrackCues`
+      `fade_in`/`fade_out`. `CrossfadeMixer` sizes each transition's overlap
+      window per preload: the incoming track's `fade_in`, else the outgoing
+      track's `fade_out`, else the global `crossfade_seconds`; the preload
+      margin uses the outgoing track's `fade_out` override too, so an
+      annotated track starts its fade early enough. No override present ⇒
+      behavior and frames are identical to before (global window).
+      `apply_cues` now also wraps when only fades are set (no cue points),
+      so `annotate:liq_fade_in=...` alone reaches the mixer. Inline tests:
+      mixer `FakeSource`/`with_fades` — outgoing `fade_out=0.4` moves the
+      preload from 0.2 s early to 0.4 s early and spans a 40-frame fade
+      (exact sample values per frame), incoming `fade_in=0.4` over a plain
+      outgoing track extends the window and finishes via the existing tail
+      ramp; `CueCutSource` reports/omits overrides; script-level `cue_cut`
+      with fades reports `(Some(2), Some(3))`; a real-file
+      `single("annotate:liq_fade_in=...,liq_fade_out=...:path")` surfaces
+      the overrides. Existing crossfade tests unchanged and green.
+- [x] D2 step 1 (`annotate:`/`cue_cut`): `src/request.rs` — `RequestUri`
+      variants gain an `Option<TrackCues>` (`TrackCues { cue_in, cue_out,
+      fade_in, fade_out }`, `fade_*` parsed now for step 2); `new()` parses
+      a Liquidsoap-style `annotate:` prefix (`liq_cue_in`, `liq_cue_out`,
+      `liq_fade_in`, `liq_fade_out`; unknown keys ignored; malformed
+      prefixes fall back to a plain URI with no cues). `TrackCues` holds
+      `f64`s so `Eq`/`Ord` are manual (`cmp_cues`/`cmp_opt` order `None`
+      before `Some`, `total_cmp` for the values). `src/source/cue_cut.rs`
+      — `CueCutSource` skips `cue_in` seconds at each track start (silence)
+      and treats `cue_out` as early exhaustion, so the parent (crossfade
+      mixer or fallback) advances at the cue point instead of the file's
+      natural end; the window is re-applied at every label change, so a
+      `cue_cut` around a playlist trims every track. `resolve()` wraps in
+      `CueCutSource` automatically when a request carries cues, so
+      playlists/`single`/`queue.push` all honor `annotate:` without extra
+      wiring. `cue_cut(src, {cue_in, cue_out, fade_in, fade_out})`
+      registered in `script.rs` for direct use. Inline tests: annotate
+      parsing (cue extraction, `http://` URIs + unknown-key ignoring,
+      malformed fallback), `CueCutSource` trim math (skip lands on the
+      right sine phase, `cue_out` ends the track at exactly the window,
+      passthrough with no cues, `remaining_seconds` tracks the window),
+      and script-level `cue_cut` on a sine + a real-file
+      `single("annotate:...:path")` that skips when `media/` is absent.
+- [x] D3 (`add`): `src/script.rs` — `AddSource` sums N children
+      sample-by-sample (each child's `next_buffer` output is added into the
+      shared output buffer; the first child writes directly, the rest pull
+      into a reusable scratch so `next_buffer` never allocates). Optional
+      `weights` per child (default 1.0) scale before summing; the sum is not
+      normalized — clipping is the caller's concern, as in Liquidsoap.
+      Exhausts only when every child exhausts, so a looping bed keeps a
+      finite voice-over mix alive; `label`/`remaining_seconds`/
+      `replaygain_db` come from the first child, `skip` forwards to all.
+      `add({a, b, ...}, {weights = {...}})` registered in `script.rs`;
+      README + ARCHITECTURE operator lists updated. Inline tests (148 ->
+      154): sample-wise sum of two in-phase sines peaks ~1.0, per-source
+      weights scale the peak (~0.75), a short child over an infinite child
+      keeps playing and never exhausts, exhaustion when every child ends
+      (exact sample count), and bad weight counts / empty lists are
+      rejected.
+- [x] D1 (`mksafe`): `src/script.rs` — pure composition of existing pieces:
+      `fallback([src, blank()])` as one `lua.create_function`, so a wrapped
+      source never fails outright. When the child exhausts (e.g. a request
+      queue that failed to resolve its request and drained), an infinite
+      `blank` produces silence instead of the engine erroring out; because
+      `FallbackSource` re-checks children from the top on every pull, a
+      `request.queue` that receives a push later preempts the silence again.
+      Registered in `script.rs`; README parity map + operator list updated.
+      Inline tests (146 -> 148): a short `sine` wrapped in `mksafe` keeps
+      producing full silence buffers and never exhausts; a `request.queue`
+      holding an unresolvable path yields silence rather than an error.
+- [x] Crossfade gain curve de-powfed: `src/engine/mixer.rs` — the two
+      `f64::powf` calls per sample in the mixing path are replaced by a
+      2048-entry `t^fade_curve` lookup table with linear interpolation,
+      built once at construction (`curve_gain`); the tail ramp uses it too.
+      Bench (same machine, `mixers/crossfade/mixing`): 390 µs -> 107 µs per
+      92.9 ms buffer (~3.6x, criterion reports ~72 % faster with p < 0.05).
+      Baseline table updated above. (The passthrough row also moved, 2 µs ->
+      1.2 µs, but that path never touches the curve — treat that delta as
+      session variance per the caveat above, not a change from this work.)
 - [x] Performance baseline harness: `benches/engine.rs` (criterion 0.5,
       `harness = false`) covering the mixers (passthrough + worst-case
       crossfade mixing + priority passthrough + ducking), the DSP chain
@@ -257,8 +403,9 @@ practice).
       encoders, on 4096-frame stereo buffers. Baselines recorded above under
       "Performance baseline". First numbers: the full mix+effects+resample+
       encode path runs ~3 % of one core per buffer — the crossfade mixing
-      loop's two `f64::powf` per sample is the only notable hotspot (mix
-      path ~200x the copy path).
+      loop's two `f64::powf` per sample was the only notable hotspot (mix
+      path ~200x the copy path); since fixed by the curve lookup table
+      (entry above).
 - [x] Phase 3 (request queue): `src/source/request.rs` — `RequestQueue`
       (FIFO of `Arc<str>` paths, `next()` pops under one lock, `skip()`
       jumps the current request instead of waiting, `Clear` command
