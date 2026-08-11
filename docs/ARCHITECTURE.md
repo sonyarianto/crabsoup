@@ -218,10 +218,18 @@ into `/usr/local` and `build.rs` adds the link path.
 
 ## Live harbor (`src/live/harbor.rs`)
 
-Decodes DJ uploads with symphonia, which has no Opus codec (confirmed through
-0.6.0): MP3 uploads decode and air; Opus uploads log "cannot create decoder:
-unsupported codec" and air silence for the ducked window while the duck
-control still runs.
+Decodes DJ uploads to target-spec PCM: MP3/Vorbis/AAC via symphonia, Opus via
+the native `OpusSource` path (symphonia 0.5 has no Opus codec) after
+sniffing the first Ogg page. The PCM crosses to the audio thread through a
+lock-free SPSC ring (`ringbuf::HeapRb`, sized at `2 * MAX_LIVE_FRAMES`):
+`LiveSink` (the decode thread) pushes with `push_slice`, `LiveSource` (the
+mixer) pops with `pop_slice` and enforces the 5 s drop-oldest latency cap by
+skipping anything older on pull — the same lag the old `Arc<Mutex<VecDeque>>`
+drain-on-push kept, but ~13x faster on the pull (benchmarked in
+`live_handoff`; see ROADMAP). When the ring is full the sink applies
+backpressure (waits for the consumer to drain) instead of dropping, so the
+newest audio is never silently lost — a fast `curl -T` upload throttles to
+real time and plays completely, as before.
 
 ## Gotchas that have burned previous work
 

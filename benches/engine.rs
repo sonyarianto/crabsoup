@@ -5,9 +5,13 @@
 //! `--save-baseline <name>` / `--load-baseline <name>` pair for later
 //! comparisons).
 
+use std::collections::VecDeque;
+use std::sync::Arc;
 use std::sync::mpsc;
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box};
+use parking_lot::Mutex;
+use ringbuf::traits::*;
 use symphonia::core::audio::{Channels, SignalSpec};
 
 use crabsoup::config::MixerConfig;
@@ -21,6 +25,11 @@ const RATE: u32 = 44_100;
 const CHANS: usize = 2;
 const FPB: usize = 4096; // frames per buffer; 8192 interleaved samples
 const BUF: usize = FPB * CHANS;
+/// Typical decoded packet size (symphonia MP3 frame: 1152 frames stereo).
+const CHUNK: usize = 1152 * CHANS;
+/// Live harbor's drop-oldest cap: 5 s of stereo audio (matches
+/// `MAX_LIVE_FRAMES` in `src/live/harbor.rs`).
+const CAP: usize = 5 * RATE as usize * CHANS;
 
 /// A continuous source filling the buffer with a constant — isolates mixer /
 /// ramp arithmetic from sine generation cost.
@@ -196,6 +205,56 @@ fn smart_crossfade(c: &mut Criterion) {
     });
 }
 
+fn live_handoff(c: &mut Criterion) {
+    // The harbor's decode thread pushes decoded PCM chunks and the audio
+    // thread pulls 8192-sample buffers, with a 5 s drop-oldest cap. A
+    // synthetic high-rate producer drives both implementations through the
+    // identical workload: 8 chunk-pushes then one buffer-pull per iter
+    // (net +1024 samples, so the queue reaches steady state under the cap).
+    let chunk = vec![0.05f32; CHUNK];
+    let mut group = c.benchmark_group("live_handoff");
+    group.throughput(Throughput::Elements(BUF as u64));
+
+    group.bench_function("mutex_vecdeque", |b| {
+        let queue = Arc::new(Mutex::new(VecDeque::<f32>::new()));
+        let mut buf = vec![0.0f32; BUF];
+        b.iter(|| {
+            {
+                let mut q = queue.lock();
+                for _ in 0..8 {
+                    q.extend(chunk.iter().copied());
+                }
+                let over = q.len().saturating_sub(CAP);
+                if over > 0 {
+                    q.drain(..over);
+                }
+            }
+            let mut q = queue.lock();
+            let n = BUF.min(q.len());
+            for slot in buf[..n].iter_mut() {
+                *slot = q.pop_front().unwrap_or(0.0);
+            }
+            black_box(n);
+        });
+    });
+
+    group.bench_function("spsc_ring", |b| {
+        let (mut prod, mut cons) = ringbuf::HeapRb::<f32>::new(2 * CAP).split();
+        let mut buf = vec![0.0f32; BUF];
+        b.iter(|| {
+            // Producer: bulk push (drop-newest only past the 2x headroom).
+            for _ in 0..8 {
+                prod.push_slice(&chunk);
+            }
+            // Consumer: enforce the drop-oldest window, then bulk pop.
+            let over = cons.occupied_len().saturating_sub(CAP);
+            cons.skip(over);
+            let n = cons.pop_slice(&mut buf);
+            black_box(n);
+        });
+    });
+}
+
 fn effects(c: &mut Criterion) {
     let mut group = c.benchmark_group("effects");
     group.throughput(Throughput::Elements(BUF as u64));
@@ -261,5 +320,5 @@ fn encode(c: &mut Criterion) {
     }
 }
 
-criterion::criterion_group!(benches, mixers, smart_crossfade, effects, resampler, encode);
+criterion::criterion_group!(benches, mixers, smart_crossfade, live_handoff, effects, resampler, encode);
 criterion::criterion_main!(benches);

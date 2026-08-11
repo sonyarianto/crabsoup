@@ -13,6 +13,10 @@ base64 = "0.22"
 # Concurrency & async (live harbor)
 tokio = { version = "1.0", features = ["full"] }
 parking_lot = "0.12"
+# Lock-free SPSC ring for the harbor -> mixer live handoff (replaces
+# Arc<Mutex<VecDeque>>; ~13x faster on the audio-thread pull per the
+# live_handoff comparison bench)
+ringbuf = "0.4"
 # Terminal interface
 clap = { version = "4.0", features = ["derive"] }
 # Logging

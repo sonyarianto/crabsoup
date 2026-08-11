@@ -6,7 +6,7 @@ use std::thread;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
-use parking_lot::Mutex;
+use ringbuf::{HeapRb, traits::*};
 use symphonia::core::audio::{SampleBuffer, SignalSpec};
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::formats::FormatOptions;
@@ -18,7 +18,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::config::LiveConfig;
 use crate::engine::mixer::MixCommand;
-use crate::live::source::LiveSource;
+use crate::live::source::{LiveSink, LiveSource};
 use crate::source::{AudioSource, PcmConverter};
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
@@ -164,11 +164,12 @@ async fn handle_connection(
         }
     };
 
-    // Hand the connection over to a decode thread. The LiveSource shares its
-    // queue with that thread via atomics + a mutex.
-    let queue = Arc::new(Mutex::new(std::collections::VecDeque::<f32>::new()));
+    // Hand the connection over to a decode thread. The SPSC ring (sized at
+    // twice the drop-oldest cap) hands PCM from the decode thread to the
+    // mixer's LiveSource lock-free; the consumer enforces the window.
+    let (prod, cons) = HeapRb::<f32>::new(2 * MAX_LIVE_FRAMES).split();
     let exhausted = Arc::new(AtomicBool::new(false));
-    let live = Box::new(LiveSource::new(queue.clone(), exhausted.clone(), MAX_LIVE_FRAMES));
+    let live = Box::new(LiveSource::new(cons, exhausted.clone(), MAX_LIVE_FRAMES));
     let _ = tx.send(MixCommand::SetLive(live));
 
     thread::spawn(move || {
@@ -178,7 +179,7 @@ async fn handle_connection(
             request.chunked,
             respond_at_end,
             target,
-            queue,
+            LiveSink::new(prod),
             exhausted,
             tx,
             occupied,
@@ -200,20 +201,12 @@ fn decode_live_stream(
     chunked: bool,
     respond_at_end: bool,
     target: SignalSpec,
-    queue: Arc<Mutex<std::collections::VecDeque<f32>>>,
+    mut sink: LiveSink,
     exhausted: Arc<AtomicBool>,
     tx: mpsc::Sender<MixCommand>,
     occupied: Arc<AtomicBool>,
 ) {
-    decode_live_stream_inner(
-        stream,
-        content_type,
-        chunked,
-        respond_at_end,
-        target,
-        &queue,
-        &exhausted,
-    );
+    decode_live_stream_inner(stream, content_type, chunked, respond_at_end, target, &mut sink);
     finish(&exhausted, &tx, &occupied);
 }
 
@@ -224,8 +217,7 @@ fn decode_live_stream_inner(
     chunked: bool,
     respond_at_end: bool,
     target: SignalSpec,
-    queue: &Arc<Mutex<std::collections::VecDeque<f32>>>,
-    exhausted: &Arc<AtomicBool>,
+    sink: &mut LiveSink,
 ) {
     fn done(respond_at_end: bool, stream: &mut std::net::TcpStream) {
         if respond_at_end {
@@ -258,8 +250,7 @@ fn decode_live_stream_inner(
         decode_opus_live(
             crate::source::opus::PrependReader::new(prefix, rest),
             target,
-            queue,
-            exhausted,
+            sink,
         );
         done(respond_at_end, &mut stream);
         return;
@@ -305,7 +296,6 @@ fn decode_live_stream_inner(
     };
 
     let mut converter = PcmConverter::new(target);
-    let live = LiveSource::new(queue.clone(), exhausted.clone(), MAX_LIVE_FRAMES);
 
     loop {
         let packet = match format.next_packet() {
@@ -332,7 +322,7 @@ fn decode_live_stream_inner(
                 let mut sbuf = SampleBuffer::<f32>::new(frames as u64, spec);
                 sbuf.copy_interleaved_ref(decoded);
                 let converted = converter.convert(sbuf.samples(), &spec);
-                live.push_samples(&converted);
+                sink.push_samples(&converted);
             }
             Err(e) => {
                 log::warn!("live harbor: decode error, skipping: {e}");
@@ -343,7 +333,7 @@ fn decode_live_stream_inner(
     // Flush the resampler tail.
     let tail = converter.flush();
     if !tail.is_empty() {
-        live.push_samples(&tail);
+        sink.push_samples(&tail);
     }
     done(respond_at_end, &mut stream);
 }
@@ -363,13 +353,8 @@ fn finish(
 }
 
 /// Decode a DJ's Opus stream natively (audiopus) and push target-spec PCM
-/// into the shared queue. Uses the same [`OpusSource`] as file playback.
-fn decode_opus_live<R: Read + Send>(
-    reader: R,
-    target: SignalSpec,
-    queue: &Arc<Mutex<std::collections::VecDeque<f32>>>,
-    exhausted: &Arc<AtomicBool>,
-) {
+/// into the live sink. Uses the same [`OpusSource`] as file playback.
+fn decode_opus_live<R: Read + Send>(reader: R, target: SignalSpec, sink: &mut LiveSink) {
     let mut src = match crate::source::opus::OpusSource::open(
         reader,
         target,
@@ -382,7 +367,6 @@ fn decode_opus_live<R: Read + Send>(
             return;
         }
     };
-    let live = LiveSource::new(queue.clone(), exhausted.clone(), MAX_LIVE_FRAMES);
     let mut buf = vec![0f32; MAX_LIVE_FRAMES];
     loop {
         let n = src.next_buffer(&mut buf);
@@ -392,7 +376,7 @@ fn decode_opus_live<R: Read + Send>(
             }
             continue;
         }
-        live.push_samples(&buf[..n]);
+        sink.push_samples(&buf[..n]);
     }
 }
 

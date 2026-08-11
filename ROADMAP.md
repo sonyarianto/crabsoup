@@ -301,6 +301,34 @@ approximates the operator surface, not the language); LADSPA plugin hosting
 practice).
 
 ## Done (cont.)
+- [x] Harbor → mixer handoff is now a lock-free SPSC ring (`ringbuf`
+      0.4.8): `src/live/source.rs` — `LiveSource` holds a `HeapCons<f32>`
+      and pops with `pop_slice`, enforcing the drop-oldest cap on pull
+      (`skip` anything older than `MAX_LIVE_FRAMES`, so the played window
+      stays the most recent 5 s, same lag as the old
+      `Arc<Mutex<VecDeque>>` drain-on-push); `LiveSink` (new) holds the
+      `HeapProd<f32>` half and pushes with `push_slice`, and **applies
+      backpressure when the ring is full** (waits for the consumer to
+      drain) so the newest audio is never silently dropped — a fast
+      `curl -T` upload throttles to real time and plays completely, like
+      the old code, instead of losing the middle of the file. `src/live/
+      harbor.rs` — `handle_connection` splits a `HeapRb` sized at
+      `2 * MAX_LIVE_FRAMES` (headroom absorbs fast uploads / brief
+      consumer stalls without ever blocking the decode thread); both
+      decode paths (`decode_live_stream_inner`, `decode_opus_live`) push
+      through the sink; the now-dead `exhausted` plumbing was removed from
+      the inner decoders. The swap was **measurement-gated per the plan**: a
+      `live_handoff` comparison bench (same high-rate producer workload —
+      8 chunk-pushes + 1 buffer-pull per iteration — against both
+      implementations) showed 43.8 µs (`mutex_vecdeque`) vs 3.2 µs
+      (`spsc_ring`) per iteration, a **~13.6x win**, so the dependency was
+      justified and added. Inline tests (175 -> 176): a concurrent
+      producer/consumer test proving the newest sample survives a full
+      ring (the non-blocking variant would lose it) and the played window
+      stays in order, consumer-side drop-oldest semantics (push 6, cap 4
+      -> pull returns the newest window `[3,4,5,6]`), and the
+      frames-then-silence-then-exhausted sequence. `ringbuf = "0.4"`
+      moved to `[dependencies]`.
 - [x] D5 (level-aware smart crossfade): `src/engine/mixer.rs` —
       `SmartFade { fade_out, fade_mid, threshold_db }` and
       `CrossfadeMixer::with_smart_fade` (builder; `None` = plain
