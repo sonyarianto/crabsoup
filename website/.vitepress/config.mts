@@ -14,7 +14,6 @@ export default defineConfig({
     nav: [
       { text: 'Guide', link: '/guide/getting-started' },
       { text: 'Architecture', link: '/architecture' },
-      { text: 'Roadmap', link: '/roadmap' },
       { text: 'GitHub', link: 'https://github.com/sonyarianto/crabsoup' },
     ],
 
