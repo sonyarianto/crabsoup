@@ -12,9 +12,6 @@ hero:
     - theme: alt
       text: View on GitHub
       link: https://github.com/sonyarianto/crabsoup
-  image:
-    src: /logo.svg
-    alt: Crabsoup
 
 features:
   - title: .lua scripting

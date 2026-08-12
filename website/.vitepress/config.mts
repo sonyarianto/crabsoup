@@ -8,11 +8,9 @@ export default defineConfig({
 
   head: [
     ['meta', { name: 'theme-color', content: '#d4472a' }],
-    ['link', { rel: 'icon', type: 'image/svg+xml', href: '/logo.svg' }],
   ],
 
   themeConfig: {
-    logo: '/logo.svg',
     nav: [
       { text: 'Guide', link: '/guide/getting-started' },
       { text: 'Architecture', link: '/architecture' },
