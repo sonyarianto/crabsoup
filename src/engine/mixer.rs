@@ -718,6 +718,7 @@ mod tests {
 
         /// Like [`Self::new`], but each source carries a per-track fade
         /// override.
+        #[allow(clippy::type_complexity)]
         fn with_fades(values: Vec<(f32, usize, Option<(Option<f64>, Option<f64>)>)>) -> Self {
             let sources = values
                 .into_iter()
@@ -1101,10 +1102,10 @@ mod tests {
         let mut seen_label = false;
         for i in 0..140 {
             pm.next_buffer(&mut buf);
-            if let Some(l) = pm.label() {
-                if l.contains("mrwashingt0n") {
-                    seen_label = true;
-                }
+            if let Some(l) = pm.label()
+                && l.contains("mrwashingt0n")
+            {
+                seen_label = true;
             }
             if (20..120).contains(&i) {
                 let e: f32 = buf.iter().map(|v| v * v).sum::<f32>() / buf.len() as f32;

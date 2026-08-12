@@ -1,15 +1,20 @@
 //! URI resolution for media requests: local paths play directly, `http://`
-//! URLs are downloaded to a temp file first (download-then-play, per the
-//! Phase 7 roadmap — no streaming decode yet).
+//! and `https://` URLs are downloaded to a temp file first
+//! (download-then-play, per the Phase 7 roadmap — no streaming decode yet).
 //!
-//! The HTTP client is a minimal protocol-level `GET` on `std::net` (no TLS,
-//! no external crates): status line + headers, `Content-Length` or
-//! chunked bodies (or connection-close delimited), and redirect following.
+//! The HTTP client is a minimal protocol-level `GET`: status line + headers,
+//! `Content-Length` or chunked bodies (or connection-close delimited), and
+//! redirect following. `http://` rides a plain `TcpStream`; `https://` wraps
+//! the same socket in a `rustls` client (Part F1) and feeds the *identical*
+//! byte stream through the same parsing — a wrap-the-transport change, not a
+//! rewrite of the HTTP logic.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use log::warn;
@@ -340,7 +345,7 @@ pub fn resolve(
         }
         RequestUri::Url(url, cues) => {
             let tmp = temp_path(url);
-            download(url, &tmp, config)?;
+            download(url, &tmp, config, None)?;
             let src = open_audio(&tmp, target, frames_per_buffer)?;
             let src = Box::new(DownloadSource::new(src, tmp, uri.display()));
             Ok(apply_cues(src, *cues, target))
@@ -398,17 +403,21 @@ fn temp_path(url: &str) -> PathBuf {
         .join(format!("{:016x}-{n}.part", hash_url(url)))
 }
 
-/// Download `url` to `dest`, retrying with a short backoff.
-fn download(url: &str, dest: &Path, config: &RequestConfig) -> crate::Result<()> {
-    if url.starts_with("https://") {
-        return Err("https is not supported yet (use a plain http:// URL)".into());
-    }
+/// Download `url` to `dest`, retrying with a short backoff. `tls_roots`
+/// overrides the default webpki roots (tests use a self-signed local server;
+/// production callers pass `None`).
+fn download(
+    url: &str,
+    dest: &Path,
+    config: &RequestConfig,
+    tls_roots: Option<Arc<rustls::RootCertStore>>,
+) -> crate::Result<()> {
     if let Some(dir) = dest.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let mut last_err: Option<String> = None;
     for attempt in 0..=config.retries {
-        match http_get(url, dest, config.timeout()) {
+        match http_get(url, dest, config.timeout(), tls_roots.as_ref()) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 last_err = Some(e.to_string());
@@ -421,8 +430,32 @@ fn download(url: &str, dest: &Path, config: &RequestConfig) -> crate::Result<()>
     Err(last_err.unwrap_or_else(|| "download failed".into()).into())
 }
 
-/// A parsed `http://host[:port]/path` URL.
+/// URL scheme: decides the default port and whether the transport is TLS.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scheme {
+    Http,
+    Https,
+}
+
+impl Scheme {
+    fn as_str(self) -> &'static str {
+        match self {
+            Scheme::Http => "http",
+            Scheme::Https => "https",
+        }
+    }
+
+    fn default_port(self) -> u16 {
+        match self {
+            Scheme::Http => 80,
+            Scheme::Https => 443,
+        }
+    }
+}
+
+/// A parsed `http(s)://host[:port]/path` URL.
 struct HttpUrl {
+    scheme: Scheme,
     host: String,
     port: u16,
     path: String,
@@ -431,9 +464,13 @@ struct HttpUrl {
 
 impl HttpUrl {
     fn parse(url: &str) -> crate::Result<Self> {
-        let rest = url
-            .strip_prefix("http://")
-            .ok_or_else(|| format!("not an http:// URL: {url}"))?;
+        let (scheme, rest) = if let Some(rest) = url.strip_prefix("https://") {
+            (Scheme::Https, rest)
+        } else if let Some(rest) = url.strip_prefix("http://") {
+            (Scheme::Http, rest)
+        } else {
+            return Err(format!("not an http(s):// URL: {url}").into());
+        };
         let (authority, path) = match rest.split_once('/') {
             Some((a, p)) => (a, format!("/{p}")),
             None => (rest, "/".to_string()),
@@ -442,7 +479,7 @@ impl HttpUrl {
             Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) => {
                 (h, p.parse::<u16>().map_err(|_| format!("bad port in {url}"))?)
             }
-            _ => (authority, 80),
+            _ => (authority, scheme.default_port()),
         };
         if host.is_empty() {
             return Err(format!("bad URL (empty host): {url}").into());
@@ -451,31 +488,116 @@ impl HttpUrl {
             .map_err(|e| format!("cannot resolve {host}: {e}"))?
             .next()
             .ok_or_else(|| format!("cannot resolve {host}"))?;
-        Ok(Self { host: host.to_string(), port, path: path.to_string(), addr })
+        Ok(Self {
+            scheme,
+            host: host.to_string(),
+            port,
+            path: path.to_string(),
+            addr,
+        })
     }
 
-    /// Join a (possibly relative) `Location` header against this URL.
+    /// Join a (possibly relative) `Location` header against this URL,
+    /// preserving the scheme (a redirect may cross `http` <-> `https`).
     fn join(&self, location: &str) -> String {
         if location.starts_with("http://") || location.starts_with("https://") {
             return location.to_string();
         }
+        let scheme = self.scheme.as_str();
         if location.starts_with('/') {
-            return format!("http://{}:{}{}", self.host, self.port, location);
+            return format!("{scheme}://{}:{}{}", self.host, self.port, location);
         }
         // Relative to the current path's directory.
         let base = self.path.rsplit_once('/').map(|(d, _)| d).unwrap_or("/");
         let base = if base.is_empty() { "/" } else { base };
-        format!("http://{}:{}{}/{}", self.host, self.port, base, location)
+        format!("{scheme}://{}:{}{}/{}", self.host, self.port, base, location)
     }
 }
 
-/// Perform one `GET` (no retries) writing the body to `dest`.
-fn http_get(url: &str, dest: &Path, timeout: Duration) -> crate::Result<()> {
+/// One `GET` hop's byte stream: plain TCP or a rustls-wrapped TLS session.
+/// Both expose the same `Read + Write`, so the status/header/body parsing
+/// below never knows which transport carried the bytes.
+enum Transport {
+    Plain(TcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+}
+
+impl Read for Transport {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Transport::Plain(s) => s.read(buf),
+            Transport::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Transport {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Transport::Plain(s) => s.write(buf),
+            Transport::Tls(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Transport::Plain(s) => s.flush(),
+            Transport::Tls(s) => s.flush(),
+        }
+    }
+}
+
+/// The Mozilla webpki root store, built once. Kept in an `Arc` so a TLS
+/// connect clones a cheap pointer instead of deep-copying ~150 roots.
+fn default_root_store() -> &'static Arc<rustls::RootCertStore> {
+    static STORE: OnceLock<Arc<rustls::RootCertStore>> = OnceLock::new();
+    STORE.get_or_init(|| {
+        let mut store = rustls::RootCertStore::empty();
+        store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        Arc::new(store)
+    })
+}
+
+/// Connect to `target` and (for `https`) complete the TLS handshake.
+/// `tls_roots` overrides the default trust store (tests only).
+fn connect_transport(
+    target: &HttpUrl,
+    timeout: Duration,
+    tls_roots: Option<&Arc<rustls::RootCertStore>>,
+) -> crate::Result<Transport> {
+    let tcp = TcpStream::connect_timeout(&target.addr, timeout)?;
+    tcp.set_read_timeout(Some(timeout))?;
+    tcp.set_write_timeout(Some(timeout))?;
+    match target.scheme {
+        Scheme::Http => Ok(Transport::Plain(tcp)),
+        Scheme::Https => {
+            let config = rustls::ClientConfig::builder()
+                .with_root_certificates(match tls_roots {
+                    Some(store) => store.clone(),
+                    None => default_root_store().clone(),
+                })
+                .with_no_client_auth();
+            let server_name = rustls::pki_types::ServerName::try_from(target.host.clone())
+                .map_err(|_| format!("invalid TLS hostname {}", target.host))?;
+            let conn = rustls::ClientConnection::new(Arc::new(config), server_name)
+                .map_err(|e| format!("TLS handshake with {} failed: {e}", target.host))?;
+            Ok(Transport::Tls(Box::new(rustls::StreamOwned::new(conn, tcp))))
+        }
+    }
+}
+
+/// Perform one `GET` (no retries) writing the body to `dest`. Each redirect
+/// hop re-opens the transport (the scheme may have changed), then runs the
+/// same status/header/body parsing over it.
+fn http_get(
+    url: &str,
+    dest: &Path,
+    timeout: Duration,
+    tls_roots: Option<&Arc<rustls::RootCertStore>>,
+) -> crate::Result<()> {
     let mut target = HttpUrl::parse(url)?;
     for _ in 0..4 {
-        let mut stream = TcpStream::connect_timeout(&target.addr, timeout)?;
-        stream.set_read_timeout(Some(timeout))?;
-        stream.set_write_timeout(Some(timeout))?;
+        let mut stream = connect_transport(&target, timeout, tls_roots)?;
         write!(
             stream,
             "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: crabsoup/0.1\r\nConnection: close\r\nAccept: */*\r\n\r\n",
@@ -545,7 +667,7 @@ fn http_get(url: &str, dest: &Path, timeout: Duration) -> crate::Result<()> {
 }
 
 /// Decode a chunked body into `file`.
-fn read_chunked(reader: &mut BufReader<TcpStream>, file: &mut File) -> crate::Result<()> {
+fn read_chunked(reader: &mut BufReader<Transport>, file: &mut File) -> crate::Result<()> {
     loop {
         let mut size_line = String::new();
         if reader.read_line(&mut size_line)? == 0 {
@@ -574,12 +696,12 @@ fn read_chunked(reader: &mut BufReader<TcpStream>, file: &mut File) -> crate::Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{TcpListener, TcpStream};
+    use std::net::TcpListener;
     use std::thread;
 
     /// Drain the request bytes (headers end at `\r\n\r\n`) so the response
-    /// socket closes cleanly instead of RSTing.
-    fn drain_request(stream: &mut TcpStream) {
+    /// socket closes cleanly instead of RSTing. Works over either transport.
+    fn drain_request(stream: &mut impl Read) {
         let mut buf = [0u8; 1024];
         let mut seen = 0usize;
         while seen < 4 {
@@ -591,6 +713,59 @@ mod tests {
                 Ok(_) => unreachable!(),
             }
         }
+    }
+
+    /// A self-signed `localhost` cert/key pair for the TLS test servers.
+    fn test_cert() -> (
+        rustls::pki_types::CertificateDer<'static>,
+        rustls::pki_types::PrivateKeyDer<'static>,
+    ) {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("rcgen cert");
+        (
+            certified.cert.der().clone(),
+            rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into()),
+        )
+    }
+
+    /// Serve a canned HTTPS response on an ephemeral port with the given
+    /// cert/key. Returns the `https://localhost:PORT/...` URL.
+    fn serve_tls(
+        status: &'static str,
+        headers: Vec<(String, String)>,
+        body: &'static [u8],
+        cert: &rustls::pki_types::CertificateDer<'static>,
+        key: &rustls::pki_types::PrivateKeyDer<'static>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server_config = Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert.clone()], key.clone_key())
+                .expect("server config"),
+        );
+        thread::spawn(move || {
+            for _ in 0..8 {
+                let Ok((tcp, _)) = listener.accept() else {
+                    return;
+                };
+                let Ok(conn) = rustls::ServerConnection::new(server_config.clone()) else {
+                    continue;
+                };
+                let mut tls = rustls::StreamOwned::new(conn, tcp);
+                drain_request(&mut tls);
+                let mut response = format!("HTTP/1.1 {status}\r\n");
+                for (k, v) in headers.iter() {
+                    response.push_str(&format!("{k}: {v}\r\n"));
+                }
+                response.push_str("\r\n");
+                let _ = tls.write_all(response.as_bytes());
+                let _ = tls.write_all(body);
+                let _ = tls.flush();
+            }
+        });
+        format!("https://localhost:{}/test.mp3", addr.port())
     }
 
     /// Serve a canned HTTP response on an ephemeral port. Returns the URL.
@@ -622,7 +797,7 @@ mod tests {
         let url = serve("200 OK", vec![("Content-Length".into(), body.len().to_string())], body);
         let dest = std::env::temp_dir().join("crabsoup-test-dl.bin");
         let _ = std::fs::remove_file(&dest);
-        http_get(&url, &dest, Duration::from_secs(5)).expect("download");
+        http_get(&url, &dest, Duration::from_secs(5), None).expect("download");
         let got = std::fs::read(&dest).expect("read");
         assert_eq!(got, body);
         let _ = std::fs::remove_file(&dest);
@@ -648,7 +823,7 @@ mod tests {
         let url = format!("http://{addr}/test.mp3");
         let dest = std::env::temp_dir().join("crabsoup-test-chunked.bin");
         let _ = std::fs::remove_file(&dest);
-        http_get(&url, &dest, Duration::from_secs(5)).expect("download");
+        http_get(&url, &dest, Duration::from_secs(5), None).expect("download");
         let got = std::fs::read(&dest).expect("read");
         assert_eq!(got, body);
         let _ = std::fs::remove_file(&dest);
@@ -688,7 +863,7 @@ mod tests {
         let url = format!("http://{addr}/start.mp3");
         let dest = std::env::temp_dir().join("crabsoup-test-redir.bin");
         let _ = std::fs::remove_file(&dest);
-        http_get(&url, &dest, Duration::from_secs(5)).expect("download");
+        http_get(&url, &dest, Duration::from_secs(5), None).expect("download");
         assert_eq!(std::fs::read(&dest).expect("read"), b"target");
         let _ = std::fs::remove_file(&dest);
     }
@@ -698,7 +873,7 @@ mod tests {
         let url = serve("404 Not Found", vec![], b"");
         let dest = std::env::temp_dir().join("crabsoup-test-404.bin");
         let _ = std::fs::remove_file(&dest);
-        let err = http_get(&url, &dest, Duration::from_secs(5)).expect_err("must fail");
+        let err = http_get(&url, &dest, Duration::from_secs(5), None).expect_err("must fail");
         assert!(err.to_string().contains("404"), "{err}");
     }
 
@@ -712,6 +887,11 @@ mod tests {
             RequestUri::new("http://x.example/track.mp3"),
             RequestUri::Url("http://x.example/track.mp3".into(), None)
         );
+        assert_eq!(
+            RequestUri::new("https://x.example/track.mp3"),
+            RequestUri::Url("https://x.example/track.mp3".into(), None)
+        );
+        assert_eq!(RequestUri::new("https://x.example/track.mp3").display(), "track.mp3");
         assert_eq!(
             RequestUri::new("http://x.example/track.mp3").display(),
             "track.mp3"
@@ -832,12 +1012,77 @@ mod tests {
     }
 
     #[test]
-    fn https_is_rejected_with_a_clear_message() {
-        let config = RequestConfig::default();
+    fn https_downloads_a_body_from_a_local_tls_server() {
+        // Replaces the old "https is not supported" rejection: the same HTTP
+        // parsing now runs over a rustls-wrapped transport, verified against
+        // a local server with a self-signed cert (trusted via an injected
+        // root store, so the test needs no live internet).
+        let (cert, key) = test_cert();
+        let body = b"TLS-encrypted-bytes";
+        let url = serve_tls(
+            "200 OK",
+            vec![("Content-Length".into(), body.len().to_string())],
+            body,
+            &cert,
+            &key,
+        );
+        let mut store = rustls::RootCertStore::empty();
+        store.add(cert).expect("trust the self-signed cert");
         let dest = std::env::temp_dir().join("crabsoup-test-https.bin");
         let _ = std::fs::remove_file(&dest);
-        let err = download("https://example.com/a.mp3", &dest, &config).expect_err("must fail");
-        assert!(err.to_string().contains("https is not supported"), "{err}");
+        http_get(&url, &dest, Duration::from_secs(5), Some(&Arc::new(store)))
+            .expect("tls download");
+        let got = std::fs::read(&dest).expect("read");
+        assert_eq!(got, body);
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    #[test]
+    fn https_redirect_to_http_swaps_the_transport() {
+        // A 302 from the TLS server pointing at a plain http server: the
+        // redirect-follow loop must re-open the transport per hop instead of
+        // assuming the scheme stays constant.
+        let (cert, key) = test_cert();
+        let body = b"redirected-target";
+        let http_url = serve(
+            "200 OK",
+            vec![("Content-Length".into(), body.len().to_string())],
+            body,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server_config = Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert.clone()], key.clone_key())
+                .expect("server config"),
+        );
+        thread::spawn(move || {
+            for _ in 0..8 {
+                let Ok((tcp, _)) = listener.accept() else {
+                    return;
+                };
+                let Ok(conn) = rustls::ServerConnection::new(server_config.clone()) else {
+                    continue;
+                };
+                let mut tls = rustls::StreamOwned::new(conn, tcp);
+                drain_request(&mut tls);
+                let _ = tls.write_all(
+                    format!("HTTP/1.1 302 Found\r\nLocation: {http_url}\r\nContent-Length: 0\r\n\r\n")
+                        .as_bytes(),
+                );
+                let _ = tls.flush();
+            }
+        });
+        let mut store = rustls::RootCertStore::empty();
+        store.add(cert).expect("trust the self-signed cert");
+        let dest = std::env::temp_dir().join("crabsoup-test-https-redir.bin");
+        let _ = std::fs::remove_file(&dest);
+        let url = format!("https://localhost:{}/start.mp3", addr.port());
+        http_get(&url, &dest, Duration::from_secs(5), Some(&Arc::new(store)))
+            .expect("follow the redirect");
+        assert_eq!(std::fs::read(&dest).expect("read"), body);
+        let _ = std::fs::remove_file(&dest);
     }
 
     #[test]
@@ -847,7 +1092,8 @@ mod tests {
         let config = RequestConfig { timeout_secs: 1, retries: 1 };
         let dest = std::env::temp_dir().join("crabsoup-test-refused.bin");
         let _ = std::fs::remove_file(&dest);
-        let err = download("http://127.0.0.1:1/x.mp3", &dest, &config).expect_err("must fail");
+        let err = download("http://127.0.0.1:1/x.mp3", &dest, &config, None)
+            .expect_err("must fail");
         assert!(!err.to_string().is_empty());
     }
 

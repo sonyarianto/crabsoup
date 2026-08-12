@@ -116,7 +116,7 @@ mod tests {
         // when the ring is full — it waits for the consumer instead of
         // dropping (the old non-blocking sink would silently lose it).
         let (prod, cons) = HeapRb::<f32>::new(2 * 16).split();
-        let mut sink = LiveSink::new(prod);
+        let sink = LiveSink::new(prod);
         let mut src = LiveSource::new(cons, Arc::new(AtomicBool::new(false)), 16);
         let total = 10_000usize;
         let producer = std::thread::spawn(move || {

@@ -32,11 +32,40 @@ One engine thread plus one thread per output:
 ## Script layer (`src/script.rs`)
 
 - Registers the Liquidsoap-flavoured Lua stdlib: `playlist`,
-  `smart_crossfade`, `single`, `blank`, `sine`, `amplify`, `compress`,
-  `normalize`, `pipe`, `jingles`, `fallback`/`sequence`/`random`,
-  `switch`, `rotate`, `mksafe`, `add`, `cue_cut`, `input.harbor`,
-  `output.icecast`, `output.file`, `output.preview`, `server.telnet`,
-  `on_metadata`, `on_track`, `set`, `log`.
+  `smart_crossfade`, `single`, `blank` (+ `blank.detect`), `sine`,
+  `amplify`, `compress`, `normalize`, `pipe`, `jingles`,
+  `fallback`/`sequence`/`random`, `switch`, `rotate`, `mksafe`, `add`,
+  `cue_cut`, `map_metadata`, `input.harbor`, `input.soundcard`,
+  `output.icecast`, `output.file`, `output.preview`, `output.soundcard`,
+  `server.telnet`, `on_metadata`, `on_track`, `set`, `log`.
+- `blank` is a *callable table* (a `__call` metamethod) so it can carry
+  `blank.detect`; Lua calls a table's `__call` as `f(self, args...)`, so
+  the closure takes a leading `_self` parameter.
+- `blank.detect(src, opts)` (`src/source/blank_detect.rs`) watches the
+  wrapped source's per-buffer RMS level; `duration` seconds (default 2)
+  below `threshold` dBFS (default -40) puts it into a blank state: it
+  returns silence and, by default, `is_exhausted() == true` so a
+  `fallback` around it hands over automatically (the zero-configuration
+  dead-air guard). An optional `on_blank` Lua callback fires once per
+  episode via `ScriptEvent::Blank`; after `restart` seconds the child is
+  re-checked and audio above the threshold recovers the source. The
+  `exhaust_while_blank` option must be read as `Option<bool>` — mlua maps
+  a missing `bool` field to `false` (nil is falsy), which would silently
+  flip the safe default.
+- `map_metadata(src, fn)` (`MapMetadataSource`, same file) rewrites each
+  track's title through a Lua callback on the A2 event loop
+  (`ScriptEvent::MapMetadata { hook_id, title, reply }`): the callback
+  receives `{ title = ... }` and returns a table whose `title` replaces
+  the label for every downstream consumer. Unlike fire-and-forget
+  `on_metadata`, the reply must reach the output, so the source polls it
+  for a bounded pull budget (8 pulls, ~0.7 s) and falls back to the
+  original label on timeout, nil, or callback error — the audio thread
+  never blocks. Fires even when the child's label is `None`, so scripts
+  can add titles to unlabeled tracks. Known limit: a label change while a
+  rewrite is still in flight replaces it, so a source whose label changes
+  faster than the budget (sub-second tracks, or the `FallbackSource`
+  label-jump quirk) mostly falls back to raw labels — fine for real
+  minute-long tracks, not for audio-rate metadata.
 - `add({a, b}, {weights = {0.5, 1.0}})` sums N children sample-by-sample
   (`AddSource`): the first child writes straight into the output buffer,
   the rest pull into a reusable scratch that is added in (no per-call
@@ -132,12 +161,18 @@ One engine thread plus one thread per output:
   crossfade overrides via `AudioSource::crossfade_overrides()` (its
   `fade_in`/`fade_out`), and `apply_cues` wraps even when *only* fades are
   set, so `annotate:liq_fade_in=...` alone reaches the mixer.
-- The HTTP client is stdlib-only: single connect per attempt, up to 4
+- The HTTP client is hand-rolled on a `Transport` enum — a plain
+  `TcpStream` for `http://`, a `rustls::StreamOwned` (ring provider,
+  webpki-roots Mozilla store) for `https://` — and the status/header/chunked
+  parsing is byte-identical over both (Part F1 wrapped the transport
+  without touching the HTTP logic). Single connect per attempt, up to 4
   redirects (`Location` resolved absolute/root/relative against the request
-  URL), `Content-Length` and chunked bodies, connection-close fallback,
-  connect+read `request_timeout`. https is rejected up front with a clear
-  error. `download()` retries `request_retries` times with a 500 ms backoff
-  and removes the partial file if all attempts fail.
+  URL, preserving the scheme — a redirect may cross `https` <-> `http` and
+  re-opens the transport per hop), `Content-Length` and chunked bodies,
+  connection-close fallback, connect+read `request_timeout`. `download()`
+  retries `request_retries` times with a 500 ms backoff and removes the
+  partial file if all attempts fail. The trust store is overridable (tests
+  inject a self-signed `rcgen` cert against a local `rustls` server).
 - `show_error`-style fallback semantics: a failed `resolve()` surfaces as an
   error the caller decides on — the request queue drops the bad request and
   plays the next one; the playlist plays silence for that slot.
@@ -231,6 +266,46 @@ into `/usr/local` and `build.rs` adds the link path.
   them type-less too). Never inject comment pages mid-stream: Icecast
   forwards them to listeners as audio, producing decoder warnings.
 
+## Soundcard I/O (`input.soundcard`, `output.soundcard`)
+
+Both directions bridge through the same SPSC-ring pattern as the live
+harbor, because cpal's callbacks run on a realtime audio thread that must
+never block or allocate:
+
+- `input.soundcard` (`src/source/soundcard.rs`): a small driver thread owns
+  the `cpal::Stream` (`cpal::Stream` is `!Send` on ALSA), opens the device,
+  and parks on `std::thread::park` (woken on drop). Its realtime callback
+  converts device samples to `f32` in stack chunks and `push_slice`s them
+  into the ring. The `AudioSource` half drains on the pull thread,
+  converts channels, and resamples to the bus spec — exact passthrough
+  when the device rate matches the bus; a pull-side cap drops the stale
+  window when the consumer lags. The device open is a synchronous bounded
+  handshake at script evaluation, so a missing/broken device fails fast —
+  note this makes `--check` hardware-dependent for scripts that register
+  `input.soundcard` (the source must exist before the engine pulls it;
+  deferring the open would need a lazy bridge, so it fails loudly instead).
+- `output.soundcard` (`src/output/soundcard.rs`): a tap consumer (claims
+  the root like `output.file`); its thread resamples/converts into a
+  reusable scratch and pushes into a ring the device callback drains
+  (silence on underrun). The device and stream open in `connect()` at
+  startup, so a missing device fails before the tap pulls. Supported
+  device channel counts are 1/2 (mirroring the bus); f32/i16/u16/i32/f64
+  sample formats are converted with the same scaling cpal/dasp uses.
+
+**Manual verification** (hardware is not reliably unit-testable in CI, so
+this is documented rather than automated):
+
+1. Record a known tone: `output.file({path = "/tmp/in.ogg", format =
+   "opus"}, input.soundcard({}))` — play a 440 Hz sine (or a loopback of
+   a test file) into the line/mic input and confirm `/tmp/in.ogg` decodes
+   to a 440 Hz tone (`ffprobe` + an FFT viewer, or compare the zero
+   crossing rate as `docs/` tests do for the resampler).
+2. Play a known tone: `output.soundcard({}, single("examples/tone.mp3"))`
+   — confirm the tone is audible/recordable at the output.
+3. Round-trip: `output.soundcard({}, input.soundcard({}))` with a
+   physical (or virtual/loopback) device — the output reproduces the
+   input; device-rate mismatch exercises the resampler.
+
 ## Live harbor (`src/live/harbor.rs`)
 
 Decodes DJ uploads to target-spec PCM: MP3/Vorbis/AAC via symphonia, Opus via
@@ -253,6 +328,17 @@ real time and plays completely, as before.
   (`idx = ((crc >> 24) ^ b) & 0xff`), not into the result. A previous bug
   corrupted every page silently; `crc_matches_external_reference` guards it.
 - Opus requires 48 kHz sample rate — never feed it the bus rate directly.
+- `FallbackSource::label()` reports the *next* child's label the moment the
+  current child exhausts (even on the current track's last pull), because
+  it follows `active()`. Harmless for `on_metadata` (an event fires one
+  buffer early), but a `map_metadata` rewrite observed on that pull targets
+  the *next* track — tests that assert a rewritten title on a short
+  `sequence` track must give the rewrite time to land before the boundary.
+- mlua maps a missing Lua field to `false` for a plain `bool` `get` target
+  (nil is falsy), so optional bools with a non-false default must be read
+  as `Option<bool>` and `unwrap_or`'d — `blank.detect`'s
+  `exhaust_while_blank` defaulted to false and broke fallback handover
+  until read that way.
 - The `on_metadata` closure stays in the Lua registry for the process
   lifetime, keeping its channel `Sender` alive: the event loop can never wait
   for channel disconnection, so it polls `recv_timeout` and exits on the

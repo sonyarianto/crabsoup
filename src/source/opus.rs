@@ -618,7 +618,7 @@ mod tests {
             for &s in &buf[..n] {
                 energy += (s as f64) * (s as f64);
             }
-            assert!(n % 2 == 0);
+            assert!(n.is_multiple_of(2));
         }
         // ~1 s of stereo at 44.1 kHz (resampler latency excluded).
         assert!(total > 80_000 && total < 100_000, "total={total}");

@@ -12,6 +12,7 @@ use crabsoup::live::harbor::Harbor;
 use crabsoup::output::file::FileOutput;
 use crabsoup::output::hls::HlsOutput;
 use crabsoup::output::icecast::IcecastOutput;
+use crabsoup::output::soundcard::SoundcardOutput;
 use crabsoup::script::{self, ScriptResult};
 use crabsoup::source::AudioSource;
 
@@ -184,6 +185,23 @@ fn main() -> crabsoup::Result<()> {
         handles.push(std::thread::spawn(move || output.run()));
     }
 
+    // Soundcard outputs: the device and stream are opened up front so a
+    // missing device fails fast; the consumer thread then just pumps frames
+    // into the ring the realtime callback drains.
+    let soundcard = if cli.preview {
+        Vec::new()
+    } else {
+        result.soundcard_outputs.clone()
+    };
+    for cfg in &soundcard {
+        let mut output = SoundcardOutput::new(cfg.clone(), tap.register(), spec.rate, chans);
+        output.set_shutdown(shutdown.clone());
+        output
+            .connect()
+            .map_err(|e| format!("output.soundcard: {e}"))?;
+        handles.push(std::thread::spawn(move || output.run()));
+    }
+
     // The tap pulls on its own thread; the Lua-owning main thread runs the
     // script event loop.
     let tap_shutdown = shutdown.clone();
@@ -252,9 +270,16 @@ fn print_result(result: &ScriptResult, preview: bool) {
                 hls.retention
             ));
         }
+        for sc in &result.soundcard_outputs {
+            lines.push(format!(
+                "soundcard: output to {}",
+                sc.device.as_deref().unwrap_or("(default)")
+            ));
+        }
         if result.outputs.is_empty()
             && result.file_outputs.is_empty()
             && result.hls_outputs.is_empty()
+            && result.soundcard_outputs.is_empty()
         {
             lines.push("output: preview only".to_string());
         }

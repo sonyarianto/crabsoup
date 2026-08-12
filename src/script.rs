@@ -37,13 +37,15 @@ use symphonia::core::audio::SignalSpec;
 
 use crate::config::{
     collect_audio, ControlConfig, FileOutputConfig, HlsOutputConfig, LiveConfig, MixerConfig,
-    OutputConfig, OutputFormat, StreamConfig,
+    OutputConfig, OutputFormat, SoundcardOutputConfig, StreamConfig,
 };
 use crate::engine::effects::{Agc, Amplify, Compressor, EffectSource};
 use crate::engine::mixer::{CrossfadeMixer, SmartFade};
 use crate::request::{resolve, RequestConfig, RequestUri, TrackCues};
+use crate::source::blank_detect::{BlankDetectConfig, BlankDetectSource};
 use crate::source::cue_cut::CueCutSource;
 use crate::source::pipe::{PcmFormat, PipeConfig, PipeSource};
+use crate::source::soundcard::{SoundcardInputConfig, SoundcardInputSource};
 use crate::source::playlist::Playlist;
 use crate::source::replaygain::ReplayGainSource;
 use crate::source::request::{RequestQueue, RequestQueueSource};
@@ -59,6 +61,7 @@ pub struct ScriptResult {
     pub outputs: Vec<OutputConfig>,
     pub file_outputs: Vec<FileOutputConfig>,
     pub hls_outputs: Vec<HlsOutputConfig>,
+    pub soundcard_outputs: Vec<SoundcardOutputConfig>,
     /// Shared state of the `request.queue` source, handed to the telnet
     /// server for `queue.push`/`queue.list`/`queue.clear`/`queue.skip`.
     pub request_queue: Option<Arc<RequestQueue>>,
@@ -85,6 +88,7 @@ struct ScriptState {
     outputs: Vec<OutputConfig>,
     file_outputs: Vec<FileOutputConfig>,
     hls_outputs: Vec<HlsOutputConfig>,
+    soundcard_outputs: Vec<SoundcardOutputConfig>,
     request_queue: Option<Arc<RequestQueue>>,
     /// Named telnet commands registered by `server.register(name, fn)`;
     /// the names mirror into `ScriptResult` for the control port.
@@ -104,6 +108,12 @@ struct ScriptState {
     /// Lua callbacks registered by `request.dynamic`; indexed by hook id.
     /// Each returns the next request URI or nil to end the source.
     dynamic_hooks: Vec<mlua::Function>,
+    /// Lua callbacks registered by `blank.detect`'s `on_blank` option;
+    /// indexed by hook id, invoked when a wrapped source goes blank.
+    blank_hooks: Vec<mlua::Function>,
+    /// Lua callbacks registered by `map_metadata`; indexed by hook id, each
+    /// rewrites a track title (returning a table or nil).
+    map_metadata_hooks: Vec<mlua::Function>,
 }
 
 /// Events sent from engine threads to the Lua-owning thread. The payload is
@@ -125,6 +135,16 @@ pub enum ScriptEvent {
     /// (`Some(uri)`) or the end of the stream (`None`). The audio thread
     /// never blocks on the reply — it polls and returns silence meanwhile.
     NextRequest { index: usize, reply: mpsc::Sender<Option<String>> },
+    /// A `blank.detect` source went blank (dead air detected).
+    Blank { hook_id: usize },
+    /// `map_metadata`: rewrite a track's title. The callback runs on the
+    /// Lua-owning thread with `{ title = ... }` and replies with the
+    /// rewritten title (or `None` to keep the original).
+    MapMetadata {
+        hook_id: usize,
+        title: String,
+        reply: mpsc::Sender<Option<String>>,
+    },
     /// Request the engine stop (future `server.register` use).
     Shutdown,
 }
@@ -140,6 +160,8 @@ pub struct ScriptRuntime {
     track_hooks: Vec<mlua::Function>,
     custom_commands: Vec<(String, mlua::Function)>,
     dynamic_hooks: Vec<mlua::Function>,
+    blank_hooks: Vec<mlua::Function>,
+    map_metadata_hooks: Vec<mlua::Function>,
 }
 
 impl ScriptRuntime {
@@ -237,6 +259,48 @@ impl ScriptRuntime {
                     }
                 };
                 let _ = reply.send(next);
+            }
+            ScriptEvent::Blank { hook_id } => {
+                let Some(cb) = self.blank_hooks.get(hook_id) else {
+                    return;
+                };
+                if let Err(e) = cb.call::<()>(()) {
+                    log::warn!("blank.detect callback error: {e}");
+                }
+            }
+            ScriptEvent::MapMetadata {
+                hook_id,
+                title,
+                reply,
+            } => {
+                let Some(cb) = self.map_metadata_hooks.get(hook_id) else {
+                    let _ = reply.send(None);
+                    return;
+                };
+                let table = match self.lua.create_table() {
+                    Ok(t) => t,
+                    Err(e) => {
+                        log::warn!("map_metadata callback: table error: {e}");
+                        let _ = reply.send(None);
+                        return;
+                    }
+                };
+                if let Err(e) = table.set("title", title.as_str()) {
+                    log::warn!("map_metadata callback: {e}");
+                    let _ = reply.send(None);
+                    return;
+                }
+                // The callback returns a (possibly modified) table; a `title`
+                // field replaces the original, anything else keeps it.
+                let out = match cb.call::<Option<Table>>(table) {
+                    Ok(Some(t)) => t.get::<Option<String>>("title").ok().flatten(),
+                    Ok(None) => None,
+                    Err(e) => {
+                        log::warn!("map_metadata callback error: {e}");
+                        None
+                    }
+                };
+                let _ = reply.send(out);
             }
             ScriptEvent::Shutdown => {
                 end.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -363,6 +427,121 @@ impl AudioSource for OnTrackSource {
 
     fn label(&self) -> Option<String> {
         self.child.label()
+    }
+
+    fn replaygain_db(&self) -> Option<f32> {
+        self.child.replaygain_db()
+    }
+
+    fn crossfade_overrides(&self) -> Option<(Option<f64>, Option<f64>)> {
+        self.child.crossfade_overrides()
+    }
+
+    fn skip(&mut self) {
+        self.child.skip();
+    }
+}
+
+/// Pull budget while a `map_metadata` rewrite is outstanding: at ~92.9 ms
+/// per 4096-frame buffer this is ~0.7 s of wall time, well past the event
+/// loop's 100 ms poll, without ever blocking the audio thread.
+const MAP_METADATA_PULL_BUDGET: u32 = 8;
+
+/// Wrapper source that rewrites its child's label through a Lua callback
+/// (Liquidsoap `map_metadata`). Unlike [`OnMetadataSource`] (fire-and-forget)
+/// the rewrite actually has to *reach* the output, so the source polls the
+/// Lua reply for a bounded number of pulls and falls back to the original
+/// label on timeout or callback error. The reply is carried over the same
+/// A2 event-loop bridge as every other callback — only owned `Send` strings
+/// cross threads.
+struct MapMetadataSource {
+    child: Box<dyn AudioSource>,
+    event_tx: mpsc::Sender<ScriptEvent>,
+    hook_id: usize,
+    /// Raw child label of the current track.
+    raw: Option<String>,
+    /// Rewritten label from the Lua callback; `Some` once a reply lands.
+    mapped: Option<String>,
+    /// Reply channel of the in-flight rewrite, while one is outstanding.
+    pending: Option<mpsc::Receiver<Option<String>>>,
+    /// Pulls left before giving up on the reply (raw label wins).
+    pulls_left: u32,
+}
+
+impl MapMetadataSource {
+    fn new(child: Box<dyn AudioSource>, event_tx: mpsc::Sender<ScriptEvent>, hook_id: usize) -> Self {
+        Self {
+            child,
+            event_tx,
+            hook_id,
+            raw: None,
+            mapped: None,
+            pending: None,
+            pulls_left: 0,
+        }
+    }
+
+    /// Ask the Lua callback for a rewrite of the current (raw) label.
+    fn request_rewrite(&mut self) {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let _ = self.event_tx.send(ScriptEvent::MapMetadata {
+            hook_id: self.hook_id,
+            title: self.raw.clone().unwrap_or_default(),
+            reply: reply_tx,
+        });
+        self.pending = Some(reply_rx);
+        self.pulls_left = MAP_METADATA_PULL_BUDGET;
+    }
+
+    /// Collect an outstanding reply without blocking; `None` on give-up.
+    fn poll_reply(&mut self) {
+        let Some(rx) = self.pending.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Some(title)) => self.mapped = Some(title),
+            Ok(None) => {}
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                if self.pulls_left > 0 {
+                    self.pulls_left -= 1;
+                    self.pending = Some(rx);
+                }
+                // Budget exhausted: keep the raw label.
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+        }
+    }
+}
+
+impl AudioSource for MapMetadataSource {
+    fn next_buffer(&mut self, buffer: &mut [f32]) -> usize {
+        let n = self.child.next_buffer(buffer);
+        let raw = self.child.label();
+        if raw != self.raw {
+            // Track boundary: fire a rewrite for the new title. Fires even
+            // when the child carries no label, so a script can add titles to
+            // unlabeled tracks.
+            self.raw = raw;
+            self.mapped = None;
+            self.request_rewrite();
+        }
+        self.poll_reply();
+        n
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.child.is_exhausted()
+    }
+
+    fn remaining_seconds(&self) -> Option<f64> {
+        self.child.remaining_seconds()
+    }
+
+    fn label(&self) -> Option<String> {
+        match &self.mapped {
+            Some(mapped) => Some(mapped.clone()),
+            None => self.raw.clone().or_else(|| self.child.label()),
+        }
     }
 
     fn replaygain_db(&self) -> Option<f32> {
@@ -1409,22 +1588,74 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
     globals.set("request", request)?;
 
     // ---- test sources (Liquidsoap `blank`, `sine`) -----------------------
+    // `blank` is a callable table: `blank({duration})` makes a silence source
+    // and `blank.detect(src, opts)` wraps a source against dead air (Part
+    // F4). Lua calls a table's `__call` as `f(self, args...)`, hence the
+    // leading `_self` parameter.
     let blank_state = state.clone();
-    globals.set(
-        "blank",
-        lua.create_function(move |_, opts: Option<Table>| {
-            let duration: Option<f64> = match &opts {
-                Some(t) => t.get("duration")?,
+    let blank_fn = lua.create_function(move |_, (_self, opts): (Table, Option<Table>)| {
+        let duration: Option<f64> = match &opts {
+            Some(t) => t.get("duration")?,
+            None => None,
+        };
+        let (spec, _) = bus(&blank_state);
+        let src: Box<dyn AudioSource> = match duration {
+            Some(d) => Box::new(BlankSource::with_duration(d, spec.rate)),
+            None => Box::new(BlankSource::new()),
+        };
+        Ok(LuaSource::new(src))
+    })?;
+    let blank_detect_state = state.clone();
+    let blank_detect_tx = event_tx.clone();
+    let blank_detect_fn =
+        lua.create_function(move |_, (mut source, opts): (LuaSource, Option<Table>)| {
+            let threshold = opt_f64(&opts, "threshold", -40.0)?;
+            let duration = opt_f64(&opts, "duration", 2.0)?;
+            let restart = opt_f64(&opts, "restart", 1.0)?;
+            // Read as Option<bool>: mlua maps a *missing* field to `false`
+            // for a plain `bool` target (nil is falsy), which would flip the
+            // safe default.
+            let exhaust_while_blank: bool = match &opts {
+                Some(t) => t.get::<Option<bool>>("exhaust_while_blank")?.unwrap_or(true),
+                None => true,
+            };
+            let on_blank: Option<mlua::Function> = match &opts {
+                Some(t) => t.get("on_blank")?,
                 None => None,
             };
-            let (spec, _) = bus(&blank_state);
-            let src: Box<dyn AudioSource> = match duration {
-                Some(d) => Box::new(BlankSource::with_duration(d, spec.rate)),
-                None => Box::new(BlankSource::new()),
+            let (spec, _) = bus(&blank_detect_state);
+            let child = source.take();
+            let on_blank = match on_blank {
+                Some(cb) => {
+                    let hook_id = blank_detect_state.borrow().blank_hooks.len();
+                    blank_detect_state.borrow_mut().blank_hooks.push(cb);
+                    let tx = blank_detect_tx.clone();
+                    Some(Box::new(move || {
+                        let _ = tx.send(ScriptEvent::Blank { hook_id });
+                    }) as Box<dyn FnMut() + Send>)
+                }
+                None => None,
             };
-            Ok(LuaSource::new(src))
-        })?,
-    )?;
+            let wrapped = BlankDetectSource::new(
+                child,
+                BlankDetectConfig {
+                    threshold_db: threshold as f32,
+                    duration_secs: duration as f32,
+                    restart_secs: restart as f32,
+                    exhaust_while_blank,
+                    on_blank,
+                    sample_rate: spec.rate,
+                    channels: spec.channels.count(),
+                },
+            );
+            Ok(LuaSource::new(Box::new(wrapped)))
+        })?;
+    let blank = lua.create_table()?;
+    blank.set("detect", blank_detect_fn)?;
+    let blank_mt = lua.create_table()?;
+    blank_mt.set("__call", blank_fn)?;
+    blank.set_metatable(Some(blank_mt));
+    globals.set("blank", blank)?;
 
     let sine_state = state.clone();
     globals.set(
@@ -1782,8 +2013,27 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         // is a marker that exhausts immediately when composed.
         Ok(LuaSource::new(Box::new(SilenceSource::new())))
     })?;
+    // ---- soundcard capture (Liquidsoap `input.soundcard`) -------------------
+    // Opens the device at script evaluation (fail fast); the cpal stream runs
+    // on its own realtime thread and the source drains it on the pull thread.
+    let sc_state = state.clone();
+    let soundcard_fn = lua.create_function(move |_, opts: Option<Table>| {
+        let device: Option<String> = match &opts {
+            Some(t) => t.get("device")?,
+            None => None,
+        };
+        let (spec, _) = bus(&sc_state);
+        let src = SoundcardInputSource::open(
+            &SoundcardInputConfig { device },
+            spec.rate,
+            spec.channels.count(),
+        )
+        .map_err(mlua::Error::runtime)?;
+        Ok(LuaSource::new(Box::new(src)))
+    })?;
     let input = lua.create_table()?;
     input.set("harbor", harbor_fn)?;
+    input.set("soundcard", soundcard_fn)?;
     globals.set("input", input)?;
 
     let telnet_state = state.clone();
@@ -1920,6 +2170,17 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
             Ok(())
         })?,
     )?;
+    let sc_out_state = state.clone();
+    output.set(
+        "soundcard",
+        lua.create_function(move |_, (opts, mut source): (Table, LuaSource)| {
+            let device: Option<String> = opts.get("device")?;
+            let mut s = sc_out_state.borrow_mut();
+            claim_root(&mut s, &mut source)?;
+            s.soundcard_outputs.push(SoundcardOutputConfig { device });
+            Ok(())
+        })?,
+    )?;
     globals.set("output", output)?;
 
     // ---- metadata hooks (Liquidsoap `on_metadata`, `on_track`) ---------------
@@ -1949,6 +2210,23 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         })?,
     )?;
 
+    // ---- metadata rewrite (Liquidsoap `map_metadata`) ---------------------
+    // Unlike `on_metadata`, the callback's return value *reaches the output*:
+    // the wrapped source asks for a rewrite when the child's label changes
+    // and reports the rewritten title (or the original on timeout/error).
+    let map_state = state.clone();
+    let map_tx = event_tx.clone();
+    globals.set(
+        "map_metadata",
+        lua.create_function(move |_, (mut source, callback): (LuaSource, mlua::Function)| {
+            let hook_id = map_state.borrow().map_metadata_hooks.len();
+            let child = source.take();
+            map_state.borrow_mut().map_metadata_hooks.push(callback);
+            let wrapped = MapMetadataSource::new(child, map_tx.clone(), hook_id);
+            Ok(LuaSource::new(Box::new(wrapped)))
+        })?,
+    )?;
+
     // ---- evaluate ---------------------------------------------------------
     lua.load(src)
         .set_name("crabsoup.lua")
@@ -1964,6 +2242,7 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         outputs: std::mem::take(&mut s.outputs),
         file_outputs: std::mem::take(&mut s.file_outputs),
         hls_outputs: std::mem::take(&mut s.hls_outputs),
+        soundcard_outputs: std::mem::take(&mut s.soundcard_outputs),
         request_queue: s.request_queue.take(),
         custom_commands: s.custom_commands.iter().map(|(n, _)| n.clone()).collect(),
         root: s.root.take(),
@@ -1982,6 +2261,8 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         track_hooks: std::mem::take(&mut s.track_hooks),
         custom_commands: std::mem::take(&mut s.custom_commands),
         dynamic_hooks: std::mem::take(&mut s.dynamic_hooks),
+        blank_hooks: std::mem::take(&mut s.blank_hooks),
+        map_metadata_hooks: std::mem::take(&mut s.map_metadata_hooks),
     };
     Ok((runtime, result))
 }
@@ -2081,11 +2362,7 @@ mod tests {
                  output.preview(sine({{freq = 440, duration = 1}}))"
             );
             let err = run(&script).err().expect("script fails");
-            assert!(
-                err.to_string().contains(detail),
-                "{name:?}: {}",
-                err.to_string()
-            );
+            assert!(err.to_string().contains(detail), "{name:?}: {err}");
         }
     }
 
@@ -2100,6 +2377,41 @@ mod tests {
         )
         .expect("script runs");
         assert!(res.preview.is_some());
+    }
+
+    #[test]
+    fn output_soundcard_registers_without_opening_a_device() {
+        // Unlike `input.soundcard`, the device is opened only at connect()
+        // time in main, so registration is deterministic anywhere.
+        let (_rt, res) = run(
+            r#"
+            output.soundcard({}, sine({freq = 440, duration = 1}))
+            "#,
+        )
+        .expect("script runs");
+        assert_eq!(res.soundcard_outputs.len(), 1);
+        assert!(res.root.is_some(), "output.soundcard claims the root");
+    }
+
+    #[test]
+    fn input_soundcard_opens_or_fails_gracefully_without_a_device() {
+        // The capture device opens at script evaluation, so this is
+        // environment-dependent by design: with a device present a real
+        // stream is created (and closed on drop); without one the error is
+        // clear and actionable rather than a panic.
+        match run("output.preview(input.soundcard({}))") {
+            Ok(_) => {}
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("no default input device")
+                        || msg.contains("no default input config")
+                        || msg.contains("cannot open device")
+                        || msg.contains("cannot start stream"),
+                    "{msg}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2757,6 +3069,155 @@ mod tests {
         _rt.drain_metadata();
         let tracks: mlua::Table = _rt.global("tracks").expect("tracks table");
         assert_eq!(tracks.raw_len(), 1, "blank labels itself, so one boundary");
+    }
+
+    // ---- Part F4: blank.detect -----------------------------------------
+
+    #[test]
+    fn blank_detect_hands_off_to_fallback_and_fires_on_blank() {
+        // A source that goes silent partway (tone then forever-silence via
+        // `add`) must trip the detector: the Lua `on_blank` fires once, and
+        // the `fallback` composed around it switches to the backup child.
+        let (_rt, res) = run(
+            r#"
+            blanked = 0
+            src = blank.detect(add({sine({freq = 440, duration = 0.3}), blank()}),
+                               {threshold = -60, duration = 0.1, restart = 0.2,
+                                on_blank = function() blanked = blanked + 1 end})
+            output.preview(fallback({src, sine({freq = 880})}))
+            "#,
+        )
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        // 0.3 s tone (~3.2 buffers at 4096 frames/44.1 kHz), then ~0.1 s of
+        // silence before detection: 8 buffers drives well past the handover.
+        for _ in 0..8 {
+            root.next_buffer(&mut buf);
+        }
+        assert_eq!(
+            root.label().as_deref(),
+            Some("sine 880 Hz"),
+            "fallback must have taken over from the blank source"
+        );
+        drop(root);
+        _rt.drain_metadata();
+        let blanked: u64 = _rt.global("blanked").expect("blanked counter");
+        assert_eq!(blanked, 1, "on_blank fired once per episode");
+    }
+
+    // ---- Part F3: map_metadata -----------------------------------------
+
+    #[test]
+    fn map_metadata_rewrites_titles_in_order() {
+        let (_rt, res) = run(
+            r#"
+            src = map_metadata(sequence({sine({freq = 440, duration = 0.2}),
+                                         sine({freq = 880, duration = 0.2})}),
+                               function(m) return {title = "Rewritten: " .. m.title} end)
+            output.preview(src)
+            "#,
+        )
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        // The rewrite is requested on the pull that observes the boundary;
+        // the Lua reply lands on the next pull. (A `sequence` label jumps to
+        // the next child the moment the current one exhausts, so the first
+        // track is long enough that the rewrite lands before that happens.)
+        root.next_buffer(&mut buf);
+        _rt.drain_metadata();
+        root.next_buffer(&mut buf);
+        assert_eq!(root.label().as_deref(), Some("Rewritten: sine 440 Hz"));
+        // Drive through the 0.2 s first track into the second.
+        for _ in 0..3 {
+            root.next_buffer(&mut buf);
+        }
+        _rt.drain_metadata();
+        root.next_buffer(&mut buf);
+        assert_eq!(root.label().as_deref(), Some("Rewritten: sine 880 Hz"));
+    }
+
+    #[test]
+    fn map_metadata_nil_keeps_the_original_title() {
+        let (_rt, res) = run(
+            r#"
+            src = map_metadata(sine({freq = 440}), function(m) return nil end)
+            output.preview(src)
+            "#,
+        )
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        root.next_buffer(&mut buf);
+        _rt.drain_metadata();
+        root.next_buffer(&mut buf);
+        assert_eq!(root.label().as_deref(), Some("sine 440 Hz"));
+    }
+
+    #[test]
+    fn map_metadata_callback_error_keeps_the_original_title() {
+        let (_rt, res) = run(
+            r#"
+            src = map_metadata(sine({freq = 440}), function() error("boom") end)
+            output.preview(src)
+            "#,
+        )
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        root.next_buffer(&mut buf);
+        _rt.drain_metadata();
+        root.next_buffer(&mut buf);
+        assert_eq!(root.label().as_deref(), Some("sine 440 Hz"));
+    }
+
+    #[test]
+    fn map_metadata_falls_back_to_raw_when_lua_never_replies() {
+        // The event loop is never drained: the rewrite cannot land, so the
+        // bounded pull budget must give up and report the raw label instead
+        // of stalling the audio thread.
+        let (_rt, res) = run(
+            r#"
+            src = map_metadata(sine({freq = 440}), function(m) return {title = "never"} end)
+            output.preview(src)
+            "#,
+        )
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        for _ in 0..10 {
+            assert!(root.next_buffer(&mut buf) > 0, "audio keeps flowing");
+        }
+        assert_eq!(
+            root.label().as_deref(),
+            Some("sine 440 Hz"),
+            "raw label after the bounded wait expires"
+        );
+    }
+
+    #[test]
+    fn blank_detect_leaves_healthy_audio_alone() {
+        let (_rt, res) = run(
+            r#"
+            blanked = 0
+            output.preview(blank.detect(sine({freq = 440}),
+                                        {duration = 0.2,
+                                         on_blank = function() blanked = blanked + 1 end}))
+            "#,
+        )
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        for _ in 0..4 {
+            assert!(root.next_buffer(&mut buf) > 0, "healthy audio keeps flowing");
+        }
+        assert_eq!(root.label().as_deref(), Some("sine 440 Hz"));
+        assert!(!root.is_exhausted());
+        drop(root);
+        _rt.drain_metadata();
+        let blanked: u64 = _rt.global("blanked").expect("blanked counter");
+        assert_eq!(blanked, 0, "no false positive on a healthy source");
     }
 
     /// Audio in two bursts with a stretch of paused (non-exhausted)

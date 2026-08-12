@@ -29,12 +29,21 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # Opus encoding (libopus FFI) + Ogg muxing
 audiopus = "0.3.0-rc.0"
 ogg = "0.9"
+# TLS for `https://` request resolution: wraps the hand-rolled HTTP/1.1
+# client's TcpStream (ring provider — pure Rust, no system TLS deps).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1.0"
+# Cross-platform audio device I/O (Part F2: `input.soundcard` /
+# `output.soundcard`).
+cpal = "0.15"
 # .liq scripting (Liquidsoap-style config in Lua); vendored Lua 5.4,
 # no `send` feature: sources are Rc-based and stay on the main thread.
 mlua = { version = "0.10", default-features = false, features = ["lua54", "vendored"] }
 
 [dev-dependencies]
 criterion = "0.5"
+# Self-signed certs for the local TLS test server (https download tests).
+rcgen = "0.13"
 
 [[bench]]
 name = "engine"

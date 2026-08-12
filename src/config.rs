@@ -88,6 +88,13 @@ pub struct FileOutputConfig {
     pub bitrate: u32,
 }
 
+/// Config for `output.soundcard`: play the tap on a physical output device.
+#[derive(Debug, Clone, Default)]
+pub struct SoundcardOutputConfig {
+    /// Named device, or the default output device when `None`.
+    pub device: Option<String>,
+}
+
 /// Config for `output.hls`: encode the tap to AAC and slice it into a
 /// sliding window of MPEG-TS HLS segments with a media playlist.
 #[derive(Debug, Clone)]

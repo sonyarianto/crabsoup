@@ -9,8 +9,9 @@ Opus) to an Icecast server.
   `smart_crossfade`, `single`, `blank`, `sine`, `amplify`, `compress`,
   `normalize`, `pipe`, `fallback`, `sequence`, `random`, `switch`,
   `rotate`, `jingles`, `mksafe`, `add`, `cue_cut`, `request.queue`,
-  `request.dynamic`, `input.harbor`, `output.icecast`, `output.preview`,
-  `server.telnet`, `set`, `log`
+  `request.dynamic`, `blank.detect`, `map_metadata`, `input.harbor`,
+  `input.soundcard`, `output.icecast`, `output.preview`,
+  `output.soundcard`, `server.telnet`, `set`, `log`
 - Playlist scheduling: recursive directory scan, explicit file lists, loop and shuffle
 - Gapless crossfades with configurable overlap and fade curve
 - Live DJ harbor: an Icecast source-protocol listener (`PUT /live`); the
@@ -119,6 +120,16 @@ Named options are passed as Lua tables; most have defaults. `format` is
  (dayparting), `rotate` (weighted round-robin), `blank`/`sine`
  (test tones, both accept an optional `duration`), `mksafe(src)`
  (never fails outright — silence covers an exhausted or failed child),
+ `blank.detect(src, {threshold, duration, restart, exhaust_while_blank,
+ on_blank})`
+ (dead-air guard: watches the wrapped source's RMS level, and after
+ `duration` seconds of sub-`threshold` silence goes blank — by default
+ reporting exhausted so a `fallback` around it hands over automatically;
+ `on_blank` fires a Lua callback once per episode and the source recovers
+ when audio returns), `map_metadata(src, function(m) return {title = ...}
+ end)`
+ (rewrites each track's title through a Lua callback before it reaches the
+ output — the original is kept on nil/error/timeout),
  `add({a, b}, {weights = {...}})`
  (N-source sample-wise sum, optional per-source weights — background bed +
  voice-over), `cue_cut(src, {cue_in, cue_out, fade_in, fade_out})`
@@ -206,7 +217,9 @@ phase).
 | `compress(threshold, ratio, ...)`, `normalize(target, ...)` | `compress(src, {threshold = -12, ratio = 2})`, `normalize(src, {target = -13})` | done |
 | replaygain (liq `amplify` + RG tags) | `replaygain(src, {max_boost = 6, max_cut = 6})` | done |
 | `input.harbor(...)` | `input.harbor({...})` | done |
+| `input.soundcard()` | `input.soundcard({device = nil})` — cpal capture bridged into the bus via an SPSC ring | done |
 | `output.icecast(...)` | `output.icecast({...}, src)` | done (single output; multi-mount in Phase 4) |
+| `output.soundcard()` | `output.soundcard({device = nil}, src)` — tap consumer playing through the device | done |
 | `output.file(...)` | `output.file({path, format}, src)` | done |
 | `server.telnet(...)` | `server.telnet({port = 1234})` | done |
 | telnet `skip` / `status` / `uptime` | same | done |
@@ -215,7 +228,7 @@ phase).
 | `request.queue` + telnet `queue.push` | done |
 | `switch` (dayparting), `rotate` | `switch({ {when = {days, from, to}, src = ...}, {src = default} })`, `rotate({...}, {weights = ...})` | done |
 | `on_metadata` / `on_track` | `on_metadata(fn, src)` (title table), `on_track(fn, src)` (boundary, no args) | done |
-| `http://` request resolution | `single("http://...")`, `playlist(entries)`, `queue.push <url>` — download-then-play with retry/timeout, temp files auto-removed | done |
+| `http://` / `https://` request resolution | `single("http(s)://...")`, `playlist(entries)`, `queue.push <url>` — download-then-play with retry/timeout, temp files auto-removed; HTTPS via rustls (redirects may cross scheme) | done |
 | `server.register` custom telnet commands | `server.register("name", function(args) return reply end)` | done |
 | `mksafe(src)` (never fails outright; silence fallback) | `mksafe(src)` — composes `fallback({src, blank()})` | done |
 | `add([...])` (N-source additive mix) | `add({a, b}, {weights = {0.5, 1.0}})` — sample-wise sum, bed + voice-over | done |
@@ -224,6 +237,8 @@ phase).
 | per-track crossfade (`liq_fade_in`/`liq_fade_out`) | `annotate:liq_fade_in="2",liq_fade_out="3":...` or `cue_cut(src, {fade_in, fade_out})` — overrides `crossfade_seconds` per track | done |
 | `smart_crossfade` (level-aware transitions) | `smart_crossfade({directory, fade_out, fade_mid, threshold})` — outgoing tail loudness picks the fade window | done |
 | `pipe(process, src)` (external processor) | `pipe({process = "...", format = "s16le"\|"s24le", restart_backoff = 500}, src)` — stdin/stdout raw PCM bridge; bypass + restart on death | done |
+| `blank.detect(src)` (dead-air detection) | `blank.detect(src, {threshold = -40, duration = 2, restart = 1, on_blank = fn})` — silence -> blank + exhausted so `fallback` hands over | done |
+| `map_metadata(f, src)` (title rewrite) | `map_metadata(src, function(m) return {title = ...} end)` — rewritten title reaches the output; original kept on nil/error | done |
 
 ## Testing
 

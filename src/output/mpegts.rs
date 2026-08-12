@@ -215,6 +215,10 @@ mod tests {
     }
 
     #[test]
+    // The bit-layout expressions below intentionally fold to zero for the
+    // test constants (ADTS length 200 < 2048; PTS top bits of a 1 s
+    // timestamp) — they document the layout, so allow the erasing-op lint.
+    #[allow(clippy::erasing_op)]
     fn adts_wraps_in_pes_with_pts() {
         let mut mux = MpegTsMuxer::new();
         let mut out = Vec::new();

@@ -323,6 +323,74 @@ Stereo-Tool-specific live check needs a licensed binary, so it is manual)
 produces correctly-shaped output; killing the subprocess mid-stream
 triggers bypass rather than a hang or panic.
 
+### Part F — real-deployment gaps
+
+**Status: F1, F2, F4, F3 all shipped — see Done (cont.).** From auditing the
+shipped code against what real deployments hit (not a fixed Liquidsoap
+checklist): HTTPS and soundcard I/O were the gaps most likely to actually
+block someone in production; `map_metadata` and `blank.detect` close the
+metadata/dead-air gaps.
+
+- [x] **F1 — HTTPS support**: `rustls` (ring provider, pure Rust) wraps the
+      hand-rolled HTTP client's `TcpStream` — a wrap-the-transport change:
+      the status/header/body parsing never knows which transport carried
+      the bytes. `http://` keeps a plain socket; `https://` completes the
+      TLS handshake and feeds the same byte stream through. Redirects that
+      cross scheme (`https` -> `http` and back) re-open the transport per
+      hop (`HttpUrl` now carries its `Scheme`, default ports 80/443, and
+      `join()` preserves the scheme). Trust store is the webpki-roots
+      Mozilla set, built once; tests inject a self-signed `rcgen` cert as
+      the root store against a local `rustls` server, so the TLS fetch test
+      needs no live internet. The old
+      `https_is_rejected_with_a_clear_message` test is replaced by
+      `https_downloads_a_body_from_a_local_tls_server` (Content-Length
+      body over TLS) and `https_redirect_to_http_swaps_the_transport`
+      (302 from the TLS server to a plain server). `single`/`playlist`/
+      `queue.push`/`request.dynamic` all accept `https://` now.
+- [x] **F2 — soundcard I/O**: `cpal` for both directions. `input.soundcard`
+      captures via the harbor-style bridge: cpal's realtime callback
+      (never blocking or allocating — stack-chunk conversion, `push_slice`
+      into the ring) feeds an SPSC ring, and the `AudioSource` half drains,
+      converts channels, and resamples to the bus spec (exact passthrough
+      when rates match). `output.soundcard` mirrors it in reverse: a tap
+      consumer resamples/converts and pushes into a ring drained by the
+      device callback (silence on underrun). `cpal::Stream` is `!Send` on
+      ALSA, so both sides keep the stream on a parked driver thread
+      (`std::thread::park`, woken on drop) and only the ring halves cross
+      threads. Device open is a synchronous bounded handshake — a missing
+      device fails at script evaluation (`input.soundcard`) or at startup
+      (`output.soundcard` connect, like `output.file`). Hardware tests
+      don't exist in CI; the bridge math is unit-tested with a synthetic
+      producer, and the manual verification steps live in
+      `docs/ARCHITECTURE.md`.
+- [x] **F4 — `blank.detect`**: dead-air detection reusing the DSP
+      envelope/RMS shape. Per-buffer RMS vs `threshold_db` (default -40);
+      sub-threshold for `duration` seconds (default 2) -> blank state:
+      silence, one `on_blank` event per episode (a new `ScriptEvent::Blank`
+      over the A2 bridge), and (default `exhaust_while_blank = true`)
+      `is_exhausted() == true` so a `fallback` composed around it hands
+      over automatically. After `restart` seconds the child is re-checked;
+      audio above the threshold brings the source back (and clears the
+      exhausted flag). `blank` is now a callable table:
+      `blank({duration})` and `blank.detect(src, {threshold, duration,
+      restart, exhaust_while_blank, on_blank})`. Exact-sample unit tests
+      (detection timing, recovery, fire-once-per-episode,
+      exhaust-while-blank toggle) plus script tests (fallback handover +
+      Lua counter, no false positive on healthy audio).
+- [x] **F3 — `map_metadata`**: metadata rewrite hook. Wraps the source;
+      when the child's label changes (even to none, so scripts can add
+      titles), the Lua callback runs on the A2 event loop with
+      `{ title = ... }` and returns a table whose `title` replaces the
+      label everywhere downstream (Icecast announce, status). Unlike
+      `on_metadata` the reply must reach the output, so
+      `MapMetadataSource` polls it for a bounded pull budget (~0.7 s,
+      never blocking the audio thread) and falls back to the original
+      label on timeout, callback error, or `nil`. `map_metadata(src,
+      function(m) return {title = ...} end)` registered next to
+      `on_metadata`. Script tests: rewrite in order across a sequence,
+      `nil` keeps the original, callback error keeps the original, and the
+      bounded wait expires to the raw label when Lua never replies.
+
 ### Suggested execution order
 
 1. Buffer-reuse pass in `CrossfadeMixer`/`PriorityMixer` (perf, low risk, no
@@ -342,6 +410,9 @@ triggers bypass rather than a hang or panic.
 7. Part E (`pipe()` external-process operator — needs no A1/A2; the
    audio-path resilience design is the real work, not the plumbing) —
    **done** (see Done section).
+8. Part F (real-deployment gaps) — **done**: F1 (HTTPS via rustls) → F2
+   (soundcard I/O via cpal) → F4 (`blank.detect`) → F3 (`map_metadata`),
+   per the plan's suggested order (see Done (cont.)).
 
 If effort is constrained to one track at a time, prioritize Track C through
 C1/C2 ahead of Track B phases 5–8 — output breadth (file recording, multiple
@@ -355,6 +426,90 @@ approximates the operator surface, not the language); LADSPA plugin hosting
 practice).
 
 ## Done (cont.)
+- [x] Part F3 (`map_metadata`): `src/script.rs` — `MapMetadataSource` wraps
+      a child and rewrites its label through a Lua callback (Liquidsoap
+      `map_metadata`). On a label change (even to none, so scripts can add
+      titles) it sends `ScriptEvent::MapMetadata { hook_id, title, reply }`
+      over the A2 bridge; the Lua-owning event loop calls the callback with
+      `{ title = ... }` and replies with the returned table's `title`, or
+      `None` (nil / error / missing field) to keep the original. Unlike
+      fire-and-forget `on_metadata`, the rewrite has to *reach the output*,
+      so the source polls the reply for a bounded pull budget
+      (`MAP_METADATA_PULL_BUDGET` = 8 pulls, ~0.7 s — never blocks the
+      audio thread, well past the event loop's 100 ms poll) and falls back
+      to the raw label when the budget expires or the callback errors.
+      `map_metadata(src, function(m) return {title = ...} end)` registered
+      next to `on_metadata`; README + ARCHITECTURE + parity map updated.
+      Inline tests (203 -> 207): rewrite in order across a 0.2 s sine
+      sequence (reply lands between pulls), `nil` keeps the original,
+      callback error keeps the original, and the bounded wait expires to
+      the raw label when the event loop never replies (audio keeps
+      flowing throughout).
+- [x] Part F4 (`blank.detect`): `src/source/blank_detect.rs` —
+      `BlankDetectSource`, a silence/ded-air guard (Liquidsoap
+      `blank.detect`). Per-buffer RMS in dBFS (`buffer_rms_db`, the DSP
+      effects' envelope shape); sub-threshold for `duration_secs` (default
+      2 s) puts the source into a blank state: it emits silence (returns 0)
+      and, by default, reports `is_exhausted() == true` so a `fallback`
+      composed around it hands over automatically — the zero-configuration
+      dead-air guard. After `restart_secs` (default 1 s) the child is
+      re-checked on every pull; audio above the threshold recovers the
+      source (and clears the exhausted flag). An optional `on_blank`
+      closure fires once per episode; script.rs wires it to a new
+      `ScriptEvent::Blank { hook_id }` (new `blank_hooks` vec) so a script
+      can log/alert/skip. `blank` is now a callable table (`__call`
+      metamethod) carrying `blank.detect`; Lua gotcha: mlua maps a
+      *missing* `exhaust_while_blank` field to `false` for a plain `bool`
+      target (nil is falsy), so the option is read as `Option<bool>` with
+      a true default. Inline tests (207 -> 218): unit tests for detection
+      timing (loud never triggers; 0.2 s of silence goes blank and
+      exhausts), recovery after the restart window, fire-once-per-episode,
+      and `exhaust_while_blank = false` reporting the child state; script
+      tests for fallback handover + Lua counter (a `tone-then-silence`
+      source trips the detector and the fallback switches to the backup
+      child) and no false positive on healthy audio.
+- [x] Part F2 (soundcard I/O): `src/source/soundcard.rs` +
+      `src/output/soundcard.rs` — `cpal` for both directions, using the
+      harbor-style ring bridge. `input.soundcard({device = nil})` opens the
+      device at script evaluation (synchronous bounded handshake — a
+      missing/broken device fails with a clear error); cpal's realtime
+      callback converts in stack chunks and `push_slice`s into an SPSC
+      ring (never blocks/allocates), and the `AudioSource` half drains,
+      converts channels, and resamples to the bus spec on the pull thread
+      (exact passthrough when rates match). `output.soundcard({device =
+      nil}, src)` is a tap consumer (claims the root like `output.file`):
+      the consumer thread resamples/converts (reusable scratch) and pushes
+      into a ring the device callback drains (silence on underrun); the
+      device + stream open at `connect()` in main so a missing device
+      fails fast at startup. `cpal::Stream` is `!Send` on ALSA, so both
+      sides park a driver thread owning the stream (`std::thread::park`,
+      unparked on drop) and only the ring halves cross threads. Inline
+      tests (204 -> 207): the ring+resampler bridge with a synthetic
+      producer (same-rate passthrough, 22.05k mono -> 44.1k stereo bus
+      upsample, drop-oldest stale-window cap), the channel-conversion
+      helper, and script registration (output.soundcard registers without
+      a device; input.soundcard opens or fails gracefully). Manual
+      verification steps (loopback round-trip) documented in
+      `docs/ARCHITECTURE.md`; README + parity map updated.
+- [x] Part F1 (HTTPS): `src/request.rs` — the hand-rolled HTTP client now
+      speaks `https://` by wrapping its `TcpStream` in a `rustls` client
+      (ring provider; webpki-roots Mozilla trust store built once in a
+      `OnceLock`). `Transport` (plain `TcpStream` | `rustls::StreamOwned`)
+      implements `Read + Write`, so the status/header/chunked/redirect
+      parsing is byte-identical over both transports; `HttpUrl` carries a
+      `Scheme` (default ports 80/443), and each redirect hop re-opens the
+      transport so scheme-crossing `Location`s (`https` -> `http` and
+      back) work. `download` takes an optional root-store override (tests
+      inject a self-signed `rcgen` cert against a local `rustls` server —
+      no live internet needed). The old
+      `https_is_rejected_with_a_clear_message` test is replaced by
+      `https_downloads_a_body_from_a_local_tls_server` and
+      `https_redirect_to_http_swaps_the_transport`; `request_uri_classifies`
+      now covers `https://` too. `single("https://...")`, `playlist`
+      entries, `queue.push`, and `request.dynamic` all resolve HTTPS now.
+      Cargo.toml: `rustls` (no default features, ring+std+tls12),
+      `webpki-roots`, dev-dep `rcgen`. README + ARCHITECTURE + parity map
+      updated.
 - [x] Part E (`pipe`): `src/source/pipe.rs` — `PipeSource`, a source that
       runs an external raw-PCM processor (Liquidsoap `pipe(process=...,
       input)`) as a pipeline stage. A writer thread pulls the child

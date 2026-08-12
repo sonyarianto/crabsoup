@@ -1,3 +1,4 @@
+pub mod blank_detect;
 pub mod cue_cut;
 pub mod file;
 pub mod opus;
@@ -5,6 +6,7 @@ pub mod pipe;
 pub mod playlist;
 pub mod replaygain;
 pub mod request;
+pub mod soundcard;
 
 use symphonia::core::audio::SignalSpec;
 

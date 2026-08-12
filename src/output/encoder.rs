@@ -691,7 +691,7 @@ fn opus_streams_a_real_48k_mp3_file() {
         44100,
         symphonia::core::audio::Channels::FRONT_LEFT | symphonia::core::audio::Channels::FRONT_RIGHT,
     );
-    let mut src = crate::source::file::FileSource::open(&file, spec, 4096).unwrap();
+    let mut src = crate::source::file::FileSource::open(file, spec, 4096).unwrap();
     let mut enc = OpusEncoder::new(44100, 2, 128_000, "test").unwrap();
     let mut buf = vec![0f32; 4096 * 2];
     let mut all = Vec::new();
