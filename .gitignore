@@ -2,3 +2,5 @@
 /media
 /crabsoup.lua
 /jingles
+/website/node_modules
+/website/.vitepress/dist

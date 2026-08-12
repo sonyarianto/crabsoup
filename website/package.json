@@ -1,0 +1,14 @@
+{
+  "name": "crabsoup-website",
+  "private": true,
+  "type": "module",
+  "description": "Crabsoup documentation site (VitePress)",
+  "scripts": {
+    "dev": "vitepress dev",
+    "build": "vitepress build",
+    "preview": "vitepress preview"
+  },
+  "devDependencies": {
+    "vitepress": "^1.6.4"
+  }
+}
