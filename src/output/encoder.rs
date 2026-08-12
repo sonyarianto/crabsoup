@@ -44,7 +44,7 @@ pub fn create_encoder(
     }
 }
 
-fn clamp_i16(s: f32) -> i16 {
+pub(crate) fn clamp_i16(s: f32) -> i16 {
     (s.clamp(-1.0, 1.0) * 32767.0) as i16
 }
 

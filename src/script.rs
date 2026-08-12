@@ -43,6 +43,7 @@ use crate::engine::effects::{Agc, Amplify, Compressor, EffectSource};
 use crate::engine::mixer::{CrossfadeMixer, SmartFade};
 use crate::request::{resolve, RequestConfig, RequestUri, TrackCues};
 use crate::source::cue_cut::CueCutSource;
+use crate::source::pipe::{PcmFormat, PipeConfig, PipeSource};
 use crate::source::playlist::Playlist;
 use crate::source::replaygain::ReplayGainSource;
 use crate::source::request::{RequestQueue, RequestQueueSource};
@@ -1611,6 +1612,48 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         })?,
     )?;
 
+    // ---- external process pipeline (Liquidsoap `pipe`) --------------------
+    // Shells out to an external raw-PCM processor (stdin/stdout): a writer
+    // thread feeds the child source to the process and a reader thread
+    // decodes its output back into the graph (see `src/source/pipe.rs`).
+    // The source is consumed like any other operator and wrapped in a fresh
+    // Arc that the bridge threads share (bypass mode pulls it directly).
+    let pipe_state = state.clone();
+    globals.set(
+        "pipe",
+        lua.create_function(move |_, (opts, mut source): (Table, LuaSource)| {
+            let process: String = opts
+                .get("process")
+                .map_err(|_| mlua::Error::runtime("pipe: `process` is required"))?;
+            let format = opts
+                .get::<Option<String>>("format")?
+                .unwrap_or_else(|| "s16le".into());
+            let format = match format.as_str() {
+                "s16le" => PcmFormat::S16Le,
+                "s24le" => PcmFormat::S24Le,
+                other => {
+                    return Err(mlua::Error::runtime(format!(
+                        "pipe: unknown format {other:?} (use \"s16le\" or \"s24le\")"
+                    )))
+                }
+            };
+            let config = PipeConfig {
+                format,
+                restart_backoff_ms: opts.get("restart_backoff").unwrap_or(500),
+            };
+            let (spec, fpb) = bus(&pipe_state);
+            let src = PipeSource::spawn(
+                &process,
+                Arc::new(Mutex::new(source.take())),
+                spec.channels.count(),
+                fpb,
+                config,
+            )
+            .map_err(mlua::Error::runtime)?;
+            Ok(LuaSource::new(Box::new(src)))
+        })?,
+    )?;
+
     // ---- mksafe (Liquidsoap defensive wrapper) ---------------------------
     // Wraps any source so it never fails outright: when the child exhausts
     // (or is a request source that failed to resolve), an infinite blank
@@ -2126,6 +2169,50 @@ mod tests {
             );
             assert!(!root.is_exhausted(), "mksafe must never exhaust");
         }
+    }
+
+    #[test]
+    fn pipe_passthrough_plays_and_composes_with_mksafe() {
+        let (_rt, res) = run(
+            r#"
+            output.preview(mksafe(pipe({process = "cat", format = "s16le"},
+                                       sine({freq = 440, duration = 0.2}))))
+            "#,
+        )
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        let mut non_silent = 0;
+        for _ in 0..200 {
+            let n = root.next_buffer(&mut buf);
+            non_silent += buf[..n].iter().filter(|&&s| s.abs() > 0.01).count();
+            if root.is_exhausted() {
+                break;
+            }
+        }
+        // 0.2 s at 44100 Hz through the pipe (a couple of 4096-frame chunks),
+        // then the mksafe blank covers the exhausted pipe with silence.
+        assert!(non_silent >= 8000, "pipe produced only {non_silent} samples");
+        assert!(!root.is_exhausted(), "mksafe must keep the pipe source alive");
+    }
+
+    #[test]
+    fn pipe_requires_process_and_valid_format() {
+        let err = match run(
+            "output.preview(pipe({format = \"s16le\"}, sine({freq = 440})))",
+        ) {
+            Ok(_) => panic!("pipe without `process` must fail"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("process"));
+
+        let err = match run(
+            "output.preview(pipe({process = \"cat\", format = \"s32le\"}, sine({freq = 440})))",
+        ) {
+            Ok(_) => panic!("pipe with a bad format must fail"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("s16le"));
     }
 
     #[test]

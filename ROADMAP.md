@@ -208,7 +208,7 @@ buffer; audio-rate callbacks need their own budget/backpressure story.
 Touches `src/output/` and `src/live/`, not `script.rs` source composition —
 no contention with Part B.
 
-- [ ] **C1 — `output.file` + multi-mount `output.icecast`** (needs A1;
+- [x] **C1 — `output.file` + multi-mount `output.icecast`** (needs A1;
       multi-mount landed with Part A; `output.file` landed as its own
       commit — see Done section).
 - [x] **C2 — AAC encoder** (no dependency, can start immediately): new
@@ -274,6 +274,55 @@ production use, not by build effort.
 - [x] **D5 — level-aware smart crossfade**: builds on D2; do last.
       (Landed — see Done section.)
 
+### Part E — external process pipeline (`pipe()`)
+
+**Status: shipped — see Done (cont.) for the landing note.**
+
+Runs outboard broadcast processors (Thimeo Stereo Tool being the concrete
+case) as a pipeline stage, generic like Liquidsoap's own
+`pipe(process=..., input)`: closed-source processors have no safe C ABI to
+bind (see the LADSPA non-goal), so a subprocess is the isolation boundary —
+a crash kills the processor, not crabsoup, and no new `unsafe` exists here.
+Liquidsoap users already run Stereo Tool exactly this way in production
+(`pipe(process='/stereo_tool_cmd_64 - - -s /mySettings.sts -q -k
+"<LICENSE>"', input)` — stdin/stdout as `-`/`-`, no named pipes).
+
+Design:
+
+- Two bridge threads per instance: a writer pulls the child source and
+  feeds the subprocess's stdin as raw little-endian PCM (s16le default,
+  s24le optional; the clamp/convert math matches the LAME path in
+  `encoder.rs`); a reader drains stdout, decodes complete frames back to
+  f32, and pushes into a bounded queue. Not lock-step — outboard
+  processors have real look-ahead latency, so the queue decouples the two
+  streams; backpressure runs end-to-end (queue full -> reader blocks ->
+  the process blocks -> the writer blocks), so the child source advances
+  at the consumption rate and nothing buffers unboundedly.
+- `AudioSource` on top: `next_buffer` accumulates queue chunks into the
+  caller's buffer (short poll; zero = silence while the process catches
+  up), drains queued audio to a clean end when the child exhausts, and
+  falls back to **bypass** (raw child audio, unprocessed) the moment the
+  process dies — restarting with a fixed backoff (`restart_backoff`,
+  default 500 ms, the Icecast reconnect philosophy), never blocking the
+  pull loop on a respawn. `mksafe(pipe(...))` is the documented
+  deployment shape.
+- Lua: `pipe({process = "...", format = "s16le"|"s24le",
+  restart_backoff = 500}, src)`. The wrapped child is shared (`Arc`) with
+  the bridge threads — unlike other operators, `pipe` does not consume the
+  source.
+
+Real caveats (documented, not blockers): the processor is an unbundled,
+separately-licensed binary the operator installs themselves; a
+`-k "<LICENSE>"` argument is visible in `ps aux`; per-output processing
+means N subprocesses — run one `pipe()` on the shared root unless
+per-output processing is a real requirement.
+
+Acceptance: a script piping a source through a real external command (the
+test suite uses `cat` and `head -c N` — dependency-free passthroughs; the
+Stereo-Tool-specific live check needs a licensed binary, so it is manual)
+produces correctly-shaped output; killing the subprocess mid-stream
+triggers bypass rather than a hang or panic.
+
 ### Suggested execution order
 
 1. Buffer-reuse pass in `CrossfadeMixer`/`PriorityMixer` (perf, low risk, no
@@ -284,10 +333,15 @@ production use, not by build effort.
    (see Done section).
 4. Track B, sequential: Phase 2 (DSP) — **done**; next Phase 3 → Phase 5 →
    Phase 6 (needs A2) → Phase 7 → Phase 8 (stretch).
-5. Track C once A1 lands: C1 → C2 → C3 (needs C2) → C4 (on request).
+5. Track C once A1 lands: C1 → C2 → C3 (needs C2) — all **done** (see
+   Done section); C4 (Shoutcast) — **not built** (unchecked by hand; only
+   if a concrete need shows up).
 6. Part D — **complete**: D1 (`mksafe`), D3 (`add()`), D2
    (`annotate:`/`cue_cut` + per-track fades), D4 (`request.dynamic`),
    D5 (level-aware smart crossfade) — all **done** (see Done section).
+7. Part E (`pipe()` external-process operator — needs no A1/A2; the
+   audio-path resilience design is the real work, not the plumbing) —
+   **done** (see Done section).
 
 If effort is constrained to one track at a time, prioritize Track C through
 C1/C2 ahead of Track B phases 5–8 — output breadth (file recording, multiple
@@ -301,6 +355,49 @@ approximates the operator surface, not the language); LADSPA plugin hosting
 practice).
 
 ## Done (cont.)
+- [x] Part E (`pipe`): `src/source/pipe.rs` — `PipeSource`, a source that
+      runs an external raw-PCM processor (Liquidsoap `pipe(process=...,
+      input)`) as a pipeline stage. A writer thread pulls the child
+      (shared `Arc<Mutex<Box<dyn AudioSource>>>` — not consumed, bypass
+      needs it too), encodes f32 -> s16le (default) or s24le (the same
+      clamp formula as the LAME path in `encoder.rs`), and writes the
+      subprocess's stdin (`sh -c`, stderr inherited so processor errors
+      are visible); a reader thread decodes stdout back to f32 in complete
+      frames and pushes into a bounded 8-chunk `sync_channel`, giving
+      end-to-end backpressure (queue full -> reader blocks -> the process
+      blocks -> the writer blocks) so the child advances at the
+      consumption rate and buffering stays bounded. `next_buffer` pulls
+      the queue (50 ms poll; zero = silence while the process catches up,
+      so a stalled processor never stalls the engine), drains queued audio
+      on graceful child exhaustion (`Draining` -> `Ended`, with a
+      1-second stall cap for processes that never close stdout), and on
+      process death switches to **bypass** — pulls the child directly —
+      while the supervisor restarts the process with a fixed
+      `restart_backoff` (default 500 ms, Icecast-reconnect style, retries
+      forever; the backoff sleep is interruptible on drop). Drop kills the
+      child so a torn engine never orphans a processor. `pipe({process,
+      format, restart_backoff}, src)` registered in `script.rs`;
+      README + ARCHITECTURE + parity map + `examples/crabsoup.pipe.lua`
+      updated. Inline tests (177 -> 186): s16le and s24le `cat`
+      passthroughs reproduce an independent reference sine within
+      quantization error (the reference is aligned by one buffer for the
+      startup chunk — the child advances 128 frames per pull); `head -c N`
+      death with a long backoff falls back to bypass and keeps playing the
+      raw child; a fast-dying process with a 10 ms backoff restarts
+      repeatedly without hanging or silencing; a 0.2 s finite child drains
+      cleanly (only the sub-buffer tail is dropped) and then exhausts; a
+      broken command bypasses immediately; an empty `process` is rejected
+      at spawn; script-level `pipe` + `mksafe` composition plays a real
+      source and stays alive.      (Caught during bring-up: a `try_send` of a
+      `mem::take`d chunk dropped one buffer of audio every time the queue
+      was full — the value is now restored on `Full`; and the reference
+      alignment bug above. Review hardening: the dead process is reaped
+      (`try_wait`, bounded) on every respawn so restarts never accumulate
+      zombies, and `pipe` consumes its source like every other operator
+      (wrapped in a fresh `Arc` for the bridge threads). Caveat: at
+      end-of-stream the drain drops the sub-buffer tail and gives up after
+      1 s of silence, so a processor with more than ~1.7 s of internal
+      latency loses its tail — acceptable for v1.)
 - [x] Harbor → mixer handoff is now a lock-free SPSC ring (`ringbuf`
       0.4.8): `src/live/source.rs` — `LiveSource` holds a `HeapCons<f32>`
       and pops with `pop_slice`, enforcing the drop-oldest cap on pull

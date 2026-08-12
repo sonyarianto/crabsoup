@@ -33,10 +33,10 @@ One engine thread plus one thread per output:
 
 - Registers the Liquidsoap-flavoured Lua stdlib: `playlist`,
   `smart_crossfade`, `single`, `blank`, `sine`, `amplify`, `compress`,
-  `normalize`, `jingles`, `fallback`/`sequence`/`random`, `switch`,
-  `rotate`, `mksafe`, `add`, `cue_cut`, `input.harbor`, `output.icecast`,
-  `output.file`, `output.preview`, `server.telnet`, `on_metadata`,
-  `on_track`, `set`, `log`.
+  `normalize`, `pipe`, `jingles`, `fallback`/`sequence`/`random`,
+  `switch`, `rotate`, `mksafe`, `add`, `cue_cut`, `input.harbor`,
+  `output.icecast`, `output.file`, `output.preview`, `server.telnet`,
+  `on_metadata`, `on_track`, `set`, `log`.
 - `add({a, b}, {weights = {0.5, 1.0}})` sums N children sample-by-sample
   (`AddSource`): the first child writes straight into the output buffer,
   the rest pull into a reusable scratch that is added in (no per-call
@@ -44,6 +44,21 @@ One engine thread plus one thread per output:
   rejected. Exhausts only when every child exhausts, so a looping bed keeps
   a finite voice-over mix alive; label/remaining/replaygain come from the
   first child, `skip` forwards to all children.
+- `pipe({process, format, restart_backoff}, src)` runs an external
+  raw-PCM processor (Stereo Tool etc.) as a pipeline stage — see
+  `src/source/pipe.rs`. A writer thread pulls the child source and feeds
+  the subprocess's stdin (`sh -c`, stderr inherited) as little-endian
+  PCM; a reader thread decodes stdout back into a bounded 8-chunk queue.
+  Backpressure runs end-to-end (queue full -> reader blocks -> the
+  process blocks -> the writer blocks), so the child advances at the
+  consumption rate. The audio side (`PipeSource`) accumulates queue
+  chunks into the consumer's buffer; on process death the reader flips
+  the pipe to **bypass** (raw child audio) while the supervisor restarts
+  the process with a fixed `restart_backoff` (Icecast reconnect-style,
+  forever), never blocking the pull loop. A child-source exhaustion
+  drains the queue (`Draining`) before ending. Unlike other operators,
+  `pipe` does not consume its child (`Arc` shared with the writer), so
+  bypass can pull it directly and `mksafe(pipe(...))` composes.
 - Sources are Lua userdata wrapping `Arc<Mutex<Box<dyn AudioSource>>>` so they
   compose; `LuaSource::take` steals the box via `mem::replace` (mlua keeps a
   clone on the stack during the call, so `Arc::try_unwrap` would fail).

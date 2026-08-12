@@ -7,10 +7,10 @@ Opus) to an Icecast server.
 
 - `.lua` scripting: real Lua with Liquidsoap-style functions — `playlist`,
   `smart_crossfade`, `single`, `blank`, `sine`, `amplify`, `compress`,
-  `normalize`, `fallback`, `sequence`, `random`, `switch`, `rotate`,
-  `jingles`, `mksafe`, `add`, `cue_cut`, `request.queue`, `request.dynamic`,
-  `input.harbor`, `output.icecast`, `output.preview`, `server.telnet`,
-  `set`, `log`
+  `normalize`, `pipe`, `fallback`, `sequence`, `random`, `switch`,
+  `rotate`, `jingles`, `mksafe`, `add`, `cue_cut`, `request.queue`,
+  `request.dynamic`, `input.harbor`, `output.icecast`, `output.preview`,
+  `server.telnet`, `set`, `log`
 - Playlist scheduling: recursive directory scan, explicit file lists, loop and shuffle
 - Gapless crossfades with configurable overlap and fade curve
 - Live DJ harbor: an Icecast source-protocol listener (`PUT /live`); the
@@ -51,6 +51,7 @@ Source layout:
 | `src/config.rs` | Configuration data types (filled by the script) |
 | `src/control.rs` | Telnet control port (jingles, shutdown) |
 | `src/source/` | `FileSource`, `Playlist` (scheduling), source composition |
+| `src/source/pipe.rs` | `PipeSource` — external-process pipeline (`pipe`) |
 | `src/engine/` | `CrossfadeMixer`, `PriorityMixer`, `MixCommand` |
 | `src/live/` | DJ harbor (Icecast source protocol listener) |
 | `src/output/` | `encoder.rs` (LAME/libopus/fdk-aac), `ogg_mux.rs`, `icecast_client.rs` (native source protocol), `icecast.rs` (pump + reconnect) |
@@ -84,6 +85,7 @@ Per-format test scripts live in `examples/`:
 ./target/release/crabsoup -c examples/crabsoup.opus.lua    # Opus -> /crabsoup.opus
 ./target/release/crabsoup -c examples/crabsoup.mp3.lua     # MP3  -> /crabsoup.mp3
 ./target/release/crabsoup -c examples/crabsoup.aac.lua     # AAC  -> /crabsoup.aac
+./target/release/crabsoup -c examples/crabsoup.pipe.lua    # external processor pipeline (preview)
 ./target/release/crabsoup -c examples/crabsoup.preview.lua # no broadcast
 ```
 
@@ -134,6 +136,17 @@ Named options are passed as Lua tables; most have defaults. `format` is
  baseline. `request.dynamic(function() return uri_or_nil end)` plays the
  requests its Lua callback returns, one ahead of the current track (nil
  ends the source) — a live-programming scheduler without a playlist file.
+ `pipe({process = "...", format = "s16le"|"s24le", restart_backoff = 500}, src)`
+ runs an external raw-PCM processor (e.g. Thimeo Stereo Tool —
+ Liquidsoap's own `pipe`): a writer thread feeds the child source to the
+ process's stdin as little-endian PCM and a reader thread decodes stdout
+ back into the graph. Not lock-step — a bounded queue decouples the two
+ streams and backpressure paces the child at the consumption rate. If the
+ process dies it is restarted after `restart_backoff` ms
+ (Icecast-reconnect style) while audio bypasses to the unprocessed child,
+ so the broadcast never drops; the child is *shared*, not consumed, so
+ `mksafe(pipe(...))` composes. A `-k "<LICENSE>"`-style argument is
+ visible in `ps aux` — expected for shelling out to a licensed binary.
  `smart_crossfade({directory = ...})` is a `playlist` whose transition
  window is chosen by the outgoing track's measured tail level: a loud tail
  gets a full `fade_out` crossfade, a quiet tail only a short `fade_mid`
@@ -194,7 +207,7 @@ phase).
 | replaygain (liq `amplify` + RG tags) | `replaygain(src, {max_boost = 6, max_cut = 6})` | done |
 | `input.harbor(...)` | `input.harbor({...})` | done |
 | `output.icecast(...)` | `output.icecast({...}, src)` | done (single output; multi-mount in Phase 4) |
-| `output.file(...)` | `output.file({path, format}, src)` | planned (Phase 4) |
+| `output.file(...)` | `output.file({path, format}, src)` | done |
 | `server.telnet(...)` | `server.telnet({port = 1234})` | done |
 | telnet `skip` / `status` / `uptime` | same | done |
 | live DJ ducking (`mksafe`/`switch` + request scheduling) | `input.harbor` + `PriorityMixer` ducking (harbor connect/disconnect drives the mixer) | done |
@@ -210,6 +223,7 @@ phase).
 | `annotate:` cue points + `cue_cut(src)` | `annotate:liq_cue_in="30",liq_cue_out="180":/path/track.mp3` on any request URI; `cue_cut(src, {cue_in, cue_out})` | done |
 | per-track crossfade (`liq_fade_in`/`liq_fade_out`) | `annotate:liq_fade_in="2",liq_fade_out="3":...` or `cue_cut(src, {fade_in, fade_out})` — overrides `crossfade_seconds` per track | done |
 | `smart_crossfade` (level-aware transitions) | `smart_crossfade({directory, fade_out, fade_mid, threshold})` — outgoing tail loudness picks the fade window | done |
+| `pipe(process, src)` (external processor) | `pipe({process = "...", format = "s16le"\|"s24le", restart_backoff = 500}, src)` — stdin/stdout raw PCM bridge; bypass + restart on death | done |
 
 ## Testing
 
