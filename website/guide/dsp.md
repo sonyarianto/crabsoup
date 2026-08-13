@@ -66,7 +66,7 @@ output — the original is kept on nil/error/timeout:
 map_metadata(src, function(m) return {title = "Artist - " .. m.title} end)
 ```
 
-## `on_metadata(fn, src)` / `on_track(fn, src)`
+## `on_metadata(src, fn)` / `on_track(src, fn)`
 
 Fire-and-forget Lua hooks: `on_metadata` gets the track's title table;
 `on_track` fires at any track boundary.

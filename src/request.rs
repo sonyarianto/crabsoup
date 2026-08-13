@@ -666,6 +666,44 @@ fn http_get(
     Err("too many redirects".into())
 }
 
+/// One-shot `POST` of a JSON body (the track-change webhook). Reuses the
+/// same transport as `http_get`; no redirects are followed (a webhook
+/// target is a fixed backend URL), and the response body is discarded
+/// beyond its status code.
+pub fn http_post_json(
+    url: &str,
+    body: &str,
+    timeout: Duration,
+    tls_roots: Option<&Arc<rustls::RootCertStore>>,
+) -> crate::Result<()> {
+    let target = HttpUrl::parse(url)?;
+    let mut stream = connect_transport(&target, timeout, tls_roots)?;
+    write!(
+        stream,
+        "POST {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: crabsoup/0.1\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        target.path,
+        target.host,
+        body.len(),
+        body
+    )?;
+    stream.flush()?;
+
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    reader.read_line(&mut status_line)?;
+    let mut status_words = status_line.split_whitespace();
+    let _protocol = status_words.next();
+    let code: u16 = status_words
+        .next()
+        .ok_or_else(|| format!("malformed status line: {status_line:?}"))?
+        .parse()
+        .map_err(|_| format!("malformed status line: {status_line:?}"))?;
+    if !(200..300).contains(&code) {
+        return Err(format!("webhook POST to {url} returned HTTP {code}").into());
+    }
+    Ok(())
+}
+
 /// Decode a chunked body into `file`.
 fn read_chunked(reader: &mut BufReader<Transport>, file: &mut File) -> crate::Result<()> {
     loop {
@@ -794,13 +832,52 @@ mod tests {
     #[test]
     fn http_get_downloads_a_content_length_body() {
         let body = b"RIFFxxxx\x00WAVEtest-bytes";
-        let url = serve("200 OK", vec![("Content-Length".into(), body.len().to_string())], body);
+        let url = serve(
+            "200 OK",
+            vec![("Content-Length".into(), body.len().to_string())],
+            body,
+        );
         let dest = std::env::temp_dir().join("crabsoup-test-dl.bin");
         let _ = std::fs::remove_file(&dest);
         http_get(&url, &dest, Duration::from_secs(5), None).expect("download");
         let got = std::fs::read(&dest).expect("read");
         assert_eq!(got, body);
         let _ = std::fs::remove_file(&dest);
+    }
+
+    #[test]
+    fn http_post_json_posts_the_body_and_accepts_2xx() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            drain_request(&mut stream);
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .expect("write");
+            stream.flush().expect("flush");
+        });
+        let url = format!("http://{addr}/hook");
+        http_post_json(&url, r#"{"title":"x"}"#, Duration::from_secs(5), None)
+            .expect("post succeeds");
+    }
+
+    #[test]
+    fn http_post_json_reports_non_2xx() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            drain_request(&mut stream);
+            stream
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")
+                .expect("write");
+            stream.flush().expect("flush");
+        });
+        let url = format!("http://{addr}/hook");
+        let err = http_post_json(&url, r#"{}"#, Duration::from_secs(5), None)
+            .expect_err("post fails");
+        assert!(err.to_string().contains("500"), "{err}");
     }
 
     #[test]

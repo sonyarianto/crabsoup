@@ -1472,6 +1472,67 @@ fn crossfading_playlist(
 }
 
 /// Evaluate a `.lua` script and return the runtime plus the engine wiring.
+/// Convert a Lua table into a JSON value for `http_post`. Supports
+/// string/integer keys with string/number/boolean/table values, and
+/// array-shaped tables (consecutive integer keys from 1).
+fn table_to_json(t: &mlua::Table) -> Result<serde_json::Value, String> {
+    let mut obj = serde_json::Map::new();
+    let mut is_array = true;
+    let mut next_index = 1usize;
+    for pair in t.clone().pairs::<mlua::Value, mlua::Value>() {
+        let (key, value) = pair.map_err(|e| e.to_string())?;
+        let json = value_to_json(&value)?;
+        match key {
+            mlua::Value::Integer(i) if i >= 1 => {
+                if is_array && i as usize == next_index {
+                    obj.insert(next_index.to_string(), json);
+                    next_index += 1;
+                } else {
+                    is_array = false;
+                    obj.insert(i.to_string(), json);
+                }
+            }
+            mlua::Value::String(s) => {
+                is_array = false;
+                obj.insert(s.to_string_lossy(), json);
+            }
+            other => {
+                is_array = false;
+                obj.insert(
+                    other.to_string().map_err(|e| e.to_string())?,
+                    json,
+                );
+            }
+        }
+    }
+    if is_array && next_index > 1 {
+        let mut items = Vec::with_capacity(next_index - 1);
+        for i in 1..next_index {
+            items.push(obj.remove(&i.to_string()).unwrap_or(serde_json::Value::Null));
+        }
+        Ok(serde_json::Value::Array(items))
+    } else {
+        Ok(serde_json::Value::Object(obj))
+    }
+}
+
+fn value_to_json(v: &mlua::Value) -> Result<serde_json::Value, String> {
+    Ok(match v {
+        mlua::Value::Nil => serde_json::Value::Null,
+        mlua::Value::Boolean(b) => serde_json::Value::Bool(*b),
+        mlua::Value::Integer(i) => serde_json::Value::Number((*i).into()),
+        mlua::Value::Number(n) => serde_json::Value::from(*n),
+        mlua::Value::String(s) => serde_json::Value::String(s.to_string_lossy()),
+        mlua::Value::Table(t) => table_to_json(t)?,
+        other => {
+            return Err(format!(
+                "unsupported Lua value in http_post payload: {}",
+                other.type_name()
+            ))
+        }
+    })
+}
+
 /// The [`ScriptRuntime`] owns the `Lua` instance, which now lives for the
 /// process lifetime: callbacks are invoked from its event loop on the
 /// calling thread only.
@@ -1495,6 +1556,25 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         "log",
         lua.create_function(|_, msg: String| {
             log::info!("script: {msg}");
+            Ok(())
+        })?,
+    )?;
+
+    // ---- outbound webhook (Crabcast track-change events) ---------------
+    // Fire-and-forget: spawn a thread so the Lua event loop never blocks
+    // on the network. The payload is a Lua table serialized to JSON.
+    globals.set(
+        "http_post",
+        lua.create_function(|_, (url, payload): (String, mlua::Table)| {
+            let value = table_to_json(&payload).map_err(mlua::Error::runtime)?;
+            let body = serde_json::to_string(&value)
+                .map_err(|e| mlua::Error::runtime(format!("http_post: {e}")))?;
+            std::thread::spawn(move || {
+                let timeout = Duration::from_secs(5);
+                if let Err(e) = crate::request::http_post_json(&url, &body, timeout, None) {
+                    log::warn!("http_post to {url} failed: {e}");
+                }
+            });
             Ok(())
         })?,
     )?;
@@ -3828,5 +3908,37 @@ mod tests {
         let mut buf = vec![0f32; 4096 * 2];
         root.next_buffer(&mut buf);
         assert_eq!(root.label().as_deref(), Some("sine 440 Hz"));
+    }
+
+    #[test]
+    fn table_to_json_converts_flat_and_nested_tables() {
+        let lua = Lua::new();
+        let t: mlua::Table = lua
+            .load("return {title = \"Some track.mp3\", started_at = \"now\", loud = true}")
+            .eval()
+            .unwrap();
+        let v = table_to_json(&t).unwrap();
+        assert_eq!(v["title"], "Some track.mp3");
+        assert_eq!(v["started_at"], "now");
+        assert_eq!(v["loud"], true);
+
+        let arr: mlua::Table = lua.load("return {\"a\", \"b\", \"c\"}").eval().unwrap();
+        let v = table_to_json(&arr).unwrap();
+        assert_eq!(v, serde_json::json!(["a", "b", "c"]));
+
+        let mixed: mlua::Table = lua
+            .load("return {1, 2, name = \"x\"}")
+            .eval()
+            .unwrap();
+        let v = table_to_json(&mixed).unwrap();
+        assert_eq!(v["name"], "x");
+        assert_eq!(v["1"], 1);
+    }
+
+    #[test]
+    fn table_to_json_rejects_unsupported_values() {
+        let lua = Lua::new();
+        let t: mlua::Table = lua.load("return {fn = function() end}").eval().unwrap();
+        assert!(table_to_json(&t).is_err());
     }
 }
