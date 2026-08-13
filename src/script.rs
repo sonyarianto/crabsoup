@@ -2041,6 +2041,8 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         let cfg = ControlConfig {
             host: opts.get("host").unwrap_or_else(|_| "127.0.0.1".into()),
             port: opts.get("port").unwrap_or(1234),
+            banner: opts.get("banner").unwrap_or(true),
+            http_port: opts.get("http_port").ok().flatten(),
         };
         telnet_state.borrow_mut().control = Some(cfg);
         Ok(())

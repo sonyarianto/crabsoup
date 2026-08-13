@@ -58,6 +58,45 @@ The name `json` is reserved and cannot be used as a `server.register`
 command name. `json` with no command replies
 `{"ok":false,"error":"usage: json <command>"}`.
 
+Machine clients should also set `banner = false` in `server.telnet` so the
+connection starts with replies instead of the prose welcome line:
+
+```lua
+server.telnet({port = 1234, banner = false})
+```
+
+## HTTP endpoint
+
+`server.telnet({http_port = N})` serves the same command surface over HTTP
+on the same host — no telnet framing, no banner, plain request/response.
+Every response body is the JSON envelope above.
+
+```lua
+server.telnet({port = 1234, http_port = 8080})
+```
+
+```sh
+curl http://localhost:8080/status
+# {"ok":true,"playing":"Some track.mp3","uptime_seconds":123}
+curl http://localhost:8080/queue
+curl http://localhost:8080/jingles
+curl -X POST -H 'Content-Type: application/json' \
+     -d '{"command":"jingles.play trance"}' http://localhost:8080/cmd
+```
+
+| Route | Effect |
+| --- | --- |
+| `GET /status` | `status` |
+| `GET /uptime` | `uptime` |
+| `GET /queue` | `queue.list` |
+| `GET /jingles` | `jingles.list` |
+| `POST /cmd` `{"command": "..."}` | any control command; reply identical to `json <command>` on telnet |
+
+HTTP status codes: 200 for `{"ok": true}`, 400 for `{"ok": false}`
+(unknown command, bad usage, malformed body), 404 for unknown routes,
+405 for wrong methods. See `examples/control_api.py` for a worked
+Crabcast-style backend using both transports.
+
 ## Custom commands
 
 Register your own handlers in the script with

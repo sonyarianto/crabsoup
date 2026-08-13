@@ -19,7 +19,14 @@
 //! single line of JSON, `{"ok": true, ...}` on success and
 //! `{"ok": false, "error": "..."}` on failure (custom Lua commands wrap
 //! their reply in `{"ok": true, "reply": "..."}`). The name `json` is
-//! reserved and cannot be a `server.register` command.
+//! reserved and cannot be a `server.register` command. `banner = false` on
+//! `server.telnet` skips the text welcome line so machine clients get
+//! replies from byte zero.
+//!
+//! `server.telnet({http_port = N})` also serves the same command surface
+//! over HTTP on the same host: `GET /status`, `GET /uptime`, `GET /queue`,
+//! `GET /jingles`, and `POST /cmd` with a JSON body
+//! `{"command": "..."}`. Every response reuses the JSON envelope above.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -28,7 +35,7 @@ use std::time::Duration;
 
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::config::ControlConfig;
@@ -92,6 +99,7 @@ impl ControlServer {
                     continue;
                 }
             };
+            let banner = self.config.banner;
             let jingles = self.jingles.clone();
             let queue = self.queue.clone();
             let tx = self.tx.clone();
@@ -99,7 +107,7 @@ impl ControlServer {
             let custom = self.custom_commands.clone();
             let event_tx = self.event_tx.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(socket, &jingles, queue, tx, &status, &custom, &event_tx).await
+                if let Err(e) = handle_connection(socket, banner, &jingles, queue, tx, &status, &custom, &event_tx).await
                 {
                     log::warn!("control port ({peer}): {e}");
                 }
@@ -108,8 +116,256 @@ impl ControlServer {
     }
 }
 
+/// Minimal HTTP/1.1 status/control endpoint on the same host as the
+/// telnet port (`server.telnet({http_port = N})`). Routes:
+///
+/// - `GET /status`, `GET /uptime`, `GET /queue`, `GET /jingles`
+/// - `POST /cmd` with a JSON body `{"command": "..."}` — any control
+///   command, with the same reply as `json <command>` on telnet
+///
+/// Every response is the JSON envelope; application errors (unknown
+/// command, bad usage) are HTTP 400, unknown routes 404, wrong methods
+/// 405. The response body is the single-line JSON from [`CommandReply::json`],
+/// so the contract is identical to the telnet JSON mode.
+pub struct ControlHttpServer {
+    host: String,
+    port: u16,
+    jingles: Vec<PathBuf>,
+    queue: Option<Arc<RequestQueue>>,
+    tx: mpsc::Sender<MixCommand>,
+    status: StatusHandle,
+    custom_commands: Arc<Vec<String>>,
+    event_tx: mpsc::Sender<ScriptEvent>,
+}
+
+impl ControlHttpServer {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        host: String,
+        port: u16,
+        jingles: Vec<PathBuf>,
+        queue: Option<Arc<RequestQueue>>,
+        tx: mpsc::Sender<MixCommand>,
+        status: StatusHandle,
+        custom_commands: Arc<Vec<String>>,
+        event_tx: mpsc::Sender<ScriptEvent>,
+    ) -> Self {
+        Self {
+            host,
+            port,
+            jingles,
+            queue,
+            tx,
+            status,
+            custom_commands,
+            event_tx,
+        }
+    }
+
+    /// Run the accept loop forever. Must be spawned onto a tokio runtime.
+    pub async fn run(self) {
+        let addr = format!("{}:{}", self.host, self.port);
+        let listener = match TcpListener::bind(&addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                log::error!("control http: failed to bind {addr}: {e}");
+                return;
+            }
+        };
+        log::info!("control http listening on {addr}");
+
+        loop {
+            let (socket, peer) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    log::warn!("control http: accept failed: {e}");
+                    continue;
+                }
+            };
+            let jingles = self.jingles.clone();
+            let queue = self.queue.clone();
+            let tx = self.tx.clone();
+            let status = self.status.clone();
+            let custom = self.custom_commands.clone();
+            let event_tx = self.event_tx.clone();
+            tokio::spawn(async move {
+                if let Err(e) = handle_http(socket, &jingles, queue, tx, &status, &custom, &event_tx).await {
+                    log::warn!("control http ({peer}): {e}");
+                }
+            });
+        }
+    }
+}
+
+const MAX_HTTP_HEADER: usize = 16 * 1024;
+const MAX_HTTP_BODY: usize = 64 * 1024;
+
+/// Serve one HTTP request and close the connection (no keep-alive).
+async fn handle_http(
+    mut socket: TcpStream,
+    jingles: &[PathBuf],
+    queue: Option<Arc<RequestQueue>>,
+    tx: mpsc::Sender<MixCommand>,
+    status: &StatusHandle,
+    custom: &[String],
+    event_tx: &mpsc::Sender<ScriptEvent>,
+) -> Result<(), String> {
+    let mut rng = SmallRng::from_entropy();
+    let (method, path, body) = match read_http_request(&mut socket).await {
+        Ok(req) => req,
+        Err((code, body)) => {
+            write_http(&mut socket, code, &body).await?;
+            return Ok(());
+        }
+    };
+    let ctx = DispatchCtx {
+        jingles,
+        queue: queue.as_deref(),
+        tx: &tx,
+        status,
+        custom,
+        event_tx,
+    };
+    let (code, body) = http_route(&method, &path, &body, &ctx, &mut rng);
+    write_http(&mut socket, code, &body).await
+}
+
+/// Read a full request (header block + Content-Length body). Returns
+/// `(method, path, body)` or the HTTP error response to send.
+async fn read_http_request(
+    socket: &mut TcpStream,
+) -> Result<(String, String, String), (u16, String)> {
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 2048];
+    let head_end = loop {
+        if buf.len() > MAX_HTTP_HEADER {
+            return Err((431, http_error("request header too large")));
+        }
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos;
+        }
+        let n = socket
+            .read(&mut chunk)
+            .await
+            .map_err(|e| (400, http_error(&format!("read error: {e}"))))?;
+        if n == 0 {
+            return Err((400, http_error("connection closed mid-request")));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+    let (method, path) = match parse_request_head(&head) {
+        Ok(p) => p,
+        Err((code, msg)) => return Err((code, http_error(&msg))),
+    };
+    let mut body = buf[head_end + 4..].to_vec();
+    if let Some(len) = content_length(&head) {
+        if len > MAX_HTTP_BODY {
+            return Err((413, http_error("request body too large")));
+        }
+        while body.len() < len {
+            let n = socket
+                .read(&mut chunk)
+                .await
+                .map_err(|e| (400, http_error(&format!("read error: {e}"))))?;
+            if n == 0 {
+                return Err((400, http_error("connection closed mid-body")));
+            }
+            body.extend_from_slice(&chunk[..n]);
+        }
+        body.truncate(len);
+    }
+    Ok((method, path, String::from_utf8_lossy(&body).into_owned()))
+}
+
+/// Parse the request line of a header block into `(method, path)`.
+fn parse_request_head(head: &str) -> Result<(String, String), (u16, String)> {
+    let line = head.lines().next().unwrap_or("");
+    let mut parts = line.split_whitespace();
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(method), Some(path), Some(_version)) => Ok((method.into(), path.into())),
+        _ => Err((400, "malformed request line".into())),
+    }
+}
+
+/// Content-Length header value, if present (case-insensitive).
+fn content_length(head: &str) -> Option<usize> {
+    head.lines().skip(1).find_map(|l| {
+        let (name, value) = l.split_once(':')?;
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            value.trim().parse().ok()
+        } else {
+            None
+        }
+    })
+}
+
+/// Route a parsed request to the control command surface and render the
+/// JSON response. `http_route` is sync so tests can call it directly.
+fn http_route(
+    method: &str,
+    path: &str,
+    body: &str,
+    ctx: &DispatchCtx,
+    rng: &mut SmallRng,
+) -> (u16, String) {
+    let command: String = match (method, path) {
+        ("GET", "/status") => "status".into(),
+        ("GET", "/uptime") => "uptime".into(),
+        ("GET", "/queue") => "queue.list".into(),
+        ("GET", "/jingles") => "jingles.list".into(),
+        ("POST", "/cmd") => match serde_json::from_str::<serde_json::Value>(body) {
+            Ok(v) => match v.get("command").and_then(serde_json::Value::as_str) {
+                Some(c) => c.to_string(),
+                None => return (400, http_error("missing \"command\" string field")),
+            },
+            Err(e) => return (400, http_error(&format!("invalid JSON body: {e}"))),
+        },
+        ("GET" | "POST", _) => return (404, http_error(&format!("not found: {method} {path}"))),
+        _ => return (405, http_error(&format!("method not allowed: {method}"))),
+    };
+    match dispatch(&command, ctx, rng) {
+        CommandResult::Reply(r) => {
+            let code = if matches!(&r, CommandReply::Err(_)) { 400 } else { 200 };
+            (code, r.json())
+        }
+        // `exit`/`quit` close the telnet connection; over HTTP just ack.
+        CommandResult::Exit => (200, r#"{"ok":true,"message":"bye"}"#.into()),
+    }
+}
+
+fn http_error(msg: &str) -> String {
+    serde_json::json!({ "ok": false, "error": msg }).to_string()
+}
+
+async fn write_http(socket: &mut TcpStream, code: u16, body: &str) -> Result<(), String> {
+    let reason = match code {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        413 => "Payload Too Large",
+        431 => "Request Header Fields Too Large",
+        _ => "Error",
+    };
+    let head = format!(
+        "HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    socket
+        .write_all(head.as_bytes())
+        .await
+        .map_err(|e| format!("write: {e}"))?;
+    socket
+        .write_all(body.as_bytes())
+        .await
+        .map_err(|e| format!("write: {e}"))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     socket: TcpStream,
+    banner: bool,
     jingles: &[PathBuf],
     queue: Option<Arc<RequestQueue>>,
     tx: mpsc::Sender<MixCommand>,
@@ -122,7 +378,9 @@ async fn handle_connection(
     let mut line = String::new();
     let mut rng = SmallRng::from_entropy();
 
-    reply(&mut writer, "welcome to the crabsoup control port (help for commands)").await?;
+    if banner {
+        reply(&mut writer, "welcome to the crabsoup control port (help for commands)").await?;
+    }
 
     loop {
         line.clear();
@@ -742,5 +1000,98 @@ mod tests {
             }
             CommandResult::Exit => panic!(),
         }
+    }
+
+    #[test]
+    fn parse_request_head_reads_method_and_path() {
+        assert_eq!(
+            parse_request_head("GET /status HTTP/1.1\r\nHost: localhost\r\n").unwrap(),
+            ("GET".into(), "/status".into())
+        );
+        assert_eq!(
+            parse_request_head("POST /cmd HTTP/1.1\r\nContent-Length: 5\r\n").unwrap(),
+            ("POST".into(), "/cmd".into())
+        );
+        assert!(parse_request_head("garbage").is_err());
+        assert!(parse_request_head("GET /status").is_err()); // missing version
+    }
+
+    #[test]
+    fn content_length_is_case_insensitive_and_optional() {
+        assert_eq!(content_length("GET / HTTP/1.1\r\nContent-Length: 12\r\n"), Some(12));
+        assert_eq!(content_length("GET / HTTP/1.1\r\ncontent-length: 4\r\n"), Some(4));
+        assert_eq!(content_length("GET / HTTP/1.1\r\nHost: x\r\n"), None);
+        assert_eq!(content_length("GET / HTTP/1.1\r\nContent-Length: nope\r\n"), None);
+    }
+
+    #[test]
+    fn http_route_serves_status_and_commands() {
+        use serde_json::Value;
+
+        let (tx, _rx) = mpsc::channel();
+        let status = StatusHandle::new();
+        status.set_current("on air");
+        let queue = Arc::new(RequestQueue::new());
+        queue.push(crate::request::RequestUri::new("/tmp/a.mp3"));
+        let j = jingles();
+        let mut rng = SmallRng::from_entropy();
+        let event_tx = mpsc::channel().0;
+        let ctx = DispatchCtx {
+            jingles: &j,
+            queue: Some(&queue),
+            tx: &tx,
+            status: &status,
+            custom: &[],
+            event_tx: &event_tx,
+        };
+
+        let (code, body) = http_route("GET", "/status", "", &ctx, &mut rng);
+        assert_eq!(code, 200);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["playing"], "on air");
+
+        let (code, body) = http_route("GET", "/queue", "", &ctx, &mut rng);
+        assert_eq!(code, 200);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["queue"], serde_json::json!(["/tmp/a.mp3"]));
+
+        let (code, body) = http_route("GET", "/jingles", "", &ctx, &mut rng);
+        assert_eq!(code, 200);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["jingles"], serde_json::json!(["jingles/a-intro.mp3", "jingles/b-sting.wav"]));
+
+        let (code, body) = http_route("POST", "/cmd", r#"{"command":"skip"}"#, &ctx, &mut rng);
+        assert_eq!(code, 200);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["message"], "skipping");
+
+        // App-level errors (unknown command, missing jingle file) are 400.
+        let (code, body) = http_route("POST", "/cmd", r#"{"command":"bogus"}"#, &ctx, &mut rng);
+        assert_eq!(code, 400);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["ok"], false);
+        assert!(v["error"].as_str().unwrap().contains("unknown command"));
+        let (code, body) = http_route("POST", "/cmd", r#"{"command":"jingles.play 0"}"#, &ctx, &mut rng);
+        assert_eq!(code, 400);
+        assert!(body.contains("jingle missing"));
+
+        // Malformed bodies, unknown routes, wrong methods.
+        let (code, body) = http_route("POST", "/cmd", "not json", &ctx, &mut rng);
+        assert_eq!(code, 400);
+        assert!(body.contains("invalid JSON"));
+        let (code, body) = http_route("POST", "/cmd", "{}", &ctx, &mut rng);
+        assert_eq!(code, 400);
+        assert!(body.contains("command"));
+        let (code, _) = http_route("GET", "/nope", "", &ctx, &mut rng);
+        assert_eq!(code, 404);
+        let (code, _) = http_route("PUT", "/status", "", &ctx, &mut rng);
+        assert_eq!(code, 405);
+
+        // `exit` is a telnet concept; over HTTP it just acks.
+        let (code, body) = http_route("POST", "/cmd", r#"{"command":"exit"}"#, &ctx, &mut rng);
+        assert_eq!(code, 200);
+        assert!(body.contains("bye"));
     }
 }

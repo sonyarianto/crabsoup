@@ -451,6 +451,22 @@ practice).
       quote/newline/backslash escaping in hostile titles, and
       `split_json_prefix` (whitespace boundary so `jsonify` is untouched).
       README + website control-port guide updated.
+- [x] Control HTTP endpoint + `banner` flag: `src/control.rs` — a minimal
+      HTTP/1.1 status/control server (`ControlHttpServer`) on the same
+      host as the telnet port, enabled with `server.telnet({http_port =
+      N})`: `GET /status` / `/uptime` / `/queue` / `/jingles` and
+      `POST /cmd` with `{"command": "..."}` (any control command). Every
+      response reuses the JSON envelope (200 on `{"ok": true}`, 400 on
+      `{"ok": false}`, 404 unknown route, 405 wrong method); framing is
+      hand-rolled on tokio like the harbor (header cap 16 KiB, body cap 64
+      KiB, `Content-Length`, no keep-alive). `server.telnet({banner =
+      false})` skips the text welcome line so machine clients get replies
+      from byte zero. Script config parsing + main.rs wiring; inline tests
+      (216 -> 219): request-line parsing, case-insensitive Content-Length,
+      and `http_route` (GETs, POST success/error, malformed bodies, 404/
+      405, `exit` ack). `examples/control_api.py` is a worked
+      Crabcast-style backend (stdlib only) consuming both transports;
+      README + website control-port guide updated.
 - [x] Part F3 (`map_metadata`): `src/script.rs` — `MapMetadataSource` wraps
       a child and rewrites its label through a Lua callback (Liquidsoap
       `map_metadata`). On a label change (even to none, so scripts can add

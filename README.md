@@ -203,7 +203,16 @@ Prefix any command with `json ` for a machine-readable reply: a single line
 of JSON, `{"ok": true, ...}` on success and `{"ok": false, "error":
 "..."}` on failure (`json status` → `{"ok":true,"playing":"...","uptime_seconds":N}`,
 `json queue.list` → `{"ok":true,"queue":["...", ...]}`). The name
-`json` is reserved. See [the control-port guide](website/guide/control-port.md)
+`json` is reserved. Machine clients should also pass `banner = false` to
+`server.telnet` so the connection starts with replies, not the prose
+welcome line.
+
+`server.telnet({http_port = N})` serves the same command surface over
+HTTP on the same host: `GET /status`, `GET /uptime`, `GET /queue`,
+`GET /jingles`, and `POST /cmd` with `{"command": "..."}` — same JSON
+envelope, 400 on `{"ok": false}`, 404/405 for bad routes and methods.
+`examples/control_api.py` is a worked Crabcast-style backend using both
+transports. See [the control-port guide](website/guide/control-port.md)
 for the full field table.
 
 ## Liquidsoap parity map

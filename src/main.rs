@@ -88,14 +88,28 @@ fn main() -> crabsoup::Result<()> {
         let event_tx = runtime.event_tx();
         let server = crabsoup::control::ControlServer::new(
             ctl_cfg.clone(),
-            jingles,
-            queue,
+            jingles.clone(),
+            queue.clone(),
             tx.clone(),
             status.clone(),
-            custom,
-            event_tx,
+            custom.clone(),
+            event_tx.clone(),
         );
         rt.spawn(async move { server.run().await });
+
+        if let Some(http_port) = ctl_cfg.http_port {
+            let http = crabsoup::control::ControlHttpServer::new(
+                ctl_cfg.host.clone(),
+                http_port,
+                jingles,
+                queue,
+                tx.clone(),
+                status.clone(),
+                custom,
+                event_tx,
+            );
+            rt.spawn(async move { http.run().await });
+        }
     }
 
     // Ctrl-C: set the flag and tell the mixer to stop.

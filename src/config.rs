@@ -215,11 +215,18 @@ impl JingleConfig {
     }
 }
 
-/// Liquidsoap-style telnet control port.
+/// Liquidsoap-style telnet control port, plus the optional HTTP
+/// status/control endpoint (`http_port`) and the text welcome banner.
 #[derive(Debug, Clone)]
 pub struct ControlConfig {
     pub host: String,
     pub port: u16,
+    /// Machine clients set `banner = false` so the connection starts with
+    /// replies, not a prose welcome line.
+    pub banner: bool,
+    /// Port for the HTTP endpoint (`GET /status`, `POST /cmd`, ...) on the
+    /// same `host`; `None` disables it.
+    pub http_port: Option<u16>,
 }
 
 impl Default for ControlConfig {
@@ -227,6 +234,8 @@ impl Default for ControlConfig {
         Self {
             host: "127.0.0.1".into(),
             port: 1234,
+            banner: true,
+            http_port: None,
         }
     }
 }
