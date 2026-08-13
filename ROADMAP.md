@@ -432,6 +432,25 @@ approximates the operator surface, not the language); LADSPA plugin hosting
 practice).
 
 ## Done (cont.)
+- [x] Structured (JSON) control-port replies: `src/control.rs` — dispatch
+      now produces a structured `CommandReply` (success / error / custom /
+      status / uptime / queued / list / playing), rendered to either the
+      human-readable telnet protocol (byte-identical to before) or a single
+      line of JSON. Any command prefixed with `json ` (e.g. `json status`,
+      `json queue.list`) replies with one JSON object per line:
+      `{"ok": true, ...}` on success, `{"ok": false, "error": "..."}` on
+      failure, custom Lua replies wrapped as `{"ok": true, "reply":
+      "..."}`. Escaping is serde_json's (new `serde_json` dep), so
+      arbitrary track titles / paths / Lua text are always well-formed;
+      the `json` name is reserved (cannot be a `server.register` command),
+      and a bare `json` replies with a usage error. This is the machine-
+      readable contract a web backend can parse without regex-scraping the
+      prose replies. Inline tests (204 -> 216): text replies unchanged,
+      JSON single-line + parseable with the expected fields, structured
+      round-trips (`queue`, `playing`/`uptime_seconds`, `queued`/`length`),
+      quote/newline/backslash escaping in hostile titles, and
+      `split_json_prefix` (whitespace boundary so `jsonify` is untouched).
+      README + website control-port guide updated.
 - [x] Part F3 (`map_metadata`): `src/script.rs` — `MapMetadataSource` wraps
       a child and rewrites its label through a Lua callback (Liquidsoap
       `map_metadata`). On a label change (even to none, so scripts can add

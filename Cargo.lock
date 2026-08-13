@@ -421,6 +421,7 @@ dependencies = [
  "rcgen",
  "ringbuf",
  "rustls",
+ "serde_json",
  "symphonia",
  "tokio",
  "webpki-roots",

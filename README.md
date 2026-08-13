@@ -199,6 +199,13 @@ script with `server.register("name", function(args) return reply end)` —
 the handler receives the rest of the line as one string and its return
 value is sent back; a Lua error becomes an `ERROR: ...` reply.
 
+Prefix any command with `json ` for a machine-readable reply: a single line
+of JSON, `{"ok": true, ...}` on success and `{"ok": false, "error":
+"..."}` on failure (`json status` → `{"ok":true,"playing":"...","uptime_seconds":N}`,
+`json queue.list` → `{"ok":true,"queue":["...", ...]}`). The name
+`json` is reserved. See [the control-port guide](website/guide/control-port.md)
+for the full field table.
+
 ## Liquidsoap parity map
 
 Approximate `.liq` → `.lua` equivalents, status tracked against

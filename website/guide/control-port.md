@@ -27,6 +27,37 @@ printf 'shutdown\n' | nc localhost 1234
 | `exit` | Disconnect |
 | `help` | List commands |
 
+## JSON mode
+
+The plain-text replies above are for humans. For a program (e.g. a web
+backend), prefix any command with `json ` to get a machine-readable reply:
+each is a single line of JSON, so a line-oriented reader needs no parsing
+beyond `read line -> JSON.parse`.
+
+```sh
+printf 'json status\n' | nc localhost 1234
+# {"ok":true,"playing":"Some track.mp3","uptime_seconds":123}
+```
+
+Every reply is `{"ok": true, ...}` on success and
+`{"ok": false, "error": "..."}` on failure (the `error` text is the same
+message the plain-text protocol prints). Notable fields:
+
+| Command | JSON reply |
+| --- | --- |
+| `json status` | `{"ok":true,"playing":"...","uptime_seconds":N}` |
+| `json uptime` | `{"ok":true,"uptime_seconds":N}` |
+| `json queue.list` | `{"ok":true,"queue":["...", ...]}` |
+| `json jingles.list` | `{"ok":true,"jingles":["...", ...]}` |
+| `json queue.push <uri>` | `{"ok":true,"queued":"...","length":N}` |
+| `json skip` / `json shutdown` | `{"ok":true,"message":"..."}` |
+| `json <custom command>` | `{"ok":true,"reply":"..."}` |
+| any error | `{"ok":false,"error":"..."}` |
+
+The name `json` is reserved and cannot be used as a `server.register`
+command name. `json` with no command replies
+`{"ok":false,"error":"usage: json <command>"}`.
+
 ## Custom commands
 
 Register your own handlers in the script with
