@@ -66,10 +66,13 @@ impl Default for MixerConfig {
 pub struct OutputConfig {
     pub host: String,
     pub port: u16,
-    /// Icecast mount point, e.g. `/radio.mp3`.
+    /// Mount point: Icecast path (e.g. `/radio.mp3`), or the SHOUTcast v2
+    /// stream path (`/` or `/stream/N`). Ignored by SHOUTcast v1.
     pub mount: String,
     pub source_user: String,
     pub source_password: String,
+    /// Which source protocol the output speaks.
+    pub protocol: OutputProtocol,
     pub format: OutputFormat,
     /// Encoder bitrate in bits per second.
     pub bitrate: u32,
@@ -126,6 +129,7 @@ impl Default for OutputConfig {
             mount: "/crabsoup.mp3".into(),
             source_user: "source".into(),
             source_password: "hackme".into(),
+            protocol: OutputProtocol::Icecast,
             format: OutputFormat::Mp3,
             bitrate: 192_000,
             name: "Crabsoup".into(),
@@ -143,6 +147,27 @@ pub enum OutputFormat {
     Opus,
     /// Raw ADTS AAC (FDK-AAC encoder).
     Aac,
+}
+
+/// Source protocol spoken by the Icecast-style output.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OutputProtocol {
+    #[default]
+    Icecast,
+    /// SHOUTcast v1 legacy ICY source protocol (MP3 only).
+    ShoutcastV1,
+    /// SHOUTcast v2 DNAS source protocol (MP3 only).
+    ShoutcastV2,
+}
+
+impl OutputProtocol {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Icecast => "Icecast",
+            Self::ShoutcastV1 => "SHOUTcast v1",
+            Self::ShoutcastV2 => "SHOUTcast v2",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

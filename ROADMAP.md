@@ -234,12 +234,19 @@ no contention with Part B.
       `-v warning`+ can report "Output file is empty" — an upstream
       `discard_unused_programs` race in ffmpeg 7's threaded input path,
       not a crabsoup defect; ffprobe and full-playlist decode are clean.)
-- [ ] **C4 — Shoutcast v1/v2** (only if a concrete need shows up): alternate
-      handshake inside `icecast_client.rs`, exposed as `protocol =
-      "icecast" | "shoutcast"` on `output.icecast`'s config table.
-      **Not built**: this checkbox previously read `[x]` but the source was
-      re-checked and nothing exists (`grep -rin shoutcast src/` finds only
-      this doc); un-checked by hand rather than left to self-correct.
+- [x] **C4 — Shoutcast v1/v2**: alternate handshakes inside
+      `icecast_client.rs`, exposed as `protocol = "icecast" | "shoutcast-v1"
+      | "shoutcast-v2"` (alias `"shoutcast"` = v2) on `output.icecast`'s
+      config table. Both versions speak the legacy ICY source protocol
+      (password line + `icy-*` headers, LF endings; accepts the bare `OK2`
+      reply) — the DNAS v2 accepts ICY sources on both source ports, and the
+      native "uvox2" handshake is undocumented/encrypted. v1 is MP3-only;
+      v2 adds **AAC** streamed as HE-AAC ("AAC+", fdk-aac AOT 5) with the
+      `audio/aacp` content type, and targets named streams by appending
+      `:#N` to the password. Opus is rejected for both. Titles ride
+      `/admin.cgi?mode=updinfo` with the source password (the ICY mechanism;
+      the DNAS re-serves them as in-stream metadata for listeners).
+      Verified end-to-end against a real DNAS 2.6.1 — see Done section.
 
 ### Part D — scripting-operator parity (new track)
 
@@ -402,8 +409,7 @@ metadata/dead-air gaps.
 4. Track B, sequential: Phase 2 (DSP) — **done**; next Phase 3 → Phase 5 →
    Phase 6 (needs A2) → Phase 7 → Phase 8 (stretch).
 5. Track C once A1 lands: C1 → C2 → C3 (needs C2) — all **done** (see
-   Done section); C4 (Shoutcast) — **not built** (unchecked by hand; only
-   if a concrete need shows up).
+   Done section); C4 (Shoutcast v1/v2) — **done** (see Done section).
 6. Part D — **complete**: D1 (`mksafe`), D3 (`add()`), D2
    (`annotate:`/`cue_cut` + per-track fades), D4 (`request.dynamic`),
    D5 (level-aware smart crossfade) — all **done** (see Done section).
@@ -904,6 +910,37 @@ practice).
       ADTS has no in-stream title mechanism, so `set_title` stays a no-op.
       `output.file` + Icecast mount verified live: ffprobe decodes the
       file and the `/c2.aac` mount at 44.1 kHz stereo 128 kbps.
+- [x] C4 (SHOUTcast v1/v2): `OutputProtocol` on the icecast output config
+      (`protocol = "icecast" | "shoutcast-v1" | "shoutcast-v2"`, with
+      `"shoutcast"` aliasing v2; parsed in script.rs, defaulting to
+      Icecast). `icecast_client.rs` gained the legacy ICY handshake for
+      both versions: the password as the first line plus
+      `icy-name`/`icy-pub`/`icy-genre`/`icy-br`/`icy-sr` headers with LF
+      endings, accepting either a bare `OK2` reply (bounded by a short
+      head-read timeout) or an HTTP-style head. The native v2 "uvox2"
+      handshake is undocumented and encrypted, so ICY on `portbase` (or
+      `portbase + 1` for legacy v1 sources) is the interoperable path — the
+      real DNAS 2.6.1 rejects `SOURCE`/`POST`/`PUT` outright ("Invalid
+      HTTP request"). v2 targets named streams by appending `:#N` to the
+      password, the DNAS's documented v2.4.7+ mechanism for ICY sources.
+      Formats: v1 is MP3-only; v2 also takes AAC, encoded as HE-AAC
+      (fdk-aac AOT 5 via `AacEncoder::new_he_aac`, SBR verified: ADTS
+      signals the 22050 Hz core and the stream decodes with ffmpeg) and
+      announced as `audio/aacp`; Opus is rejected for both. Titles ride
+      `/admin.cgi?mode=updinfo&pass=<pw>&song=<title>` GETs with the source
+      password — the ICY-source mechanism (the DNAS re-serves them as
+      in-stream metadata to listeners) — routed from the pump loop instead
+      of the Icecast `/admin/metadata` GET. Verified with fake-server tests
+      (v1/v2 ICY handshake requests, bare `OK2`, `:#N` stream selection,
+      format enforcement incl. AAC-only-on-v2, admin.cgi title request, and
+      the HE-AAC SBR/decode test). Verified end-to-end against a real DNAS
+      2.6.1: v1 MP3 on 8001 and v2 MP3 on 8000 both connect, the DNAS
+      detects "MPEG v1 layer 3 stereo", `SONGTITLE` updates stick, and
+      listeners decode the stream cleanly with `icy-metaint` metadata.
+      AAC also connects and the DNAS sniffs it correctly ("AACv4, LC"), but
+      DNAS 2.6.1 corrupts the AAC relay to listeners (its legacy-path frame
+      parser rewrites ADTS headers), so MP3 is the reliable SHOUTcast
+      format until the native uvox2 protocol is supported.
 - [x] Part A (engine tap + Lua event loop, one PR): `src/engine/tap.rs` —
       `EngineTap` owns the root source on its own thread and publishes each
       wall-clock-paced buffer as `Arc<AudioFrame { pcm, label }>` to N

@@ -41,5 +41,18 @@ output.icecast({host = "localhost", port = 8000,
                 genre = "Various", reconnect = 5},
                fallback({j, live, pl}))
 
+-- SHOUTcast instead of Icecast: `protocol` is "shoutcast-v1" (MP3 only),
+-- "shoutcast-v2" (alias "shoutcast"), or "icecast" (default). v2 also
+-- accepts format = "aac" (HE-AAC / AAC+; DNAS 2.6.1 corrupts the AAC
+-- listener relay, so MP3 is the reliable choice). Titles go out via the
+-- admin.cgi updinfo endpoint; `source_user` is ignored; for v2, mount is
+-- the stream path ("/" or "/stream/N"). On a v2 DNAS, v1 sources use
+-- portbase + 1.
+-- output.icecast({host = "radio.example.com", port = 8000, mount = "/",
+--                 format = "mp3", bitrate = 128000, protocol = "shoutcast-v2",
+--                 source_password = "changeme", name = "Crabsoup",
+--                 genre = "Various", reconnect = 5},
+--                fallback({j, live, pl}))
+
 -- Decode + mix locally without broadcasting (instead of output.icecast):
 -- output.preview(fallback({j, live, pl}))

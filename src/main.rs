@@ -255,8 +255,12 @@ fn print_result(result: &ScriptResult, preview: bool) {
     } else {
         for out in &result.outputs {
             lines.push(format!(
-                "output: {:?} to {}:{}{}",
-                out.format, out.host, out.port, out.mount
+                "output: {} {:?} to {}:{}{}",
+                out.protocol.name(),
+                out.format,
+                out.host,
+                out.port,
+                out.mount
             ));
         }
         for rec in &result.file_outputs {

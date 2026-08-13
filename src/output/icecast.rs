@@ -3,10 +3,10 @@ use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::config::{OutputConfig, OutputFormat};
+use crate::config::{OutputConfig, OutputFormat, OutputProtocol};
 use crate::engine::mixer::StatusHandle;
 use crate::engine::tap::AudioFrame;
-use crate::output::encoder::{create_encoder, Encoder};
+use crate::output::encoder::{create_encoder, AacEncoder, Encoder};
 use crate::output::icecast_client::IcecastClient;
 use crate::Result;
 
@@ -70,16 +70,26 @@ impl IcecastOutput {
 
     /// Establish the initial source connection (caller decides retry policy).
     pub fn connect(&mut self) -> Result<()> {
-        self.encoder = Some(create_encoder(
-            self.config.format,
-            self.sample_rate,
-            self.chans as u16,
-            self.config.bitrate,
-            &self.config.name,
-        )?);
+        self.encoder = Some(match (self.config.protocol, self.config.format) {
+            // SHOUTcast v2 exposes AAC as "AAC+" (`audio/aacp`): HE-AAC with
+            // SBR rather than the plain AAC-LC used for Icecast and HLS.
+            (OutputProtocol::ShoutcastV2, OutputFormat::Aac) => Box::new(AacEncoder::new_he_aac(
+                self.sample_rate,
+                self.chans as u16,
+                self.config.bitrate,
+            )?),
+            _ => create_encoder(
+                self.config.format,
+                self.sample_rate,
+                self.chans as u16,
+                self.config.bitrate,
+                &self.config.name,
+            )?,
+        });
         self.shout = Some(IcecastClient::connect(&self.config, self.sample_rate, self.chans as u16)?);
         log::info!(
-            "connected to Icecast {}:{} mount {} ({})",
+            "connected to {} {}:{} mount {} ({})",
+            self.config.protocol.name(),
             self.config.host,
             self.config.port,
             self.config.mount,
@@ -89,10 +99,13 @@ impl IcecastOutput {
     }
 
     fn format_name(&self) -> &'static str {
-        match self.config.format {
-            OutputFormat::Mp3 => "MP3",
-            OutputFormat::Opus => "Ogg/Opus",
-            OutputFormat::Aac => "AAC",
+        match (self.config.protocol, self.config.format) {
+            (OutputProtocol::ShoutcastV1 | OutputProtocol::ShoutcastV2, OutputFormat::Aac) => {
+                "AAC+ (HE-AAC)"
+            }
+            (_, OutputFormat::Mp3) => "MP3",
+            (_, OutputFormat::Opus) => "Ogg/Opus",
+            (_, OutputFormat::Aac) => "AAC",
         }
     }
 
@@ -147,26 +160,37 @@ impl IcecastOutput {
         }
         if title != self.last_title {
             self.last_title = title.clone();
-            log::info!("icecast: now playing {title}");
-            match self.config.format {
-                // Opus mounts reject Icecast's URL metadata endpoint, and
-                // Icecast parses OpusTags only as stream headers (2.5+); the
-                // pre-flush set_title below gets the first track into them.
-                OutputFormat::Opus => {
-                    if let Some(encoder) = self.encoder.as_mut() {
-                        let tags = encoder.set_title(&title);
-                        if !tags.is_empty() {
-                            self.send_or_reconnect(&tags);
+            log::info!("{}: now playing {title}", self.config.protocol.name());
+            match self.config.protocol {
+                OutputProtocol::Icecast => match self.config.format {
+                    // Opus mounts reject Icecast's URL metadata endpoint, and
+                    // Icecast parses OpusTags only as stream headers (2.5+);
+                    // the pre-flush set_title below gets the first track into
+                    // them.
+                    OutputFormat::Opus => {
+                        if let Some(encoder) = self.encoder.as_mut() {
+                            let tags = encoder.set_title(&title);
+                            if !tags.is_empty() {
+                                self.send_or_reconnect(&tags);
+                            }
                         }
                     }
-                }
-                OutputFormat::Mp3 => {
-                    if let Err(e) = IcecastClient::update_title(&self.config, &title) {
-                        log::warn!("icecast metadata update failed: {e}");
+                    OutputFormat::Mp3 => {
+                        if let Err(e) = IcecastClient::update_title(&self.config, &title) {
+                            log::warn!("icecast metadata update failed: {e}");
+                        }
+                    }
+                    // ADTS has no in-stream title mechanism; nothing to send.
+                    OutputFormat::Aac => {}
+                },
+                // SHOUTcast updates titles via the DNAS's /admin.cgi
+                // updinfo endpoint (the DNAS does not parse in-stream ICY
+                // metadata from sources).
+                OutputProtocol::ShoutcastV1 | OutputProtocol::ShoutcastV2 => {
+                    if let Err(e) = IcecastClient::update_icy_title(&self.config, &title) {
+                        log::warn!("shoutcast metadata update failed: {e}");
                     }
                 }
-                // ADTS has no in-stream title mechanism; nothing to send.
-                OutputFormat::Aac => {}
             }
         }
     }

@@ -80,5 +80,5 @@ Next: the [example script](/guide/example-script).
 
 Feature work is tracked in the repo's
 [ROADMAP.md](https://github.com/sonyarianto/crabsoup/blob/main/ROADMAP.md) —
-shipped and verified phases are marked done; the open item (Shoutcast v1/v2)
-is planned only if a concrete need shows up.
+shipped and verified phases are marked done, including SHOUTcast v1/v2 output
+(`protocol = "shoutcast-v1" | "shoutcast-v2"` on `output.icecast`).

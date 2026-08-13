@@ -37,7 +37,7 @@ use symphonia::core::audio::SignalSpec;
 
 use crate::config::{
     collect_audio, ControlConfig, FileOutputConfig, HlsOutputConfig, LiveConfig, MixerConfig,
-    OutputConfig, OutputFormat, SoundcardOutputConfig, StreamConfig,
+    OutputConfig, OutputFormat, OutputProtocol, SoundcardOutputConfig, StreamConfig,
 };
 use crate::engine::effects::{Agc, Amplify, Compressor, EffectSource};
 use crate::engine::mixer::{CrossfadeMixer, SmartFade};
@@ -2076,6 +2076,19 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         }
     }
 
+    /// Parse the source protocol string (`"icecast"` is the default;
+    /// `"shoutcast"` is an alias for SHOUTcast v2).
+    fn parse_protocol(value: &str) -> mlua::Result<OutputProtocol> {
+        match value {
+            "icecast" => Ok(OutputProtocol::Icecast),
+            "shoutcast" | "shoutcast-v2" => Ok(OutputProtocol::ShoutcastV2),
+            "shoutcast-v1" => Ok(OutputProtocol::ShoutcastV1),
+            other => Err(mlua::Error::runtime(format!(
+                "unknown protocol {other:?} (use \"icecast\", \"shoutcast\" or \"shoutcast-v1\")"
+            ))),
+        }
+    }
+
     /// First output call wins the shared root; later calls must pass the
     /// same source graph (`Arc::ptr_eq`).
     fn claim_root(s: &mut ScriptState, source: &mut LuaSource) -> mlua::Result<()> {
@@ -2105,6 +2118,11 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
             mount: opts.get("mount").unwrap_or_else(|_| "/crabsoup.mp3".into()),
             source_user: opts.get("user").unwrap_or_else(|_| "source".into()),
             source_password: opts.get("password").unwrap_or_else(|_| "hackme".into()),
+            protocol: opts
+                .get::<Option<String>>("protocol")?
+                .map(|p| parse_protocol(&p))
+                .transpose()?
+                .unwrap_or_default(),
             format,
             bitrate: opts.get("bitrate").unwrap_or(192_000),
             name: opts.get("name").unwrap_or_else(|_| "Crabsoup".into()),

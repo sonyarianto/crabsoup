@@ -338,6 +338,7 @@ const AACENC_CHANNELMODE: c_uint = 0x0106;
 const AACENC_TRANSMUX: c_uint = 0x0300;
 // Parameter values.
 const AOT_AAC_LC: c_uint = 2;
+const AOT_AAC_HE: c_uint = 5; // MPEG-4 HE-AAC (AAC-LC core + SBR, "AAC+")
 const MODE_1: c_uint = 1; // mono
 const MODE_2: c_uint = 2; // stereo
 const TT_MP4_ADTS: c_uint = 2;
@@ -408,7 +409,18 @@ pub struct AacEncoder {
 unsafe impl Send for AacEncoder {}
 
 impl AacEncoder {
+    /// AAC-LC — the profile used for Icecast and HLS.
     pub fn new(sample_rate: u32, channels: u16, bitrate: u32) -> Result<Self> {
+        Self::new_with_aot(sample_rate, channels, bitrate, AOT_AAC_LC)
+    }
+
+    /// HE-AAC ("AAC+", SBR) — the profile SHOUTcast v2 expects from
+    /// `audio/aacp` sources.
+    pub fn new_he_aac(sample_rate: u32, channels: u16, bitrate: u32) -> Result<Self> {
+        Self::new_with_aot(sample_rate, channels, bitrate, AOT_AAC_HE)
+    }
+
+    fn new_with_aot(sample_rate: u32, channels: u16, bitrate: u32, aot: c_uint) -> Result<Self> {
         let mut handle = ptr::null_mut();
         let status = unsafe { aacEncOpen(&mut handle, 0, channels.max(1) as c_uint) };
         if status != AACENC_OK || handle.is_null() {
@@ -419,7 +431,7 @@ impl AacEncoder {
             log::warn!("AAC only supports mono/stereo; encoding {} channels", channels);
         }
         let ok = unsafe {
-            aacEncoder_SetParam(handle, AACENC_AOT, AOT_AAC_LC)
+            aacEncoder_SetParam(handle, AACENC_AOT, aot)
                 | aacEncoder_SetParam(handle, AACENC_SAMPLERATE, sample_rate)
                 | aacEncoder_SetParam(handle, AACENC_CHANNELMODE, ch_mode)
                 | aacEncoder_SetParam(handle, AACENC_BITRATE, bitrate)
@@ -648,6 +660,64 @@ mod tests {
         // ADTS frames start with the 0xFFF sync word.
         assert_eq!(bytes[0], 0xFF);
         assert_eq!(bytes[1] >> 4, 0xF);
+    }
+
+    #[test]
+    fn he_aac_encoder_produces_adts_stream() {
+        let mut enc = AacEncoder::new_he_aac(44100, 2, 64_000).unwrap();
+        let mut pcm = vec![0f32; 44100 * 2]; // 1 second
+        for (i, s) in pcm.iter_mut().enumerate() {
+            let t = i as f64 / 44100.0;
+            *s = (2.0 * std::f64::consts::PI * 440.0 * t).sin() as f32 * 0.5;
+        }
+        let mut bytes = enc.encode(&pcm);
+        bytes.extend_from_slice(&enc.finish());
+        assert!(!bytes.is_empty());
+        assert_eq!(bytes[0], 0xFF);
+        assert_eq!(bytes[1] >> 4, 0xF);
+    }
+
+    #[test]
+    fn he_aac_stream_carries_sbr_and_decodes() {
+        // HE-AAC is AAC-LC plus SBR. In ADTS the SBR shows up as the half-rate
+        // core signal (dualrate SBR at 44.1 kHz output -> 22050 Hz, index 7)
+        // and the 2048-sample frame, and the stream must decode cleanly.
+        // Requires ffmpeg; skipped when absent.
+        if std::process::Command::new("ffmpeg").arg("-version").output().is_err() {
+            return;
+        }
+        let mut enc = AacEncoder::new_he_aac(44100, 2, 64_000).unwrap();
+        let mut pcm = vec![0f32; 44100 * 2]; // 1 second
+        for (i, s) in pcm.iter_mut().enumerate() {
+            let t = i as f64 / 44100.0;
+            *s = (2.0 * std::f64::consts::PI * 440.0 * t).sin() as f32 * 0.5;
+        }
+        let mut bytes = enc.encode(&pcm);
+        bytes.extend_from_slice(&enc.finish());
+        assert!(!bytes.is_empty());
+
+        // ADTS fixed header: byte[2] = profile(2) | sf_index(4) | ...
+        assert_eq!(bytes[0], 0xFF);
+        let sf_index = (bytes[2] >> 2) & 0x0F;
+        assert_eq!(
+            sf_index, 7,
+            "HE-AAC ADTS must signal the 22050 Hz core (index 7), got {sf_index}"
+        );
+
+        let path = std::env::temp_dir().join("crabsoup_he_aac_test.aac");
+        let _ = std::fs::write(&path, &bytes);
+        let out = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(&path)
+            .args(["-f", "null", "-"])
+            .output()
+            .expect("ffmpeg runs");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            out.status.success(),
+            "HE-AAC stream failed to decode: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     fn split_pages(bytes: &[u8]) -> Vec<Vec<u8>> {

@@ -257,6 +257,26 @@ into `/usr/local` and `build.rs` adds the link path.
   request, then raw encoded bytes; titles go out on separate authenticated
   `/admin/metadata` GETs. One request per operation — no libshout capability
   negotiation, no unauthenticated 401 probe, no `!POKE`.
+- SHOUTcast v1/v2 (`protocol = "shoutcast-v1" | "shoutcast-v2"`): both
+  speak the legacy ICY handshake — the password as the first line plus
+  `icy-*` headers with LF line endings; the reply is a bare `OK2` line or an
+  HTTP-style head, so the head read is bounded by a short timeout. The DNAS
+  v2 accepts ICY sources on both source ports; the native "uvox2" handshake
+  is undocumented (and encrypted), and DNAS 2.6.1 rejects `SOURCE`/
+  `POST`/`PUT` outright, so ICY is the interoperable path. v1 is MP3-only;
+  v2 adds AAC as HE-AAC ("AAC+", fdk-aac AOT 5) announced with the
+  `audio/aacp` content type — the Icecast/HLS AAC-LC profile stays
+  untouched — and targets named streams by appending `:#N` to the password
+  (the DNAS's documented v2.4.7+ way for ICY sources to pick a stream).
+  Titles go out as `/admin.cgi?mode=updinfo&pass=<pw>&song=<title>` GETs
+  with the source password — the ICY-source mechanism; the DNAS re-serves
+  them as in-stream metadata to listeners, so no in-stream blocks are sent
+  by the client (they'd be relayed as audio by the DNAS). Verified
+  end-to-end against DNAS 2.6.1: MP3 (v1 on 8001, v2 on 8000) connects,
+  `SONGTITLE` updates stick via updinfo, and listeners decode cleanly with
+  `icy-metaint` metadata; AAC connects and is sniffed correctly but the
+  DNAS corrupts the AAC listener relay (its legacy-path frame parser
+  rewrites ADTS headers), so MP3 is the reliable SHOUTcast format.
 - Opus titles ride the stream header: Icecast rejects URL metadata updates
   for Opus mounts (HTTP 200 + "Mountpoint will not accept URL updates"), so
   the initial OpusTags carries the first track's title (`set_title` replaces

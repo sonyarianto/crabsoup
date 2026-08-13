@@ -11,9 +11,10 @@ Playlist ──► CrossfadeMixer ──► PriorityMixer ──► Encoder ─�
 
 ## `output.icecast({...}, src)`
 
-Broadcasts the source to Icecast via the native source protocol (no libshout —
-one authenticated `SOURCE` request, then raw encoded bytes; titles go out on
-separate `/admin/metadata` GETs for MP3/AAC):
+Broadcasts the source to Icecast or SHOUTcast via native source protocols (no
+libshout). The `protocol` key picks the server type: `"icecast"` (default),
+`"shoutcast-v1"` (legacy ICY), or `"shoutcast-v2"` (`"shoutcast"` is an
+alias for v2):
 
 ```lua
 output.icecast({host = "localhost", port = 8000,
@@ -33,6 +34,44 @@ output.icecast({host = "localhost", port = 8000,
 - For Opus mounts the title rides the initial OpusTags stream header (Icecast
   rejects URL metadata updates for Opus; 2.4.4 never parses Opus titles at
   all, 2.5+ only the stream-start one).
+
+### SHOUTcast specifics
+
+For SHOUTcast the output speaks the DNAS's legacy ICY source protocol — the
+password as the first line plus `icy-*` headers — for both `shoutcast-v1` and
+`shoutcast-v2`, because the DNAS v2 accepts ICY sources on both its source
+ports and the native "uvox2" handshake is undocumented (and encrypted). The
+DNAS replies with a bare `OK2` line. v1 is **MP3-only**; v2 adds **AAC**, sent
+as HE-AAC ("AAC+") with the `audio/aacp` content type the SHOUTcast platform
+expects. Track titles go out as `/admin.cgi?mode=updinfo` requests with the
+source password — the mechanism ICY sources use — which the DNAS then
+re-serves to listeners as in-stream metadata.
+
+```lua
+output.icecast({host = "radio.example.com", port = 8000,
+                mount = "/", format = "mp3", bitrate = 128000,
+                protocol = "shoutcast-v2",
+                source_password = "changeme",
+                name = "Crabsoup", genre = "Various", reconnect = 5},
+               fallback({j, live, pl}))
+```
+
+- `mount` is ignored by v1; for v2 it is the stream path — `/` for the
+  default stream or `/stream/N` for a named one (which selects that DNAS
+  stream by appending `:#N` to the password, the DNAS's documented way for
+  ICY sources to target a stream).
+- `source_user` is ignored by both versions (the ICY protocol has no user
+  concept).
+- On a v2 DNAS, v1 sources connect to `portbase + 1` (e.g. 8001) while v2
+  sources use `portbase` (8000); a standalone v1 DNAS uses its single port
+  directly.
+- AAC on v2 is HE-AAC (SBR) — a sensible `bitrate` for AAC+ is around
+  32–96 kbps, not the 128+ typical of MP3. Verified end-to-end against
+  DNAS 2.6.1: MP3 connects, populates `SONGTITLE`, and decodes cleanly for
+  listeners. AAC connects and the DNAS sniffs it correctly, but this DNAS
+  build corrupts the AAC relay to listeners (its legacy-path frame parser
+  rewrites ADTS headers), so MP3 is the reliable choice until the native
+  uvox2 protocol is supported.
 
 ## `output.preview(...)`
 
