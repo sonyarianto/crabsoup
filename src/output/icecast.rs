@@ -1,14 +1,14 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
-use std::sync::Arc;
 use std::time::Duration;
 
+use crate::Result;
 use crate::config::{OutputConfig, OutputFormat, OutputProtocol};
 use crate::engine::mixer::StatusHandle;
 use crate::engine::tap::AudioFrame;
-use crate::output::encoder::{create_encoder, AacEncoder, Encoder};
+use crate::output::encoder::{AacEncoder, Encoder, create_encoder};
 use crate::output::icecast_client::IcecastClient;
-use crate::Result;
 
 enum SendResult {
     Sent,
@@ -86,7 +86,11 @@ impl IcecastOutput {
                 &self.config.name,
             )?,
         });
-        self.shout = Some(IcecastClient::connect(&self.config, self.sample_rate, self.chans as u16)?);
+        self.shout = Some(IcecastClient::connect(
+            &self.config,
+            self.sample_rate,
+            self.chans as u16,
+        )?);
         log::info!(
             "connected to {} {}:{} mount {} ({})",
             self.config.protocol.name(),

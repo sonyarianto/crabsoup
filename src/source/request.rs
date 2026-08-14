@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use symphonia::core::audio::SignalSpec;
 
-use crate::request::{resolve, RequestConfig, RequestUri};
+use crate::request::{RequestConfig, RequestUri, resolve};
 use crate::source::AudioSource;
 
 /// Shared FIFO state. Methods used by the control port (`push`/`list`/
@@ -51,7 +51,13 @@ impl RequestQueue {
 
     /// Copy of the queued requests, oldest first.
     pub fn list(&self) -> Vec<RequestUri> {
-        self.inner.lock().unwrap().requests.iter().cloned().collect()
+        self.inner
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// Drop every queued request (a playing track is unaffected).
@@ -127,7 +133,10 @@ impl AudioSource for RequestQueueSource {
                 if self.queue.take_skip() {
                     log::info!(
                         "request queue: skipping {}",
-                        self.current_uri.as_ref().map(|u| u.display()).unwrap_or_default()
+                        self.current_uri
+                            .as_ref()
+                            .map(|u| u.display())
+                            .unwrap_or_default()
                     );
                     self.current = None;
                     continue;
@@ -139,7 +148,10 @@ impl AudioSource for RequestQueueSource {
                 if src.is_exhausted() {
                     log::info!(
                         "request queue: finished {}",
-                        self.current_uri.as_ref().map(|u| u.display()).unwrap_or_default()
+                        self.current_uri
+                            .as_ref()
+                            .map(|u| u.display())
+                            .unwrap_or_default()
                     );
                     self.current = None;
                     continue;
@@ -169,9 +181,7 @@ impl AudioSource for RequestQueueSource {
     }
 
     fn label(&self) -> Option<String> {
-        self.current_uri
-            .as_ref()
-            .map(|uri| uri.display())
+        self.current_uri.as_ref().map(|uri| uri.display())
     }
 
     fn replaygain_db(&self) -> Option<f32> {

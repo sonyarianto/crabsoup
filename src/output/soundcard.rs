@@ -11,18 +11,18 @@
 //! stream with the ring's consumer half, then parks (the same shape as
 //! `src/source/soundcard.rs`). Only the `HeapProd` half crosses threads.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::Arc;
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use ringbuf::{traits::*, HeapCons, HeapProd, HeapRb};
+use ringbuf::{HeapCons, HeapProd, HeapRb, traits::*};
 
+use crate::Result;
 use crate::config::SoundcardOutputConfig;
 use crate::engine::tap::AudioFrame;
 use crate::resample::SincResampler;
-use crate::Result;
 
 /// Ring capacity in device frames (double-buffered against the callback).
 const RING_FRAMES: usize = 16 * 1024;
@@ -213,7 +213,9 @@ fn start_output_stream(
             .default_output_device()
             .ok_or_else(|| "output.soundcard: no default output device".to_string())?,
     };
-    let name = device.name().unwrap_or_else(|_| "soundcard output".to_string());
+    let name = device
+        .name()
+        .unwrap_or_else(|_| "soundcard output".to_string());
     let supported = device
         .default_output_config()
         .map_err(|e| format!("output.soundcard: no default output config: {e}"))?;
@@ -231,7 +233,7 @@ fn start_output_stream(
             return Err(format!(
                 "output.soundcard: unsupported sample format {other:?} on {name:?}"
             )
-            .into())
+            .into());
         }
     };
     stream
@@ -243,7 +245,12 @@ fn start_output_stream(
 /// Convert one bus frame to device channels into the reusable `out` vec:
 /// (1->2) duplicates, (2->1) averages, matching counts copy straight
 /// through. Channel combos are validated in `connect`.
-fn convert_to_device(samples: &[f32], bus_channels: usize, device_channels: usize, out: &mut Vec<f32>) {
+fn convert_to_device(
+    samples: &[f32],
+    bus_channels: usize,
+    device_channels: usize,
+    out: &mut Vec<f32>,
+) {
     out.clear();
     out.reserve(samples.len() * device_channels / bus_channels.max(1));
     match (bus_channels, device_channels) {
@@ -315,7 +322,11 @@ where
                 for chunk in data.chunks_mut(CALLBACK_CHUNK) {
                     let n = consumer.pop_slice(&mut buf[..chunk.len()]);
                     for (i, out) in chunk.iter_mut().enumerate() {
-                        *out = if i < n { T::from_f32(buf[i]) } else { T::from_f32(0.0) };
+                        *out = if i < n {
+                            T::from_f32(buf[i])
+                        } else {
+                            T::from_f32(0.0)
+                        };
                     }
                 }
             },

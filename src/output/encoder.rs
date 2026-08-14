@@ -5,10 +5,10 @@
 use std::ffi::{c_int, c_uint, c_void};
 use std::ptr;
 
+use crate::Result;
 use crate::config::OutputFormat;
 use crate::output::ogg_mux::{OggMuxer, opus_head_packet, opus_tags_packet};
 use crate::resample::SincResampler;
-use crate::Result;
 
 /// Uniform interface for a PCM -> stream-format encoder.
 pub trait Encoder: Send {
@@ -38,7 +38,10 @@ pub fn create_encoder(
     match format {
         OutputFormat::Mp3 => Ok(Box::new(Mp3Encoder::new(sample_rate, channels, bitrate)?)),
         OutputFormat::Opus => Ok(Box::new(OpusEncoder::new(
-            sample_rate, channels, bitrate, title,
+            sample_rate,
+            channels,
+            bitrate,
+            title,
         )?)),
         OutputFormat::Aac => Ok(Box::new(AacEncoder::new(sample_rate, channels, bitrate)?)),
     }
@@ -197,12 +200,7 @@ pub struct OpusEncoder {
 unsafe impl Send for OpusEncoder {}
 
 impl OpusEncoder {
-    pub fn new(
-        sample_rate: u32,
-        channels: u16,
-        bitrate: u32,
-        title: &str,
-    ) -> Result<Self> {
+    pub fn new(sample_rate: u32, channels: u16, bitrate: u32, title: &str) -> Result<Self> {
         use audiopus::coder::Encoder;
         use audiopus::{Application, Bitrate, Channels, SampleRate};
 
@@ -216,7 +214,10 @@ impl OpusEncoder {
             .set_bitrate(Bitrate::BitsPerSecond(bitrate as i32))
             .map_err(|e| format!("failed to set opus bitrate: {e}"))?;
         if channels > 2 {
-            log::warn!("Opus only supports mono/stereo; encoding {} channels", channels);
+            log::warn!(
+                "Opus only supports mono/stereo; encoding {} channels",
+                channels
+            );
         }
 
         let resampler = SincResampler::new(24, sample_rate, OPUS_SAMPLE_RATE, channels as usize);
@@ -384,11 +385,7 @@ struct AacInfoStruct {
 
 #[link(name = "fdk-aac")]
 unsafe extern "C" {
-    fn aacEncOpen(
-        handle: *mut *mut AacEncoderRaw,
-        modules: c_uint,
-        max_channels: c_uint,
-    ) -> c_int;
+    fn aacEncOpen(handle: *mut *mut AacEncoderRaw, modules: c_uint, max_channels: c_uint) -> c_int;
     fn aacEncClose(handle: *mut *mut AacEncoderRaw) -> c_int;
     fn aacEncoder_SetParam(handle: *mut AacEncoderRaw, param: c_uint, value: c_uint) -> c_int;
     fn aacEncEncode(
@@ -428,7 +425,10 @@ impl AacEncoder {
         }
         let ch_mode = if channels == 1 { MODE_1 } else { MODE_2 };
         if channels > 2 {
-            log::warn!("AAC only supports mono/stereo; encoding {} channels", channels);
+            log::warn!(
+                "AAC only supports mono/stereo; encoding {} channels",
+                channels
+            );
         }
         let ok = unsafe {
             aacEncoder_SetParam(handle, AACENC_AOT, aot)
@@ -463,7 +463,10 @@ impl AacEncoder {
         }
         // FDK's documented max; clamp so small configs stay usable.
         let out_buf_size = (info.max_out_buf_bytes as usize).max(8192);
-        Ok(Self { handle, out_buf_size })
+        Ok(Self {
+            handle,
+            out_buf_size,
+        })
     }
 
     /// Run one `aacEncEncode` call. FDK consumes at most one frame's worth of
@@ -683,7 +686,11 @@ mod tests {
         // core signal (dualrate SBR at 44.1 kHz output -> 22050 Hz, index 7)
         // and the 2048-sample frame, and the stream must decode cleanly.
         // Requires ffmpeg; skipped when absent.
-        if std::process::Command::new("ffmpeg").arg("-version").output().is_err() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
             return;
         }
         let mut enc = AacEncoder::new_he_aac(44100, 2, 64_000).unwrap();
@@ -759,7 +766,8 @@ fn opus_streams_a_real_48k_mp3_file() {
 
     let spec = symphonia::core::audio::SignalSpec::new(
         44100,
-        symphonia::core::audio::Channels::FRONT_LEFT | symphonia::core::audio::Channels::FRONT_RIGHT,
+        symphonia::core::audio::Channels::FRONT_LEFT
+            | symphonia::core::audio::Channels::FRONT_RIGHT,
     );
     let mut src = crate::source::file::FileSource::open(file, spec, 4096).unwrap();
     let mut enc = OpusEncoder::new(44100, 2, 128_000, "test").unwrap();

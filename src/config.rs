@@ -179,6 +179,8 @@ pub struct LiveConfig {
     pub mount: String,
     /// Password DJs authenticate with (source-protocol Basic auth).
     pub password: String,
+    /// Extra valid source passwords (per-streamer accounts).
+    pub extra_passwords: Vec<String>,
 }
 
 impl Default for LiveConfig {
@@ -188,6 +190,7 @@ impl Default for LiveConfig {
             port: 8005,
             mount: "/live".into(),
             password: "dj".into(),
+            extra_passwords: Vec::new(),
         }
     }
 }
@@ -240,7 +243,9 @@ impl Default for ControlConfig {
     }
 }
 
-const AUDIO_EXTS: &[&str] = &["mp3", "wav", "flac", "ogg", "opus", "oga", "m4a", "aac", "wma"];
+const AUDIO_EXTS: &[&str] = &[
+    "mp3", "wav", "flac", "ogg", "opus", "oga", "m4a", "aac", "wma",
+];
 
 /// Recursively collect audio files under `dir`.
 pub fn collect_audio(dir: &Path, out: &mut Vec<PathBuf>) {

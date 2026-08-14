@@ -15,8 +15,8 @@ use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::source::AudioSource;
 use crate::Result;
+use crate::source::AudioSource;
 
 /// How many full buffers the reader may queue ahead of the consumer.
 /// Bounded so a stalled consumer backpressures all the way to the writer.
@@ -152,9 +152,7 @@ fn spawn_reader(
     let reader_shared = shared.clone();
     std::thread::Builder::new()
         .name("pipe-reader".into())
-        .spawn(move || {
-            reader_thread(stdout, tx, reader_shared, format, channels, chunk_samples)
-        })
+        .spawn(move || reader_thread(stdout, tx, reader_shared, format, channels, chunk_samples))
         .map_err(|e| format!("reader thread failed: {e}"))?;
     Ok(())
 }
@@ -348,8 +346,13 @@ impl PipeSource {
         });
         // The first spawn is synchronous so a broken command fails fast
         // into bypass instead of sitting silent until the first retry.
-        match spawn_reader(&shared, command, config.format, channels, frames_per_buffer * channels)
-        {
+        match spawn_reader(
+            &shared,
+            command,
+            config.format,
+            channels,
+            frames_per_buffer * channels,
+        ) {
             Ok(()) => {
                 shared.died.store(false, Ordering::SeqCst);
                 shared.mode.store(MODE_PROCESSING, Ordering::SeqCst);
@@ -539,7 +542,10 @@ mod tests {
             }
             total += n;
         }
-        assert!(total >= pulls.saturating_sub(8) * buf.len(), "{label}: too little audio");
+        assert!(
+            total >= pulls.saturating_sub(8) * buf.len(),
+            "{label}: too little audio"
+        );
     }
 
     #[test]
@@ -547,7 +553,10 @@ mod tests {
         let mut pipe =
             PipeSource::spawn("cat", sine_child(), 2, FPBS, PipeConfig::default()).unwrap();
         let mut buf = vec![0f32; FPBS * 2];
-        assert!(pull_nonzero(&mut pipe, &mut buf, 200) > 0, "no audio from cat");
+        assert!(
+            pull_nonzero(&mut pipe, &mut buf, 200) > 0,
+            "no audio from cat"
+        );
         let mut reference = reference_sine();
         let mut refbuf = vec![0f32; FPBS * 2];
         reference.next_buffer(&mut refbuf); // the pipe already took chunk 1
@@ -571,7 +580,10 @@ mod tests {
         };
         let mut pipe = PipeSource::spawn("cat", sine_child(), 2, FPBS, cfg).unwrap();
         let mut buf = vec![0f32; FPBS * 2];
-        assert!(pull_nonzero(&mut pipe, &mut buf, 200) > 0, "no audio from cat");
+        assert!(
+            pull_nonzero(&mut pipe, &mut buf, 200) > 0,
+            "no audio from cat"
+        );
         let mut reference = reference_sine();
         let mut refbuf = vec![0f32; FPBS * 2];
         reference.next_buffer(&mut refbuf); // the pipe already took chunk 1
@@ -596,7 +608,10 @@ mod tests {
         };
         let mut pipe = PipeSource::spawn("head -c 512", sine_child(), 2, FPBS, cfg).unwrap();
         let mut buf = vec![0f32; FPBS * 2];
-        assert!(pull_nonzero(&mut pipe, &mut buf, 200) > 0, "no processed audio");
+        assert!(
+            pull_nonzero(&mut pipe, &mut buf, 200) > 0,
+            "no processed audio"
+        );
         // After the queue drains the pipe must fall back to the raw child
         // and keep producing the sine — never hanging, never exhausting.
         let mut total = 0;
@@ -605,7 +620,10 @@ mod tests {
             let n = pipe.next_buffer(&mut buf);
             total += n;
             non_silent += buf[..n].iter().filter(|&&s| s.abs() > 0.01).count();
-            assert!(!pipe.is_exhausted(), "pipe must not exhaust on a dead process");
+            assert!(
+                !pipe.is_exhausted(),
+                "pipe must not exhaust on a dead process"
+            );
         }
         assert!(non_silent > 0, "bypass produced only silence");
         assert!(total > 0);
@@ -633,7 +651,10 @@ mod tests {
             let n = pipe.next_buffer(&mut buf);
             total += n;
             non_silent += buf[..n].iter().filter(|&&s| s.abs() > 0.01).count();
-            assert!(!pipe.is_exhausted(), "pipe must not exhaust on a dying process");
+            assert!(
+                !pipe.is_exhausted(),
+                "pipe must not exhaust on a dying process"
+            );
         }
         assert!(total > 0 && non_silent > 0, "audio stopped during restarts");
     }
@@ -642,9 +663,9 @@ mod tests {
     fn finite_child_drains_cleanly_and_exhausts() {
         // A 0.2 s sine through `cat`: the child exhausts, the pipe drains
         // the processed tail and only then reports exhausted (no hang).
-        let child = Arc::new(Mutex::new(Box::new(
-            SineSource::new(440.0, Some(0.2), 0.5, 44100, 2),
-        ) as Box<dyn AudioSource>));
+        let child = Arc::new(Mutex::new(
+            Box::new(SineSource::new(440.0, Some(0.2), 0.5, 44100, 2)) as Box<dyn AudioSource>,
+        ));
         let mut pipe = PipeSource::spawn("cat", child, 2, FPBS, PipeConfig::default()).unwrap();
         let mut buf = vec![0f32; FPBS * 2];
         let expected_frames = (0.2 * 44100.0) as usize;
@@ -679,7 +700,10 @@ mod tests {
         let mut buf = vec![0f32; FPBS * 2];
         // sh exits 127 immediately; the first chunk write fails and the pipe
         // lands in bypass with the raw child's audio.
-        assert!(pull_nonzero(&mut pipe, &mut buf, 100) > 0, "no audio in bypass");
+        assert!(
+            pull_nonzero(&mut pipe, &mut buf, 100) > 0,
+            "no audio in bypass"
+        );
         let mut non_silent = 0;
         for _ in 0..50 {
             let n = pipe.next_buffer(&mut buf);

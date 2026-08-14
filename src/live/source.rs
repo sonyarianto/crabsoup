@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ringbuf::{HeapCons, HeapProd, traits::*};
 
@@ -34,7 +34,10 @@ impl AudioSource for LiveSource {
         // Drop-oldest cap: the DJ's stream may have raced ahead (a fast
         // upload, a briefly stalled consumer); keep only the most recent
         // `max_samples` window so live latency stays bounded.
-        let over = self.consumer.occupied_len().saturating_sub(self.max_samples);
+        let over = self
+            .consumer
+            .occupied_len()
+            .saturating_sub(self.max_samples);
         if over > 0 {
             self.consumer.skip(over);
         }

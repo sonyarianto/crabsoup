@@ -149,7 +149,11 @@ impl Effect for Compressor {
                 self.env += down * (level - self.env);
             }
             let over = gain_to_db(self.env) - self.threshold_db;
-            let gain_db = if over > 0.0 { over * (ratio_inv - 1.0) } else { 0.0 };
+            let gain_db = if over > 0.0 {
+                over * (ratio_inv - 1.0)
+            } else {
+                0.0
+            };
             *s *= db_to_gain(gain_db) * makeup;
         }
     }
@@ -221,7 +225,11 @@ impl Effect for Agc {
                 (self.target_db - gain_to_db(self.env)).clamp(-self.max_cut_db, self.max_boost_db);
             // Rise toward a boost slowly (avoids pumping on silence), drop
             // toward a cut quickly (loud transients get clamped fast).
-            let alpha = if target > self.gain_db { gain_up } else { gain_down };
+            let alpha = if target > self.gain_db {
+                gain_up
+            } else {
+                gain_down
+            };
             self.gain_db += alpha * (target - self.gain_db);
             *s *= db_to_gain(self.gain_db);
         }
@@ -371,7 +379,10 @@ mod tests {
         let mut buf = vec![0.05f32; 100];
         fx.process(&mut buf, 1);
         assert!(buf[0] > 0.05 - 1e-4, "gain dropped at the quiet start");
-        assert!(buf[99] > buf[0], "gain should rise through the quiet segment");
+        assert!(
+            buf[99] > buf[0],
+            "gain should rise through the quiet segment"
+        );
         assert!(
             buf[99] < 0.5,
             "gain jumped to full boost (pumping): {}",

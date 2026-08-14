@@ -1,10 +1,9 @@
-
 use log::{info, warn};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use symphonia::core::audio::SignalSpec;
 
-use crate::request::{resolve, RequestConfig, RequestUri};
+use crate::request::{RequestConfig, RequestUri, resolve};
 use crate::source::{AudioSource, SilenceSource, SourceProvider};
 
 /// A scheduled queue of media requests (local files or `http://` URLs).
@@ -35,7 +34,9 @@ impl Playlist {
     ) -> Self {
         files.sort();
         if shuffle {
-            let mut rng = seed.map(SmallRng::seed_from_u64).unwrap_or_else(SmallRng::from_entropy);
+            let mut rng = seed
+                .map(SmallRng::seed_from_u64)
+                .unwrap_or_else(SmallRng::from_entropy);
             for i in (1..files.len()).rev() {
                 let j = rng.gen_range(0..=i);
                 files.swap(i, j);
@@ -126,7 +127,15 @@ mod tests {
 
     #[test]
     fn provides_every_track_then_stops() {
-        let mut pl = Playlist::new(paths(&["a.wav", "b.wav", "c.wav"]), false, false, RequestConfig::default(), spec(), 4096, None);
+        let mut pl = Playlist::new(
+            paths(&["a.wav", "b.wav", "c.wav"]),
+            false,
+            false,
+            RequestConfig::default(),
+            spec(),
+            4096,
+            None,
+        );
         let mut seen = Vec::new();
         while pl.has_next() {
             let (_, label) = pl.next_source();
@@ -138,7 +147,15 @@ mod tests {
 
     #[test]
     fn loops_forever_without_loop_flag_disabled_but_respects_loop() {
-        let mut pl = Playlist::new(paths(&["a.wav"]), false, true, RequestConfig::default(), spec(), 4096, None);
+        let mut pl = Playlist::new(
+            paths(&["a.wav"]),
+            false,
+            true,
+            RequestConfig::default(),
+            spec(),
+            4096,
+            None,
+        );
         let mut seen = Vec::new();
         for _ in 0..3 {
             let (_, label) = pl.next_source();
@@ -149,8 +166,24 @@ mod tests {
 
     #[test]
     fn shuffle_is_deterministic_with_seed() {
-        let a = Playlist::new(paths(&["a", "b", "c", "d", "e"]), true, false, RequestConfig::default(), spec(), 4096, Some(42));
-        let b = Playlist::new(paths(&["a", "b", "c", "d", "e"]), true, false, RequestConfig::default(), spec(), 4096, Some(42));
+        let a = Playlist::new(
+            paths(&["a", "b", "c", "d", "e"]),
+            true,
+            false,
+            RequestConfig::default(),
+            spec(),
+            4096,
+            Some(42),
+        );
+        let b = Playlist::new(
+            paths(&["a", "b", "c", "d", "e"]),
+            true,
+            false,
+            RequestConfig::default(),
+            spec(),
+            4096,
+            Some(42),
+        );
         let order = |pl: &mut Playlist| {
             let mut v = Vec::new();
             while pl.has_next() {

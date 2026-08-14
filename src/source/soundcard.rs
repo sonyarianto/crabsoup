@@ -12,17 +12,17 @@
 //! created portably off the thread that builds them, and must outlive the
 //! pull loop), parks on `std::thread::park`, and is woken on drop.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use ringbuf::{traits::*, HeapCons, HeapProd, HeapRb};
+use ringbuf::{HeapCons, HeapProd, HeapRb, traits::*};
 
-use crate::resample::SincResampler;
-use crate::source::{convert_channels, AudioSource};
 use crate::Result;
+use crate::resample::SincResampler;
+use crate::source::{AudioSource, convert_channels};
 
 /// Ring capacity in device *frames* (the ring itself is twice this, so a
 /// briefly stalled pull absorbs without dropping; the pull-side cap below
@@ -62,7 +62,8 @@ impl SoundcardInputSource {
     /// Open the device and spawn the capture driver thread. The device open
     /// is synchronous (a bounded handshake) so a missing device fails fast.
     pub fn open(config: &SoundcardInputConfig, bus_rate: u32, bus_channels: usize) -> Result<Self> {
-        let (producer, consumer) = HeapRb::<f32>::new(RING_FRAMES * 2 * bus_channels.max(2)).split();
+        let (producer, consumer) =
+            HeapRb::<f32>::new(RING_FRAMES * 2 * bus_channels.max(2)).split();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(String, u32, usize)>>();
         let shutdown = Arc::new(AtomicBool::new(false));
         let driver_shutdown = shutdown.clone();
@@ -84,19 +85,20 @@ impl SoundcardInputSource {
                 }
             }
         });
-        let (name, device_rate, device_channels) = match ready_rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(Ok(v)) => v,
-            // The driver already exited on its error path; nothing to join.
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                // Handshake timed out: wake the parked driver so it drops
-                // the device stream instead of leaking a parked thread.
-                shutdown.store(true, Ordering::Relaxed);
-                driver.thread().unpark();
-                let _ = driver.join();
-                return Err("input.soundcard: timed out opening the device".into());
-            }
-        };
+        let (name, device_rate, device_channels) =
+            match ready_rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(Ok(v)) => v,
+                // The driver already exited on its error path; nothing to join.
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    // Handshake timed out: wake the parked driver so it drops
+                    // the device stream instead of leaking a parked thread.
+                    shutdown.store(true, Ordering::Relaxed);
+                    driver.thread().unpark();
+                    let _ = driver.join();
+                    return Err("input.soundcard: timed out opening the device".into());
+                }
+            };
         Ok(Self {
             consumer,
             bus_rate,
@@ -131,7 +133,9 @@ fn start_input_stream(
             .default_input_device()
             .ok_or_else(|| "input.soundcard: no default input device".to_string())?,
     };
-    let name = device.name().unwrap_or_else(|_| "soundcard input".to_string());
+    let name = device
+        .name()
+        .unwrap_or_else(|_| "soundcard input".to_string());
     let supported = device
         .default_input_config()
         .map_err(|e| format!("input.soundcard: no default input config: {e}"))?;
@@ -148,7 +152,7 @@ fn start_input_stream(
             return Err(format!(
                 "input.soundcard: unsupported sample format {other:?} on {name:?}"
             )
-            .into())
+            .into());
         }
     }
     .play()
@@ -260,8 +264,7 @@ impl AudioSource for SoundcardInputSource {
 
         // Pull just enough device frames to fill the remaining bus capacity
         // (plus rounding margin); the excess stays in the resampler's ring.
-        let want_frames = (capacity / self.bus_channels.max(1)) as f64
-            * self.device_rate as f64
+        let want_frames = (capacity / self.bus_channels.max(1)) as f64 * self.device_rate as f64
             / self.bus_rate.max(1) as f64;
         let want = (want_frames.ceil() as usize + 1) * self.device_channels;
         if self.scratch.len() != want {
@@ -287,7 +290,8 @@ impl AudioSource for SoundcardInputSource {
             if self.device_rate == self.bus_rate {
                 self.pending.extend_from_slice(&converted);
             } else {
-                self.pending.extend_from_slice(resampler.resample(&converted));
+                self.pending
+                    .extend_from_slice(resampler.resample(&converted));
             }
         }
         let take = self.pending.len().min(capacity);
@@ -314,7 +318,12 @@ mod tests {
     /// A parts-based source (no cpal): the ring + resampler bridge with a
     /// synthetic producer at the device rate, so the conversion math is
     /// testable without hardware.
-    fn parts_source(device_rate: u32, device_channels: usize, bus_rate: u32, bus_channels: usize) -> (SoundcardInputSource, HeapProd<f32>) {
+    fn parts_source(
+        device_rate: u32,
+        device_channels: usize,
+        bus_rate: u32,
+        bus_channels: usize,
+    ) -> (SoundcardInputSource, HeapProd<f32>) {
         let (producer, consumer) = HeapRb::<f32>::new(RING_FRAMES * 2 * device_channels).split();
         let src = SoundcardInputSource {
             consumer,
@@ -382,7 +391,10 @@ mod tests {
             }
         }
         // One second of mono 22.05 kHz -> one second of stereo 44.1 kHz.
-        assert!(total >= 87_000, "one second of stereo bus audio, got {total}");
+        assert!(
+            total >= 87_000,
+            "one second of stereo bus audio, got {total}"
+        );
         assert!(peak > 0.3, "resampled tone collapsed: peak {peak}");
         assert!(peak < 0.6, "resampled tone overshot: peak {peak}");
     }
@@ -409,7 +421,11 @@ mod tests {
             last = Some(buf[n - 1]);
         }
         // cap = RING_FRAMES * 2 ch = 32768 samples: the oldest 232 are stale.
-        assert_eq!(first, Some((total - RING_FRAMES * 2) as f32), "oldest dropped");
+        assert_eq!(
+            first,
+            Some((total - RING_FRAMES * 2) as f32),
+            "oldest dropped"
+        );
         assert_eq!(last, Some((total - 1) as f32), "newest survives");
     }
 }

@@ -6,14 +6,14 @@
 
 use std::fs::File;
 use std::io::Write;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
-use std::sync::Arc;
 
+use crate::Result;
 use crate::config::FileOutputConfig;
 use crate::engine::tap::AudioFrame;
-use crate::output::encoder::{create_encoder, Encoder};
-use crate::Result;
+use crate::output::encoder::{Encoder, create_encoder};
 
 /// Consumes frames from the engine tap, encodes them, and writes the result
 /// to a local file (truncating any existing one). The encoder is created and
@@ -106,8 +106,8 @@ impl FileOutput {
 mod tests {
     use super::*;
     use crate::config::OutputFormat;
-    use crate::source::file::FileSource;
     use crate::source::AudioSource;
+    use crate::source::file::FileSource;
     use std::sync::mpsc;
 
     fn sine_frames(tx: &mpsc::SyncSender<Arc<AudioFrame>>, seconds: f64) {
@@ -159,8 +159,10 @@ mod tests {
         );
 
         // Decode the file back and require real audio.
-        let spec =
-            symphonia::core::audio::SignalSpec::new(44100, symphonia::core::audio::Channels::FRONT_LEFT);
+        let spec = symphonia::core::audio::SignalSpec::new(
+            44100,
+            symphonia::core::audio::Channels::FRONT_LEFT,
+        );
         let mut src = FileSource::open(&path, spec, 4096).expect("decodes");
         let mut buf = vec![0f32; 44100];
         let n = src.next_buffer(&mut buf);

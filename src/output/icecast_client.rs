@@ -16,8 +16,8 @@ use std::time::Duration;
 
 use base64::Engine as _;
 
-use crate::config::{OutputConfig, OutputFormat, OutputProtocol};
 use crate::Result;
+use crate::config::{OutputConfig, OutputFormat, OutputProtocol};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 /// SHOUTcast v1 answers with a bare `OK2` line and then waits for audio, so
@@ -187,10 +187,9 @@ impl IcecastClient {
         stream.write_all(request.as_bytes())?;
         let (status, message, _) = read_response_head(&mut stream)?;
         if !(200..300).contains(&status) {
-            return Err(format!(
-                "SHOUTcast metadata update failed: HTTP {status} {message}"
-            )
-            .into());
+            return Err(
+                format!("SHOUTcast metadata update failed: HTTP {status} {message}").into(),
+            );
         }
         Ok(())
     }
@@ -401,7 +400,10 @@ mod tests {
         let server = FakeIcecast::new();
         let port = server.port();
         thread::spawn(move || {
-            server.serve_once("HTTP/1.0 401 Unauthorized\r\nContent-Length: 0\r\n\r\n", false)
+            server.serve_once(
+                "HTTP/1.0 401 Unauthorized\r\nContent-Length: 0\r\n\r\n",
+                false,
+            )
         });
         let err = IcecastClient::connect(&test_config(port), 44100, 2).unwrap_err();
         assert!(err.to_string().contains("401"), "{err}");
@@ -452,9 +454,7 @@ mod tests {
     fn shoutcast_v1_handshake_sends_password_and_icy_headers() {
         let server = FakeIcecast::new();
         let port = server.port();
-        let capture = thread::spawn(move || {
-            server.serve_once("OK2\r\nicy-caps:11\r\n\r\n", false)
-        });
+        let capture = thread::spawn(move || server.serve_once("OK2\r\nicy-caps:11\r\n\r\n", false));
         let mut client = IcecastClient::connect(
             &shoutcast_config(port, OutputProtocol::ShoutcastV1),
             44100,
@@ -494,9 +494,7 @@ mod tests {
     fn shoutcast_v2_uses_icy_handshake_with_stream_selection() {
         let server = FakeIcecast::new();
         let port = server.port();
-        let capture = thread::spawn(move || {
-            server.serve_once("OK2\r\nicy-caps:11\r\n\r\n", false)
-        });
+        let capture = thread::spawn(move || server.serve_once("OK2\r\nicy-caps:11\r\n\r\n", false));
         let mut cfg = shoutcast_config(port, OutputProtocol::ShoutcastV2);
         // The DNAS's named-stream path selects stream id 2 via password:#2.
         cfg.mount = "/stream/2".into();
@@ -512,9 +510,7 @@ mod tests {
     fn shoutcast_v2_default_mount_keeps_plain_password() {
         let server = FakeIcecast::new();
         let port = server.port();
-        let capture = thread::spawn(move || {
-            server.serve_once("OK2\r\nicy-caps:11\r\n\r\n", false)
-        });
+        let capture = thread::spawn(move || server.serve_once("OK2\r\nicy-caps:11\r\n\r\n", false));
         let mut cfg = shoutcast_config(port, OutputProtocol::ShoutcastV2);
         cfg.mount = "/".into();
         IcecastClient::connect(&cfg, 44100, 2).expect("connects");

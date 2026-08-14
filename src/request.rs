@@ -323,7 +323,12 @@ fn apply_cues(
                 || c.fade_in.is_some()
                 || c.fade_out.is_some() =>
         {
-            Box::new(CueCutSource::new(src, c, target.rate, target.channels.count()))
+            Box::new(CueCutSource::new(
+                src,
+                c,
+                target.rate,
+                target.channels.count(),
+            ))
         }
         _ => src,
     }
@@ -421,7 +426,11 @@ fn download(
             Ok(()) => return Ok(()),
             Err(e) => {
                 last_err = Some(e.to_string());
-                warn!("request: download of {url} failed (attempt {}/{})", attempt + 1, config.retries + 1);
+                warn!(
+                    "request: download of {url} failed (attempt {}/{})",
+                    attempt + 1,
+                    config.retries + 1
+                );
                 std::thread::sleep(config.backoff());
             }
         }
@@ -476,9 +485,10 @@ impl HttpUrl {
             None => (rest, "/".to_string()),
         };
         let (host, port) = match authority.rsplit_once(':') {
-            Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) => {
-                (h, p.parse::<u16>().map_err(|_| format!("bad port in {url}"))?)
-            }
+            Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) => (
+                h,
+                p.parse::<u16>().map_err(|_| format!("bad port in {url}"))?,
+            ),
             _ => (authority, scheme.default_port()),
         };
         if host.is_empty() {
@@ -510,7 +520,10 @@ impl HttpUrl {
         // Relative to the current path's directory.
         let base = self.path.rsplit_once('/').map(|(d, _)| d).unwrap_or("/");
         let base = if base.is_empty() { "/" } else { base };
-        format!("{scheme}://{}:{}{}/{}", self.host, self.port, base, location)
+        format!(
+            "{scheme}://{}:{}{}/{}",
+            self.host, self.port, base, location
+        )
     }
 }
 
@@ -581,7 +594,9 @@ fn connect_transport(
                 .map_err(|_| format!("invalid TLS hostname {}", target.host))?;
             let conn = rustls::ClientConnection::new(Arc::new(config), server_name)
                 .map_err(|e| format!("TLS handshake with {} failed: {e}", target.host))?;
-            Ok(Transport::Tls(Box::new(rustls::StreamOwned::new(conn, tcp))))
+            Ok(Transport::Tls(Box::new(rustls::StreamOwned::new(
+                conn, tcp,
+            ))))
         }
     }
 }
@@ -746,7 +761,11 @@ mod tests {
             match stream.read(&mut buf[..1]) {
                 Ok(0) | Err(_) => return,
                 Ok(1) => {
-                    seen = if buf[0] == b"\r\n\r\n"[seen] { seen + 1 } else { 0 };
+                    seen = if buf[0] == b"\r\n\r\n"[seen] {
+                        seen + 1
+                    } else {
+                        0
+                    };
                 }
                 Ok(_) => unreachable!(),
             }
@@ -758,8 +777,8 @@ mod tests {
         rustls::pki_types::CertificateDer<'static>,
         rustls::pki_types::PrivateKeyDer<'static>,
     ) {
-        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-            .expect("rcgen cert");
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen cert");
         (
             certified.cert.der().clone(),
             rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into()),
@@ -875,8 +894,8 @@ mod tests {
             stream.flush().expect("flush");
         });
         let url = format!("http://{addr}/hook");
-        let err = http_post_json(&url, r#"{}"#, Duration::from_secs(5), None)
-            .expect_err("post fails");
+        let err =
+            http_post_json(&url, r#"{}"#, Duration::from_secs(5), None).expect_err("post fails");
         assert!(err.to_string().contains("500"), "{err}");
     }
 
@@ -928,7 +947,9 @@ mod tests {
                 }
                 let request = String::from_utf8_lossy(&req).to_string();
                 if request.starts_with("GET /start.mp3 ") {
-                    let _ = stream.write_all(b"HTTP/1.1 302 Found\r\nLocation: /target\r\nContent-Length: 0\r\n\r\n");
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 302 Found\r\nLocation: /target\r\nContent-Length: 0\r\n\r\n",
+                    );
                 } else if request.starts_with("GET /target ") {
                     let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\ntarget");
                 } else {
@@ -968,7 +989,10 @@ mod tests {
             RequestUri::new("https://x.example/track.mp3"),
             RequestUri::Url("https://x.example/track.mp3".into(), None)
         );
-        assert_eq!(RequestUri::new("https://x.example/track.mp3").display(), "track.mp3");
+        assert_eq!(
+            RequestUri::new("https://x.example/track.mp3").display(),
+            "track.mp3"
+        );
         assert_eq!(
             RequestUri::new("http://x.example/track.mp3").display(),
             "track.mp3"
@@ -978,9 +1002,7 @@ mod tests {
 
     #[test]
     fn annotate_prefix_parses_cue_points_and_strips_to_the_uri() {
-        let uri = RequestUri::new(
-            "annotate:liq_cue_in=\"30\",liq_cue_out=\"180\":media/a.mp3",
-        );
+        let uri = RequestUri::new("annotate:liq_cue_in=\"30\",liq_cue_out=\"180\":media/a.mp3");
         assert_eq!(
             uri,
             RequestUri::Local(
@@ -999,9 +1021,8 @@ mod tests {
 
     #[test]
     fn annotate_prefix_handles_http_uris_and_ignores_unknown_keys() {
-        let uri = RequestUri::new(
-            "annotate:title=\"intro\",liq_cue_in=\"5\":http://x.example/track.mp3",
-        );
+        let uri =
+            RequestUri::new("annotate:title=\"intro\",liq_cue_in=\"5\":http://x.example/track.mp3");
         assert_eq!(
             uri,
             RequestUri::Url(
@@ -1053,9 +1074,7 @@ mod tests {
         // `inf`/`NaN` would corrupt the sample-count math (and break the
         // Eq/Ord consistency of TrackCues), so they must not become cues.
         for bad in ["inf", "-inf", "NaN"] {
-            let uri = RequestUri::new(&format!(
-                "annotate:liq_cue_in=\"{bad}\":media/a.mp3"
-            ));
+            let uri = RequestUri::new(&format!("annotate:liq_cue_in=\"{bad}\":media/a.mp3"));
             assert_eq!(
                 uri,
                 RequestUri::Local("media/a.mp3".into(), None),
@@ -1063,9 +1082,7 @@ mod tests {
             );
         }
         // A good value next to a bad one still applies.
-        let uri = RequestUri::new(
-            "annotate:liq_cue_in=\"inf\",liq_cue_out=\"5\":media/a.mp3",
-        );
+        let uri = RequestUri::new("annotate:liq_cue_in=\"inf\",liq_cue_out=\"5\":media/a.mp3");
         assert_eq!(
             uri,
             RequestUri::Local(
@@ -1145,8 +1162,10 @@ mod tests {
                 let mut tls = rustls::StreamOwned::new(conn, tcp);
                 drain_request(&mut tls);
                 let _ = tls.write_all(
-                    format!("HTTP/1.1 302 Found\r\nLocation: {http_url}\r\nContent-Length: 0\r\n\r\n")
-                        .as_bytes(),
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {http_url}\r\nContent-Length: 0\r\n\r\n"
+                    )
+                    .as_bytes(),
                 );
                 let _ = tls.flush();
             }
@@ -1166,11 +1185,14 @@ mod tests {
     fn download_retries_then_fails() {
         // Point at a port with nothing listening: connect fails fast, and the
         // retry loop must still surface an error.
-        let config = RequestConfig { timeout_secs: 1, retries: 1 };
+        let config = RequestConfig {
+            timeout_secs: 1,
+            retries: 1,
+        };
         let dest = std::env::temp_dir().join("crabsoup-test-refused.bin");
         let _ = std::fs::remove_file(&dest);
-        let err = download("http://127.0.0.1:1/x.mp3", &dest, &config, None)
-            .expect_err("must fail");
+        let err =
+            download("http://127.0.0.1:1/x.mp3", &dest, &config, None).expect_err("must fail");
         assert!(!err.to_string().is_empty());
     }
 

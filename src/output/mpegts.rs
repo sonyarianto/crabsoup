@@ -114,7 +114,13 @@ impl MpegTsMuxer {
         let mut pes = Vec::with_capacity(header.len() + adts.len());
         pes.extend_from_slice(&header);
         pes.extend_from_slice(adts);
-        packetize(&pes, AUDIO_PID, with_pcr.then_some(pts_90k), &mut self.cc_audio, out);
+        packetize(
+            &pes,
+            AUDIO_PID,
+            with_pcr.then_some(pts_90k),
+            &mut self.cc_audio,
+            out,
+        );
         if with_pcr {
             self.last_pcr_pts = pts_90k;
         }
@@ -133,7 +139,11 @@ fn packetize(payload: &[u8], pid: u16, pcr: Option<u64>, cc: &mut u8, out: &mut 
         packet[0] = SYNC;
         packet[1] = (if first { 0x40 } else { 0 }) | (pid >> 8) as u8;
         packet[2] = (pid & 0xff) as u8;
-        let pcr_len = if first { pcr.map(|_| 8).unwrap_or(0) } else { 0 };
+        let pcr_len = if first {
+            pcr.map(|_| 8).unwrap_or(0)
+        } else {
+            0
+        };
         let take = (TS_PACKET_SIZE - 4 - pcr_len).min(rest.len());
         let slack = TS_PACKET_SIZE - 4 - pcr_len - take;
         packet[3] = if pcr_len > 0 || slack > 0 { 0x30 } else { 0x10 } | (*cc & 0x0f);

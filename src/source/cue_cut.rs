@@ -201,8 +201,7 @@ mod tests {
     fn skips_cue_in_seconds_at_track_start() {
         // 25 Hz sine: at t=0.04s the first emitted sample must match the
         // sine's phase there, i.e. sin(2*pi*25*0.04) = sin(2pi) = 0.
-        let child: Box<dyn AudioSource> =
-            Box::new(SineSource::new(25.0, None, 1.0, RATE, CHANS));
+        let child: Box<dyn AudioSource> = Box::new(SineSource::new(25.0, None, 1.0, RATE, CHANS));
         let mut src = CueCutSource::new(child, cues(0.04, None), RATE, CHANS);
         let mut buf = vec![0f32; 8];
         let n = src.next_buffer(&mut buf);
@@ -213,8 +212,7 @@ mod tests {
     #[test]
     fn cue_out_truncates_the_track() {
         // cue_in 0.02s (2 frames) + cue_out 0.04s -> window is 2 frames.
-        let child: Box<dyn AudioSource> =
-            Box::new(SineSource::new(25.0, None, 1.0, RATE, CHANS));
+        let child: Box<dyn AudioSource> = Box::new(SineSource::new(25.0, None, 1.0, RATE, CHANS));
         let mut src = CueCutSource::new(child, cues(0.02, Some(0.04)), RATE, CHANS);
         let mut buf = vec![0f32; 40];
         let mut total = 0usize;
@@ -235,8 +233,7 @@ mod tests {
 
     #[test]
     fn no_cue_points_is_a_passthrough() {
-        let child: Box<dyn AudioSource> =
-            Box::new(SineSource::new(25.0, None, 1.0, RATE, CHANS));
+        let child: Box<dyn AudioSource> = Box::new(SineSource::new(25.0, None, 1.0, RATE, CHANS));
         let mut src = CueCutSource::new(child, TrackCues::default(), RATE, CHANS);
         let mut buf = vec![0f32; 8];
         let n = src.next_buffer(&mut buf);
@@ -246,8 +243,7 @@ mod tests {
 
     #[test]
     fn reports_fade_overrides_from_the_cue_points() {
-        let child: Box<dyn AudioSource> =
-            Box::new(SineSource::new(25.0, None, 1.0, RATE, CHANS));
+        let child: Box<dyn AudioSource> = Box::new(SineSource::new(25.0, None, 1.0, RATE, CHANS));
         let src = CueCutSource::new(
             child,
             TrackCues {
@@ -262,24 +258,22 @@ mod tests {
         assert_eq!(src.crossfade_overrides(), Some((Some(2.0), Some(3.0))));
 
         // Only cue points, no fades: no override reported.
-        let child: Box<dyn AudioSource> =
-            Box::new(SineSource::new(25.0, None, 1.0, RATE, CHANS));
+        let child: Box<dyn AudioSource> = Box::new(SineSource::new(25.0, None, 1.0, RATE, CHANS));
         let src = CueCutSource::new(child, cues(0.02, Some(0.22)), RATE, CHANS);
         assert_eq!(src.crossfade_overrides(), None);
     }
 
     #[test]
     fn remaining_seconds_reports_the_cue_window() {
-        let child: Box<dyn AudioSource> =
-            Box::new(SineSource::new(25.0, None, 1.0, RATE, CHANS));
+        let child: Box<dyn AudioSource> = Box::new(SineSource::new(25.0, None, 1.0, RATE, CHANS));
         let mut src = CueCutSource::new(child, cues(0.02, Some(0.22)), RATE, CHANS);
         // 0.2 s window (40 samples at 200/s) remains before any audio is
         // pulled.
         assert!((src.remaining_seconds().unwrap() - 0.2).abs() < 1e-9);
         let mut buf = vec![0f32; 20];
         src.next_buffer(&mut buf); // 0.02 s of the pull is the cue_in skip,
-                                   // so 16 samples (0.08 s) of window audio
-                                   // are consumed, leaving 24 (0.12 s).
+        // so 16 samples (0.08 s) of window audio
+        // are consumed, leaving 24 (0.12 s).
         let left = src.remaining_seconds().unwrap();
         assert!((left - 0.12).abs() < 1e-9, "left {left}");
     }

@@ -9,8 +9,8 @@ use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
-use crate::source::{AudioSource, PcmConverter};
 use crate::Result;
+use crate::source::{AudioSource, PcmConverter};
 
 /// A single decoded audio file, normalised to the bus `SignalSpec`.
 pub struct FileSource {
@@ -48,10 +48,8 @@ impl FileSource {
             .cloned()
             .ok_or("no default audio track")?;
         let track_id = track.id;
-        let decoder = symphonia::default::get_codecs().make(
-            &track.codec_params,
-            &DecoderOptions::default(),
-        )?;
+        let decoder = symphonia::default::get_codecs()
+            .make(&track.codec_params, &DecoderOptions::default())?;
 
         // Total duration, computed on the source's own clock.
         let total_seconds = track
@@ -85,7 +83,7 @@ impl FileSource {
         use symphonia::core::audio::SampleBuffer;
         use symphonia::core::errors::Error as SErr;
 
-let to_ch = self.converter.target_channels();
+        let to_ch = self.converter.target_channels();
         while self.buf.len() - self.pos < needed && !self.eof {
             let packet = match self.format.next_packet() {
                 Ok(p) => p,
@@ -370,7 +368,11 @@ mod tests {
         let path = dir.join("sine.wav");
         write_sine_wav(&path, 0.25, 44100, 440.0);
 
-        let spec = symphonia::core::audio::SignalSpec::new(44100, symphonia::core::audio::Channels::FRONT_LEFT | symphonia::core::audio::Channels::FRONT_RIGHT);
+        let spec = symphonia::core::audio::SignalSpec::new(
+            44100,
+            symphonia::core::audio::Channels::FRONT_LEFT
+                | symphonia::core::audio::Channels::FRONT_RIGHT,
+        );
         let mut src = FileSource::open(&path, spec, 4096).unwrap();
 
         let mut buf = vec![0f32; 44100 * 2];
@@ -437,7 +439,11 @@ mod tests {
             return;
         }
         let tagged = write_id3_txxx(real, "REPLAYGAIN_TRACK_GAIN", "-6.5 dB");
-        let spec = symphonia::core::audio::SignalSpec::new(44100, symphonia::core::audio::Channels::FRONT_LEFT | symphonia::core::audio::Channels::FRONT_RIGHT);
+        let spec = symphonia::core::audio::SignalSpec::new(
+            44100,
+            symphonia::core::audio::Channels::FRONT_LEFT
+                | symphonia::core::audio::Channels::FRONT_RIGHT,
+        );
         let src = FileSource::open(&tagged, spec, 4096).unwrap();
         assert_eq!(src.replaygain_db(), Some(-6.5));
     }
@@ -448,9 +454,12 @@ mod tests {
         if !real.exists() {
             return;
         }
-        let tagged =
-            write_id3_txxx(real, "REPLAYGAIN_ALBUM_GAIN", "\u{2212}4.25 dB");
-        let spec = symphonia::core::audio::SignalSpec::new(44100, symphonia::core::audio::Channels::FRONT_LEFT | symphonia::core::audio::Channels::FRONT_RIGHT);
+        let tagged = write_id3_txxx(real, "REPLAYGAIN_ALBUM_GAIN", "\u{2212}4.25 dB");
+        let spec = symphonia::core::audio::SignalSpec::new(
+            44100,
+            symphonia::core::audio::Channels::FRONT_LEFT
+                | symphonia::core::audio::Channels::FRONT_RIGHT,
+        );
         let src = FileSource::open(&tagged, spec, 4096).unwrap();
         // Tools write the Unicode minus; parse must normalize it.
         assert_eq!(src.replaygain_db(), Some(-4.25));
@@ -470,9 +479,12 @@ mod tests {
             return;
         }
         let tagged = write_id3_txxx(real, "REPLAYGAIN_TRACK_GAIN", "3.0");
-        let spec = symphonia::core::audio::SignalSpec::new(44100, symphonia::core::audio::Channels::FRONT_LEFT | symphonia::core::audio::Channels::FRONT_RIGHT);
+        let spec = symphonia::core::audio::SignalSpec::new(
+            44100,
+            symphonia::core::audio::Channels::FRONT_LEFT
+                | symphonia::core::audio::Channels::FRONT_RIGHT,
+        );
         let src = FileSource::open(&tagged, spec, 4096).unwrap();
         assert_eq!(src.replaygain_db(), Some(3.0));
     }
 }
-

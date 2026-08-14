@@ -1,7 +1,7 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
@@ -17,7 +17,11 @@ use crabsoup::script::{self, ScriptResult};
 use crabsoup::source::AudioSource;
 
 #[derive(Parser)]
-#[command(name = "crabsoup", version, about = "Liquidsoap-inspired audio streaming engine")]
+#[command(
+    name = "crabsoup",
+    version,
+    about = "Liquidsoap-inspired audio streaming engine"
+)]
 struct Cli {
     /// Path to the .lua script (Lua).
     #[arg(short, long, default_value = "crabsoup.lua")]
@@ -56,8 +60,13 @@ fn main() -> crabsoup::Result<()> {
         .or_else(|| result.preview.take())
         .expect("script output checked by run()");
     let (tx, rx) = mpsc::channel();
-    let root: Box<dyn AudioSource> =
-        Box::new(PriorityMixer::new(root_source, rx, &result.mixer, spec, fpb));
+    let root: Box<dyn AudioSource> = Box::new(PriorityMixer::new(
+        root_source,
+        rx,
+        &result.mixer,
+        spec,
+        fpb,
+    ));
     let mut tap = EngineTap::new(root, spec.rate, chans);
 
     let broadcast = if cli.preview {
@@ -77,7 +86,7 @@ fn main() -> crabsoup::Result<()> {
         .build()?;
 
     if let Some(live_cfg) = &result.harbor {
-        let harbor = Harbor::new(live_cfg.clone(), spec, tx.clone());
+        let harbor = Harbor::new(live_cfg.clone(), spec, tx.clone(), status.harbor_flag());
         rt.spawn(async move { harbor.run().await });
     }
 
@@ -177,9 +186,7 @@ fn main() -> crabsoup::Result<()> {
     for cfg in &record {
         let mut output = FileOutput::new(cfg.clone(), tap.register(), spec.rate, chans);
         output.set_shutdown(shutdown.clone());
-        output
-            .connect()
-            .map_err(|e| format!("output.file: {e}"))?;
+        output.connect().map_err(|e| format!("output.file: {e}"))?;
         handles.push(std::thread::spawn(move || output.run()));
     }
 
@@ -193,9 +200,7 @@ fn main() -> crabsoup::Result<()> {
     for cfg in &hls {
         let mut output = HlsOutput::new(cfg.clone(), tap.register(), spec.rate, chans);
         output.set_shutdown(shutdown.clone());
-        output
-            .connect()
-            .map_err(|e| format!("output.hls: {e}"))?;
+        output.connect().map_err(|e| format!("output.hls: {e}"))?;
         handles.push(std::thread::spawn(move || output.run()));
     }
 
@@ -278,7 +283,11 @@ fn print_result(result: &ScriptResult, preview: bool) {
             ));
         }
         for rec in &result.file_outputs {
-            lines.push(format!("record: {:?} to {}", rec.format, rec.path.display()));
+            lines.push(format!(
+                "record: {:?} to {}",
+                rec.format,
+                rec.path.display()
+            ));
         }
         for hls in &result.hls_outputs {
             lines.push(format!(

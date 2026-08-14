@@ -171,13 +171,11 @@ mod tests {
 
     #[test]
     fn gain_is_unchanged_within_a_track() {
-        let child: Box<dyn AudioSource> = Box::new(ArcSource(Arc::new(Mutex::new(
-            GainCycler {
-                tracks: vec![("a".into(), Some(-3.0))],
-                index: 0,
-                value: 0.5,
-            },
-        ))));
+        let child: Box<dyn AudioSource> = Box::new(ArcSource(Arc::new(Mutex::new(GainCycler {
+            tracks: vec![("a".into(), Some(-3.0))],
+            index: 0,
+            value: 0.5,
+        }))));
         let mut src = ReplayGainSource::new(child, 12.0, 12.0);
         let mut buf = vec![0f32; 4];
         let first = {

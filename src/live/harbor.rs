@@ -1,11 +1,11 @@
 use std::io::{Read, Seek, SeekFrom};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::thread;
 
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use ringbuf::{HeapRb, traits::*};
 use symphonia::core::audio::{SampleBuffer, SignalSpec};
 use symphonia::core::codecs::DecoderOptions;
@@ -47,12 +47,14 @@ impl Harbor {
         config: LiveConfig,
         target: SignalSpec,
         tx: mpsc::Sender<MixCommand>,
+        // Shared with the status handle so `/status` can report on-air state.
+        occupied: Arc<AtomicBool>,
     ) -> Self {
         Self {
             config,
             target,
             tx,
-            occupied: Arc::new(AtomicBool::new(false)),
+            occupied,
         }
     }
 
@@ -121,12 +123,15 @@ async fn handle_connection(
         return Ok(());
     }
 
-    // Auth (source protocol Basic auth, password match).
-    let auth_ok = request
-        .authorization
-        .as_deref()
-        .map(|cred| basic_password_matches(cred, &config.password))
-        .unwrap_or(false);
+    // Auth (source protocol Basic auth, password match against the shared
+    // mount password or any per-streamer `extra_passwords`).
+    let auth_ok = request.authorization.as_deref().is_some_and(|cred| {
+        basic_password_matches(cred, &config.password)
+            || config
+                .extra_passwords
+                .iter()
+                .any(|p| basic_password_matches(cred, p))
+    });
     if !auth_ok {
         respond(&mut socket, 401, "Unauthorized").await?;
         return Ok(());
@@ -211,7 +216,14 @@ fn decode_live_stream(
     tx: mpsc::Sender<MixCommand>,
     occupied: Arc<AtomicBool>,
 ) {
-    decode_live_stream_inner(stream, content_type, chunked, respond_at_end, target, &mut sink);
+    decode_live_stream_inner(
+        stream,
+        content_type,
+        chunked,
+        respond_at_end,
+        target,
+        &mut sink,
+    );
     log::debug!("live harbor: decode done, buffered={}", sink.buffered());
     // A fast upload (e.g. `curl -T`) can land several seconds of audio in
     // the ring before the mixer processes `SetLive`; a `ClearLive` sent
@@ -302,10 +314,9 @@ fn decode_live_stream_inner(
         return;
     };
     let track_id = track.id;
-    let mut decoder = match symphonia::default::get_codecs().make(
-        &track.codec_params,
-        &DecoderOptions::default(),
-    ) {
+    let mut decoder = match symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+    {
         Ok(d) => d,
         Err(e) => {
             log::error!("live harbor: cannot create decoder: {e}");
@@ -357,11 +368,7 @@ fn decode_live_stream_inner(
     done(respond_at_end, &mut stream);
 }
 
-fn finish(
-    exhausted: &Arc<AtomicBool>,
-    tx: &mpsc::Sender<MixCommand>,
-    occupied: &Arc<AtomicBool>,
-) {
+fn finish(exhausted: &Arc<AtomicBool>, tx: &mpsc::Sender<MixCommand>, occupied: &Arc<AtomicBool>) {
     exhausted.store(true, Ordering::SeqCst);
     // Always fade back out; the priority mixer also auto-fades once the live
     // source drains, so a ClearLive with buffered audio just starts the fade
@@ -457,7 +464,7 @@ impl<R: Read> ChunkedReader<R> {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
                         "unexpected EOF in chunk header",
-                    ))
+                    ));
                 }
                 Ok(_) => {}
                 Err(e) => return Err(e),
@@ -636,7 +643,8 @@ async fn read_header(socket: &mut TcpStream) -> Result<Vec<u8>, String> {
 }
 
 async fn respond(socket: &mut TcpStream, code: u16, reason: &str) -> Result<(), String> {
-    let body = format!("HTTP/1.0 {code} {reason}\r\nServer: Crabsoup Harbor\r\nContent-Length: 0\r\n\r\n");
+    let body =
+        format!("HTTP/1.0 {code} {reason}\r\nServer: Crabsoup Harbor\r\nContent-Length: 0\r\n\r\n");
     socket
         .write_all(body.as_bytes())
         .await
@@ -664,7 +672,10 @@ mod tests {
         let header = b"PUT /live HTTP/1.1\r\nAuthorization: Basic c291cmNlOnNlY3JldA==\r\nContent-Type: application/mpeg\r\nContent-Length: 466982\r\n\r\n";
         let req = parse_source_request(header).unwrap();
         assert_eq!(req.path, "/live");
-        assert_eq!(req.authorization.as_deref(), Some("Basic c291cmNlOnNlY3JldA=="));
+        assert_eq!(
+            req.authorization.as_deref(),
+            Some("Basic c291cmNlOnNlY3JldA==")
+        );
         assert_eq!(req.content_type.as_deref(), Some("application/mpeg"));
         assert_eq!(req.content_length, Some(466982));
         assert!(!req.chunked);
@@ -672,7 +683,8 @@ mod tests {
 
     #[test]
     fn parses_chunked_put_request() {
-        let header = b"PUT /live HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Type: audio/mpeg\r\n\r\n";
+        let header =
+            b"PUT /live HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Type: audio/mpeg\r\n\r\n";
         let req = parse_source_request(header).unwrap();
         assert!(req.chunked);
     }
@@ -686,10 +698,35 @@ mod tests {
     #[test]
     fn basic_auth_password_match() {
         // "source:secret"
-        assert!(basic_password_matches("Basic c291cmNlOnNlY3JldA==", "secret"));
-        assert!(!basic_password_matches("Basic c291cmNlOnNlY3JldA==", "nope"));
+        assert!(basic_password_matches(
+            "Basic c291cmNlOnNlY3JldA==",
+            "secret"
+        ));
+        assert!(!basic_password_matches(
+            "Basic c291cmNlOnNlY3JldA==",
+            "nope"
+        ));
         assert!(!basic_password_matches("Bearer xyz", "secret"));
         assert!(!basic_password_matches("Basic not-base64!!", "secret"));
+    }
+
+    #[test]
+    fn extra_passwords_are_accepted_for_auth() {
+        // One shared mount password plus per-streamer extras; the same
+        // Basic auth check must accept any of them.
+        // base64("source:<pw>") with the `Basic ` prefix, as sent by DJs.
+        let shared = "Basic c291cmNlOnNoYXJlZA=="; // source:shared
+        let dj1 = "Basic c291cmNlOmRqLW9uZQ=="; // source:dj-one
+        let dj2 = "Basic c291cmNlOmRqLXR3bw=="; // source:dj-two
+        let extras = ["dj-one".to_string(), "dj-two".to_string()];
+        let accepts = |cred: &str| {
+            basic_password_matches(cred, "shared")
+                || extras.iter().any(|p| basic_password_matches(cred, p))
+        };
+        assert!(accepts(shared));
+        assert!(accepts(dj1));
+        assert!(accepts(dj2));
+        assert!(!accepts("Basic c291cmNlOndyb25n")); // source:wrong
     }
 
     #[test]
@@ -722,10 +759,7 @@ mod tests {
         let mut reader = ChunkedReader::new(framed);
         let mut out = Vec::new();
         reader.read_to_end(&mut out).unwrap();
-        assert_eq!(
-            out,
-            b"0123456789abcdefghijklmnopqrstuvwxyz0123456789zz"
-        );
+        assert_eq!(out, b"0123456789abcdefghijklmnopqrstuvwxyz0123456789zz");
     }
 
     #[test]

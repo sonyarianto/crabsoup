@@ -173,9 +173,7 @@ pub fn opus_tags_packet(title: &str) -> Vec<u8> {
 }
 
 fn sanitize_comment(s: &str) -> String {
-    s.chars()
-        .filter(|c| !c.is_control())
-        .collect::<String>()
+    s.chars().filter(|c| !c.is_control()).collect::<String>()
 }
 
 #[cfg(test)]

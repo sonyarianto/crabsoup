@@ -90,12 +90,8 @@ fn mixers(c: &mut Criterion) {
     group.throughput(Throughput::Elements(BUF as u64));
 
     group.bench_function("crossfade/passthrough", |b| {
-        let mut mixer = CrossfadeMixer::new(
-            Box::new(FakeProvider::new(2, None)),
-            &cfg,
-            RATE,
-            CHANS,
-        );
+        let mut mixer =
+            CrossfadeMixer::new(Box::new(FakeProvider::new(2, None)), &cfg, RATE, CHANS);
         let mut buf = vec![0.0f32; BUF];
         b.iter(|| {
             mixer.next_buffer(&mut buf);
@@ -106,12 +102,8 @@ fn mixers(c: &mut Criterion) {
     group.bench_function("crossfade/mixing", |b| {
         // ConstSource reports remaining = 1.0 s < crossfade window, so the
         // mixer preloads the next track and mixes every buffer (worst case).
-        let mut mixer = CrossfadeMixer::new(
-            Box::new(FakeProvider::new(2, Some(1.0))),
-            &cfg,
-            RATE,
-            CHANS,
-        );
+        let mut mixer =
+            CrossfadeMixer::new(Box::new(FakeProvider::new(2, Some(1.0))), &cfg, RATE, CHANS);
         let mut buf = vec![0.0f32; BUF];
         mixer.next_buffer(&mut buf);
         b.iter(|| {
@@ -123,13 +115,8 @@ fn mixers(c: &mut Criterion) {
     group.bench_function("priority/passthrough", |b| {
         let (tx, rx) = mpsc::channel();
         drop(tx);
-        let mut mixer = PriorityMixer::new(
-            Box::new(ConstSource::new(0.2, None)),
-            rx,
-            &cfg,
-            spec,
-            FPB,
-        );
+        let mut mixer =
+            PriorityMixer::new(Box::new(ConstSource::new(0.2, None)), rx, &cfg, spec, FPB);
         let mut buf = vec![0.0f32; BUF];
         b.iter(|| {
             mixer.next_buffer(&mut buf);
@@ -141,18 +128,13 @@ fn mixers(c: &mut Criterion) {
         // A live override is ramped in/out every buffer: each call toggles
         // the fade state via a fresh SetLive command.
         let (tx, rx) = mpsc::channel();
-        let mut mixer = PriorityMixer::new(
-            Box::new(ConstSource::new(0.2, None)),
-            rx,
-            &cfg,
-            spec,
-            FPB,
-        );
+        let mut mixer =
+            PriorityMixer::new(Box::new(ConstSource::new(0.2, None)), rx, &cfg, spec, FPB);
         let mut buf = vec![0.0f32; BUF];
         b.iter(|| {
-            tx.send(crabsoup::engine::mixer::MixCommand::SetLive(
-                Box::new(ConstSource::new(0.4, None)),
-            ))
+            tx.send(crabsoup::engine::mixer::MixCommand::SetLive(Box::new(
+                ConstSource::new(0.4, None),
+            )))
             .unwrap();
             mixer.next_buffer(&mut buf);
             black_box(&buf);
@@ -175,8 +157,9 @@ fn smart_crossfade(c: &mut Criterion) {
         // passthrough plus the rolling tail-level accumulation (per-sample
         // sum of squares + VecDeque window eviction) — the hot-path cost
         // D5 adds on top of the plain crossfade passthrough row.
-        let mut mixer = CrossfadeMixer::new(Box::new(FakeProvider::new(2, None)), &cfg, RATE, CHANS)
-            .with_smart_fade(smart);
+        let mut mixer =
+            CrossfadeMixer::new(Box::new(FakeProvider::new(2, None)), &cfg, RATE, CHANS)
+                .with_smart_fade(smart);
         let mut buf = vec![0.0f32; BUF];
         b.iter(|| {
             mixer.next_buffer(&mut buf);
@@ -189,13 +172,9 @@ fn smart_crossfade(c: &mut Criterion) {
         // margin, so the mixer preloads and mixes every buffer; the tail
         // measurement pauses during the fade (worst case, same as the
         // plain crossfade/mixing row but through the smart branch).
-        let mut mixer = CrossfadeMixer::new(
-            Box::new(FakeProvider::new(2, Some(1.0))),
-            &cfg,
-            RATE,
-            CHANS,
-        )
-        .with_smart_fade(smart);
+        let mut mixer =
+            CrossfadeMixer::new(Box::new(FakeProvider::new(2, Some(1.0))), &cfg, RATE, CHANS)
+                .with_smart_fade(smart);
         let mut buf = vec![0.0f32; BUF];
         mixer.next_buffer(&mut buf);
         b.iter(|| {
@@ -303,12 +282,18 @@ fn encode(c: &mut Criterion) {
 
     let pcm = vec![0.0f32; BUF];
     let encoders: [(&str, Box<dyn Encoder>); 3] = [
-        ("mp3", Box::new(Mp3Encoder::new(RATE, CHANS as u16, 192_000).unwrap())),
+        (
+            "mp3",
+            Box::new(Mp3Encoder::new(RATE, CHANS as u16, 192_000).unwrap()),
+        ),
         (
             "opus",
             Box::new(OpusEncoder::new(48_000, CHANS as u16, 128_000, "bench").unwrap()),
         ),
-        ("aac", Box::new(AacEncoder::new(RATE, CHANS as u16, 128_000).unwrap())),
+        (
+            "aac",
+            Box::new(AacEncoder::new(RATE, CHANS as u16, 128_000).unwrap()),
+        ),
     ];
     for (name, mut enc) in encoders {
         group.bench_function(name, |b| {
@@ -320,5 +305,13 @@ fn encode(c: &mut Criterion) {
     }
 }
 
-criterion::criterion_group!(benches, mixers, smart_crossfade, live_handoff, effects, resampler, encode);
+criterion::criterion_group!(
+    benches,
+    mixers,
+    smart_crossfade,
+    live_handoff,
+    effects,
+    resampler,
+    encode
+);
 criterion::criterion_main!(benches);

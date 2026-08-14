@@ -204,8 +204,7 @@ impl AudioSource for SineSource {
     }
 
     fn remaining_seconds(&self) -> Option<f64> {
-        self.frames_left
-            .map(|l| l as f64 / self.sample_rate as f64)
+        self.frames_left.map(|l| l as f64 / self.sample_rate as f64)
     }
 
     fn label(&self) -> Option<String> {
@@ -270,7 +269,11 @@ impl PcmConverter {
             self.resampler = Some(SincResampler::new(24, spec.rate, self.target.rate, to_ch));
             self.in_rate = spec.rate;
         }
-        self.resampler.as_mut().unwrap().resample(&converted).to_vec()
+        self.resampler
+            .as_mut()
+            .unwrap()
+            .resample(&converted)
+            .to_vec()
     }
 
     /// Drain any samples remaining inside the resampler (call at EOF).

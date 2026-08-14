@@ -116,7 +116,11 @@ impl AudioSource for BlankDetectSource {
         if !self.blank {
             let n = self.child.next_buffer(buffer);
             let secs = self.buffer_seconds(n, buffer.len());
-            let db = if n > 0 { buffer_rms_db(&buffer[..n]) } else { f32::NEG_INFINITY };
+            let db = if n > 0 {
+                buffer_rms_db(&buffer[..n])
+            } else {
+                f32::NEG_INFINITY
+            };
             if db < self.threshold_db {
                 self.blank_secs += secs;
                 if self.duration_secs > 0.0 && self.blank_secs >= self.duration_secs {
@@ -200,7 +204,11 @@ mod tests {
         fn next_buffer(&mut self, buffer: &mut [f32]) -> usize {
             buffer.fill(if self.loud { 0.5 } else { 0.0 });
             self.count += 1;
-            let cycle = if self.loud { self.loud_bufs } else { self.quiet_bufs };
+            let cycle = if self.loud {
+                self.loud_bufs
+            } else {
+                self.quiet_bufs
+            };
             if self.count >= cycle {
                 self.loud = !self.loud;
                 self.count = 0;
@@ -229,28 +237,39 @@ mod tests {
 
     #[test]
     fn loud_audio_never_triggers() {
-        let mut src = detect(Box::new(LoudQuiet {
-            loud: true,
-            count: 0,
-            loud_bufs: 10,
-            quiet_bufs: 0,
-        }), 0.2, 0.1);
+        let mut src = detect(
+            Box::new(LoudQuiet {
+                loud: true,
+                count: 0,
+                loud_bufs: 10,
+                quiet_bufs: 0,
+            }),
+            0.2,
+            0.1,
+        );
         let mut buf = vec![0f32; 10]; // 0.1 s per buffer at 100 Hz
         for _ in 0..5 {
             assert_eq!(src.next_buffer(&mut buf), 10);
         }
         assert!(!src.is_exhausted());
-        assert!(buf.iter().all(|&s| (s - 0.5).abs() < 1e-6), "audio passes through");
+        assert!(
+            buf.iter().all(|&s| (s - 0.5).abs() < 1e-6),
+            "audio passes through"
+        );
     }
 
     #[test]
     fn silence_beyond_the_duration_goes_blank_and_exhausts() {
-        let mut src = detect(Box::new(LoudQuiet {
-            loud: true,
-            count: 0,
-            loud_bufs: 3,  // 0.3 s loud
-            quiet_bufs: 8, // 0.8 s quiet
-        }), 0.2, 0.1);
+        let mut src = detect(
+            Box::new(LoudQuiet {
+                loud: true,
+                count: 0,
+                loud_bufs: 3,  // 0.3 s loud
+                quiet_bufs: 8, // 0.8 s quiet
+            }),
+            0.2,
+            0.1,
+        );
         let mut buf = vec![0f32; 10];
         // 3 loud + 2 quiet buffers: after the 5th pull the 0.2 s threshold
         // has elapsed, so the next pull must be blank + exhausted.
@@ -265,12 +284,16 @@ mod tests {
     fn recovers_when_audio_returns_after_the_restart_window() {
         // 3 loud / 4 quiet buffers, repeating: detection at the 5th pull,
         // one restart buffer, then the cycle flips back to loud.
-        let mut src = detect(Box::new(LoudQuiet {
-            loud: true,
-            count: 0,
-            loud_bufs: 3,
-            quiet_bufs: 4,
-        }), 0.2, 0.1);
+        let mut src = detect(
+            Box::new(LoudQuiet {
+                loud: true,
+                count: 0,
+                loud_bufs: 3,
+                quiet_bufs: 4,
+            }),
+            0.2,
+            0.1,
+        );
         let mut buf = vec![0f32; 10];
         for _ in 0..5 {
             src.next_buffer(&mut buf);
@@ -283,7 +306,10 @@ mod tests {
         // the audio through.
         assert_eq!(src.next_buffer(&mut buf), 10, "recovered audio");
         assert!(!src.is_exhausted());
-        assert!(buf.iter().all(|&s| (s - 0.5).abs() < 1e-6), "recovered sample value");
+        assert!(
+            buf.iter().all(|&s| (s - 0.5).abs() < 1e-6),
+            "recovered sample value"
+        );
     }
 
     #[test]
@@ -314,11 +340,19 @@ mod tests {
         for _ in 0..5 {
             src.next_buffer(&mut buf);
         }
-        assert_eq!(fired.load(std::sync::atomic::Ordering::Relaxed), 1, "first episode fired once");
+        assert_eq!(
+            fired.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "first episode fired once"
+        );
         for _ in 0..9 {
             src.next_buffer(&mut buf);
         }
-        assert_eq!(fired.load(std::sync::atomic::Ordering::Relaxed), 2, "second episode fired once more");
+        assert_eq!(
+            fired.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "second episode fired once more"
+        );
     }
 
     #[test]

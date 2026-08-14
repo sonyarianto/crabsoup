@@ -15,9 +15,9 @@ use audiopus::{Channels as OpusChannels, MutSignals, SampleRate};
 use log::warn;
 use symphonia::core::audio::{Channels, SignalSpec};
 
+use crate::Result;
 use crate::output::ogg_mux::crc32;
 use crate::source::{AudioSource, PcmConverter};
-use crate::Result;
 
 /// Longest decodable Opus frame (120 ms at 48 kHz, stereo).
 const MAX_OPUS_SAMPLES: usize = 5760 * 2;
@@ -98,7 +98,13 @@ impl<R: Read> OggOpusDemux<R> {
                 }
             };
             let (flags, granule, serial, body, laces) = {
-                let Page { flags, granule, serial, body, laces } = page;
+                let Page {
+                    flags,
+                    granule,
+                    serial,
+                    body,
+                    laces,
+                } = page;
                 (flags, granule, serial, body, laces)
             };
             self.granule = granule;
@@ -346,7 +352,12 @@ pub struct OpusSource<R: Read + Send> {
 impl<R: Read + Send> OpusSource<R> {
     /// Open an Opus stream. Consumes header packets until the first audio
     /// packet so channels/pre-skip are known before playback.
-    pub fn open(reader: R, target: SignalSpec, frames_per_buffer: usize, label: String) -> Result<Self> {
+    pub fn open(
+        reader: R,
+        target: SignalSpec,
+        frames_per_buffer: usize,
+        label: String,
+    ) -> Result<Self> {
         let mut demux = OggOpusDemux::new(reader);
         let readahead = match demux.next_packet()? {
             Some(p) => p,
@@ -401,9 +412,13 @@ impl<R: Read + Send> OpusSource<R> {
                 },
             };
             let mut decoded = Vec::new();
-            let Some(frames) =
-                decode_packet(&mut self.decoder, self.channels, &pkt, &mut self.preskip_left, &mut decoded)
-            else {
+            let Some(frames) = decode_packet(
+                &mut self.decoder,
+                self.channels,
+                &pkt,
+                &mut self.preskip_left,
+                &mut decoded,
+            ) else {
                 continue;
             };
             self.elapsed_48k += frames as u64;
@@ -415,7 +430,6 @@ impl<R: Read + Send> OpusSource<R> {
             self.buf.extend_from_slice(&converted);
         }
     }
-
 }
 
 impl<R: Read + Send> AudioSource for OpusSource<R> {
@@ -573,7 +587,8 @@ mod tests {
         let mut out = Vec::new();
         let mut pcm = Vec::with_capacity(1024);
         for f in 0..frames {
-            let v = (f as f64 * 2.0 * std::f64::consts::PI * 440.0 / rate as f64).sin() as f32 * 0.5;
+            let v =
+                (f as f64 * 2.0 * std::f64::consts::PI * 440.0 / rate as f64).sin() as f32 * 0.5;
             pcm.push(v);
             pcm.push(v);
             if pcm.len() >= 1024 {
@@ -588,7 +603,10 @@ mod tests {
         out
     }
 
-    fn open_cursor(bytes: Vec<u8>, target: SignalSpec) -> OpusSource<Box<std::io::Cursor<Vec<u8>>>> {
+    fn open_cursor(
+        bytes: Vec<u8>,
+        target: SignalSpec,
+    ) -> OpusSource<Box<std::io::Cursor<Vec<u8>>>> {
         OpusSource::open(
             Box::new(Cursor::new(bytes)),
             target,
@@ -633,23 +651,24 @@ mod tests {
         // the encoder writes them.
         let mut stream = Vec::new();
         let mut seq = 0u32;
-        let mut page = |stream: &mut Vec<u8>, flags: u8, granule: i64, laces: &[u8], body: &[u8]| {
-            let mut hdr = Vec::new();
-            hdr.extend_from_slice(b"OggS");
-            hdr.push(0);
-            hdr.push(flags);
-            hdr.extend_from_slice(&granule.to_le_bytes());
-            hdr.extend_from_slice(&1u32.to_le_bytes());
-            hdr.extend_from_slice(&seq.to_le_bytes());
-            hdr.extend_from_slice(&[0, 0, 0, 0]);
-            hdr.push(laces.len() as u8);
-            hdr.extend_from_slice(laces);
-            let crc = crc32(&hdr, body);
-            hdr[22..26].copy_from_slice(&crc.to_le_bytes());
-            stream.extend_from_slice(&hdr);
-            stream.extend_from_slice(body);
-            seq += 1;
-        };
+        let mut page =
+            |stream: &mut Vec<u8>, flags: u8, granule: i64, laces: &[u8], body: &[u8]| {
+                let mut hdr = Vec::new();
+                hdr.extend_from_slice(b"OggS");
+                hdr.push(0);
+                hdr.push(flags);
+                hdr.extend_from_slice(&granule.to_le_bytes());
+                hdr.extend_from_slice(&1u32.to_le_bytes());
+                hdr.extend_from_slice(&seq.to_le_bytes());
+                hdr.extend_from_slice(&[0, 0, 0, 0]);
+                hdr.push(laces.len() as u8);
+                hdr.extend_from_slice(laces);
+                let crc = crc32(&hdr, body);
+                hdr[22..26].copy_from_slice(&crc.to_le_bytes());
+                stream.extend_from_slice(&hdr);
+                stream.extend_from_slice(body);
+                seq += 1;
+            };
         // Page 1: OpusHead (BOS), page 2: OpusTags — the conventional
         // encoder layout (each header on its own page). The 306-byte audio
         // packet is split 255 + 51 across pages 3 and 4: page 3's last lace
@@ -693,23 +712,24 @@ mod tests {
         // silently dropped the rest — an 8 s ffmpeg file decoded to ~0.17 s.
         let mut stream = Vec::new();
         let mut seq = 0u32;
-        let mut page = |stream: &mut Vec<u8>, flags: u8, granule: i64, laces: &[u8], body: &[u8]| {
-            let mut hdr = Vec::new();
-            hdr.extend_from_slice(b"OggS");
-            hdr.push(0);
-            hdr.push(flags);
-            hdr.extend_from_slice(&granule.to_le_bytes());
-            hdr.extend_from_slice(&1u32.to_le_bytes());
-            hdr.extend_from_slice(&seq.to_le_bytes());
-            hdr.extend_from_slice(&[0, 0, 0, 0]);
-            hdr.push(laces.len() as u8);
-            hdr.extend_from_slice(laces);
-            let crc = crc32(&hdr, body);
-            hdr[22..26].copy_from_slice(&crc.to_le_bytes());
-            stream.extend_from_slice(&hdr);
-            stream.extend_from_slice(body);
-            seq += 1;
-        };
+        let mut page =
+            |stream: &mut Vec<u8>, flags: u8, granule: i64, laces: &[u8], body: &[u8]| {
+                let mut hdr = Vec::new();
+                hdr.extend_from_slice(b"OggS");
+                hdr.push(0);
+                hdr.push(flags);
+                hdr.extend_from_slice(&granule.to_le_bytes());
+                hdr.extend_from_slice(&1u32.to_le_bytes());
+                hdr.extend_from_slice(&seq.to_le_bytes());
+                hdr.extend_from_slice(&[0, 0, 0, 0]);
+                hdr.push(laces.len() as u8);
+                hdr.extend_from_slice(laces);
+                let crc = crc32(&hdr, body);
+                hdr[22..26].copy_from_slice(&crc.to_le_bytes());
+                stream.extend_from_slice(&hdr);
+                stream.extend_from_slice(body);
+                seq += 1;
+            };
         page(&mut stream, 0x02, 0, &[19], &opus_head_packet(2));
         let tags = opus_tags_packet("multi");
         page(&mut stream, 0, 0, &[tags.len() as u8], &tags);

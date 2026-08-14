@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 
@@ -156,8 +157,7 @@ impl CrossfadeMixer {
         self.tail_chunks.push_back((sum_sq, count));
         self.tail_sum_sq += sum_sq;
         self.tail_samples += count;
-        let window =
-            (smart.fade_out * self.sample_rate as f64 * self.channels as f64).max(1.0);
+        let window = (smart.fade_out * self.sample_rate as f64 * self.channels as f64).max(1.0);
         while self.tail_samples > window {
             let (sq, n) = self.tail_chunks.pop_front().expect("chunks non-empty");
             self.tail_sum_sq -= sq;
@@ -306,8 +306,7 @@ impl AudioSource for CrossfadeMixer {
                 let chans = self.channels;
                 let frames = n_a / chans;
                 for f in 0..frames {
-                    let progress =
-                        1.0 - tail.remaining as f64 / tail.total.max(1) as f64;
+                    let progress = 1.0 - tail.remaining as f64 / tail.total.max(1) as f64;
                     let ramp = tail.start_gain + (1.0 - tail.start_gain) * progress;
                     for ch in 0..chans {
                         buffer[f * chans + ch] =
@@ -334,7 +333,8 @@ impl AudioSource for CrossfadeMixer {
                     let gain_b = self.curve_gain(t);
                     let gain_a = self.curve_gain(1.0 - t);
                     *out = (self.scratch_a[i] as f64 * gain_a as f64
-                        + self.scratch_b[i] as f64 * gain_b as f64) as f32;
+                        + self.scratch_b[i] as f64 * gain_b as f64)
+                        as f32;
                 }
                 self.fade_pos += frames_out;
 
@@ -425,6 +425,9 @@ pub enum MixCommand {
 pub struct StatusHandle {
     started: std::time::Instant,
     current: Arc<std::sync::Mutex<String>>,
+    /// True while a live DJ holds the harbor (the playlist is ducked).
+    /// Shared with the harbor, which toggles it on connect/disconnect.
+    harbor_connected: Arc<AtomicBool>,
 }
 
 impl StatusHandle {
@@ -432,7 +435,17 @@ impl StatusHandle {
         Self {
             started: std::time::Instant::now(),
             current: Arc::new(Mutex::new(String::new())),
+            harbor_connected: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// The flag the harbor writes to; hand a clone to the harbor.
+    pub fn harbor_flag(&self) -> Arc<AtomicBool> {
+        self.harbor_connected.clone()
+    }
+
+    pub fn harbor_connected(&self) -> bool {
+        self.harbor_connected.load(Ordering::SeqCst)
     }
 
     pub fn set_current(&self, title: &str) {
@@ -611,7 +624,11 @@ impl AudioSource for PriorityMixer {
         // drained at that point).
         let override_ended = match self.live.as_ref() {
             Some(l) => l.is_exhausted(),
-            None => self.jingle.as_ref().map(|j| j.is_exhausted()).unwrap_or(false),
+            None => self
+                .jingle
+                .as_ref()
+                .map(|j| j.is_exhausted())
+                .unwrap_or(false),
         };
         if override_ended && self.gain > 0.0 && !self.falling {
             self.rising = false;
@@ -834,7 +851,11 @@ mod tests {
             duck_seconds: 0.1,
             ..cfg
         };
-        let spec = symphonia::core::audio::SignalSpec::new(RATE as u32, symphonia::core::audio::Channels::FRONT_LEFT | symphonia::core::audio::Channels::FRONT_RIGHT);
+        let spec = symphonia::core::audio::SignalSpec::new(
+            RATE as u32,
+            symphonia::core::audio::Channels::FRONT_LEFT
+                | symphonia::core::audio::Channels::FRONT_RIGHT,
+        );
         let mut pm = PriorityMixer::new(main, rx, &cfg, spec, 10);
 
         // Main only.
@@ -1083,7 +1104,6 @@ mod tests {
 
     #[test]
     fn plays_a_real_jingle_file() {
-
         use std::path::PathBuf;
         let jingle = PathBuf::from("jingles/mrwashingt0n-radio-for-all-trance-505921.mp3");
         if !jingle.exists() {
@@ -1093,7 +1113,11 @@ mod tests {
         let cfg = mixer_config(0.2);
         let cross = CrossfadeMixer::new(provider, &cfg, RATE as u32, CHANS);
         let (tx, rx) = mpsc::channel();
-        let spec = symphonia::core::audio::SignalSpec::new(RATE as u32, symphonia::core::audio::Channels::FRONT_LEFT | symphonia::core::audio::Channels::FRONT_RIGHT);
+        let spec = symphonia::core::audio::SignalSpec::new(
+            RATE as u32,
+            symphonia::core::audio::Channels::FRONT_LEFT
+                | symphonia::core::audio::Channels::FRONT_RIGHT,
+        );
         let mut pm = PriorityMixer::new(Box::new(cross), rx, &cfg, spec, 100);
         tx.send(MixCommand::PlayJingle(jingle)).unwrap();
         // Duck ramp is 1.0s (10 buffers), jingle is ~12s (124 buffers):
@@ -1157,9 +1181,14 @@ mod tests {
         let mut pm = PriorityMixer::new(Box::new(cross), rx, &cfg, spec, 4096);
         tx.send(MixCommand::PlayJingle(jingle)).unwrap();
 
-        let mut enc =
-            crate::output::encoder::create_encoder(crate::config::OutputFormat::Opus, 44100, 2, 128_000, "e2e")
-                .unwrap();
+        let mut enc = crate::output::encoder::create_encoder(
+            crate::config::OutputFormat::Opus,
+            44100,
+            2,
+            128_000,
+            "e2e",
+        )
+        .unwrap();
         let mut buf = vec![0f32; 4096 * 2];
         let mut all = Vec::new();
         let mut jingle_audio = false;

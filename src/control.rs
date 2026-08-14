@@ -107,7 +107,10 @@ impl ControlServer {
             let custom = self.custom_commands.clone();
             let event_tx = self.event_tx.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(socket, banner, &jingles, queue, tx, &status, &custom, &event_tx).await
+                if let Err(e) = handle_connection(
+                    socket, banner, &jingles, queue, tx, &status, &custom, &event_tx,
+                )
+                .await
                 {
                     log::warn!("control port ({peer}): {e}");
                 }
@@ -189,7 +192,9 @@ impl ControlHttpServer {
             let custom = self.custom_commands.clone();
             let event_tx = self.event_tx.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_http(socket, &jingles, queue, tx, &status, &custom, &event_tx).await {
+                if let Err(e) =
+                    handle_http(socket, &jingles, queue, tx, &status, &custom, &event_tx).await
+                {
                     log::warn!("control http ({peer}): {e}");
                 }
             });
@@ -326,7 +331,11 @@ fn http_route(
     };
     match dispatch(&command, ctx, rng) {
         CommandResult::Reply(r) => {
-            let code = if matches!(&r, CommandReply::Err(_)) { 400 } else { 200 };
+            let code = if matches!(&r, CommandReply::Err(_)) {
+                400
+            } else {
+                200
+            };
             (code, r.json())
         }
         // `exit`/`quit` close the telnet connection; over HTTP just ack.
@@ -379,7 +388,11 @@ async fn handle_connection(
     let mut rng = SmallRng::from_entropy();
 
     if banner {
-        reply(&mut writer, "welcome to the crabsoup control port (help for commands)").await?;
+        reply(
+            &mut writer,
+            "welcome to the crabsoup control port (help for commands)",
+        )
+        .await?;
     }
 
     loop {
@@ -426,7 +439,9 @@ async fn handle_connection(
 /// name `json` is reserved (cannot be a `server.register` command).
 fn split_json_prefix(cmd: &str) -> (bool, &str) {
     match cmd.strip_prefix("json") {
-        Some(rest) if rest.is_empty() || rest.starts_with(char::is_whitespace) => (true, rest.trim()),
+        Some(rest) if rest.is_empty() || rest.starts_with(char::is_whitespace) => {
+            (true, rest.trim())
+        }
         _ => (false, cmd),
     }
 }
@@ -449,18 +464,16 @@ enum CommandReply {
     Err(String),
     /// Opaque reply from a `server.register` Lua handler.
     Custom(String),
-    /// `status`: current track + uptime.
+    /// `status`: current track + uptime + live-DJ (harbor) state.
     Status {
         playing: String,
         uptime_seconds: u64,
+        harbor_connected: bool,
     },
     /// `uptime`.
     Uptime(u64),
     /// `queue.push <path>`: the queued path and the new queue length.
-    Queued {
-        path: String,
-        length: usize,
-    },
+    Queued { path: String, length: usize },
     /// `queue.list` / `jingles.list`: items under `key`; `empty` is the
     /// text-mode reply when there are none.
     List {
@@ -475,11 +488,14 @@ enum CommandReply {
 impl CommandReply {
     fn text(&self) -> String {
         match self {
-            CommandReply::Ok(msg) | CommandReply::Err(msg) | CommandReply::Custom(msg) => msg.clone(),
+            CommandReply::Ok(msg) | CommandReply::Err(msg) | CommandReply::Custom(msg) => {
+                msg.clone()
+            }
             CommandReply::Status {
                 playing,
                 uptime_seconds,
-            } => format!("playing: {playing}\nuptime: {uptime_seconds}s"),
+                harbor_connected,
+            } => format!("playing: {playing}\nuptime: {uptime_seconds}s\nlive: {harbor_connected}"),
             CommandReply::Uptime(secs) => format!("uptime: {secs}s"),
             CommandReply::Queued { path, length } => format!("queued {path} ({length})"),
             CommandReply::List { items, empty, .. } => {
@@ -502,13 +518,23 @@ impl CommandReply {
         match self {
             CommandReply::Ok(msg) => serde_json::json!({ "ok": true, "message": msg }).to_string(),
             CommandReply::Err(msg) => serde_json::json!({ "ok": false, "error": msg }).to_string(),
-            CommandReply::Custom(msg) => serde_json::json!({ "ok": true, "reply": msg }).to_string(),
+            CommandReply::Custom(msg) => {
+                serde_json::json!({ "ok": true, "reply": msg }).to_string()
+            }
             CommandReply::Status {
                 playing,
                 uptime_seconds,
-            } => serde_json::json!({ "ok": true, "playing": playing, "uptime_seconds": uptime_seconds })
-                .to_string(),
-            CommandReply::Uptime(secs) => serde_json::json!({ "ok": true, "uptime_seconds": secs }).to_string(),
+                harbor_connected,
+            } => serde_json::json!({
+                "ok": true,
+                "playing": playing,
+                "uptime_seconds": uptime_seconds,
+                "harbor_connected": harbor_connected
+            })
+            .to_string(),
+            CommandReply::Uptime(secs) => {
+                serde_json::json!({ "ok": true, "uptime_seconds": secs }).to_string()
+            }
             CommandReply::Queued { path, length } => {
                 serde_json::json!({ "ok": true, "queued": path, "length": length }).to_string()
             }
@@ -517,11 +543,19 @@ impl CommandReply {
                 obj.insert("ok".into(), serde_json::Value::Bool(true));
                 obj.insert(
                     (*key).into(),
-                    serde_json::Value::Array(items.iter().cloned().map(serde_json::Value::String).collect()),
+                    serde_json::Value::Array(
+                        items
+                            .iter()
+                            .cloned()
+                            .map(serde_json::Value::String)
+                            .collect(),
+                    ),
                 );
                 serde_json::Value::Object(obj).to_string()
             }
-            CommandReply::Playing(path) => serde_json::json!({ "ok": true, "playing": path }).to_string(),
+            CommandReply::Playing(path) => {
+                serde_json::json!({ "ok": true, "playing": path }).to_string()
+            }
         }
     }
 }
@@ -557,9 +591,9 @@ fn dispatch(cmd: &str, ctx: &DispatchCtx, rng: &mut SmallRng) -> CommandResult {
                         length: q.len(),
                     })
                 }
-                None => {
-                    CommandResult::Reply(CommandReply::Err("ERROR: no request.queue source in script".into()))
-                }
+                None => CommandResult::Reply(CommandReply::Err(
+                    "ERROR: no request.queue source in script".into(),
+                )),
             },
             None => CommandResult::Reply(CommandReply::Err("usage: queue.push <path>".into())),
         },
@@ -569,25 +603,32 @@ fn dispatch(cmd: &str, ctx: &DispatchCtx, rng: &mut SmallRng) -> CommandResult {
                 empty: "queue empty",
                 items: q.list().iter().map(|uri| uri.raw().to_string()).collect(),
             }),
-            None => CommandResult::Reply(CommandReply::Err("ERROR: no request.queue source in script".into())),
+            None => CommandResult::Reply(CommandReply::Err(
+                "ERROR: no request.queue source in script".into(),
+            )),
         },
         "queue.clear" => match ctx.queue {
             Some(q) => {
                 q.clear();
                 CommandResult::Reply(CommandReply::Ok("queue cleared".into()))
             }
-            None => CommandResult::Reply(CommandReply::Err("ERROR: no request.queue source in script".into())),
+            None => CommandResult::Reply(CommandReply::Err(
+                "ERROR: no request.queue source in script".into(),
+            )),
         },
         "queue.skip" => match ctx.queue {
             Some(q) => {
                 q.request_skip();
                 CommandResult::Reply(CommandReply::Ok("skipping queued track".into()))
             }
-            None => CommandResult::Reply(CommandReply::Err("ERROR: no request.queue source in script".into())),
+            None => CommandResult::Reply(CommandReply::Err(
+                "ERROR: no request.queue source in script".into(),
+            )),
         },
         "status" => CommandResult::Reply(CommandReply::Status {
             playing: ctx.status.current(),
             uptime_seconds: ctx.status.uptime_seconds(),
+            harbor_connected: ctx.status.harbor_connected(),
         }),
         "uptime" => CommandResult::Reply(CommandReply::Uptime(ctx.status.uptime_seconds())),
         "shutdown" => {
@@ -598,17 +639,25 @@ fn dispatch(cmd: &str, ctx: &DispatchCtx, rng: &mut SmallRng) -> CommandResult {
         "jingles.list" => CommandResult::Reply(CommandReply::List {
             key: "jingles",
             empty: "no jingles configured",
-            items: ctx.jingles.iter().map(|p| p.display().to_string()).collect(),
+            items: ctx
+                .jingles
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
         }),
         "jingles.play" => {
             let path = match parts.next() {
                 Some(arg) => match pick_jingle(ctx.jingles, arg) {
                     Ok(i) => ctx.jingles[i].clone(),
-                    Err(e) => return CommandResult::Reply(CommandReply::Err(format!("ERROR: {e}"))),
+                    Err(e) => {
+                        return CommandResult::Reply(CommandReply::Err(format!("ERROR: {e}")));
+                    }
                 },
                 None => {
                     if ctx.jingles.is_empty() {
-                        return CommandResult::Reply(CommandReply::Err("ERROR: no jingles configured".into()));
+                        return CommandResult::Reply(CommandReply::Err(
+                            "ERROR: no jingles configured".into(),
+                        ));
                     }
                     let idx = rng.gen_range(0..ctx.jingles.len());
                     ctx.jingles[idx].clone()
@@ -633,7 +682,9 @@ fn dispatch(cmd: &str, ctx: &DispatchCtx, rng: &mut SmallRng) -> CommandResult {
                 match reply_rx.recv_timeout(Duration::from_secs(5)) {
                     Ok(Ok(text)) => CommandResult::Reply(CommandReply::Custom(text)),
                     Ok(Err(e)) => CommandResult::Reply(CommandReply::Err(format!("ERROR: {e}"))),
-                    Err(_) => CommandResult::Reply(CommandReply::Err("ERROR: custom command timed out".into())),
+                    Err(_) => CommandResult::Reply(CommandReply::Err(
+                        "ERROR: custom command timed out".into(),
+                    )),
                 }
             }
             None => CommandResult::Reply(CommandReply::Err(format!(
@@ -668,7 +719,10 @@ fn pick_jingle(jingles: &[PathBuf], arg: &str) -> Result<usize, String> {
 
 fn play_jingle(path: &Path, tx: &mpsc::Sender<MixCommand>) -> CommandResult {
     if !path.exists() {
-        return CommandResult::Reply(CommandReply::Err(format!("ERROR: jingle missing: {}", path.display())));
+        return CommandResult::Reply(CommandReply::Err(format!(
+            "ERROR: jingle missing: {}",
+            path.display()
+        )));
     }
     let _ = tx.send(MixCommand::PlayJingle(path.to_path_buf()));
     log::info!("control port: playing jingle {}", path.display());
@@ -689,6 +743,7 @@ async fn reply(writer: &mut tokio::net::tcp::OwnedWriteHalf, text: &str) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     fn jingles() -> Vec<PathBuf> {
         vec![
@@ -753,6 +808,19 @@ mod tests {
             CommandResult::Reply(r) => {
                 assert!(r.text().contains("playing: some track"));
                 assert!(r.text().contains("uptime: "));
+                assert!(r.text().contains("live: false"));
+                let v: serde_json::Value = serde_json::from_str(&r.json()).unwrap();
+                assert_eq!(v["harbor_connected"], serde_json::Value::Bool(false));
+            }
+            CommandResult::Exit => panic!("status must reply"),
+        }
+        // Toggling the shared harbor flag is visible in the reply.
+        status.harbor_flag().store(true, Ordering::SeqCst);
+        match dispatch("status", &ctx, &mut SmallRng::from_entropy()) {
+            CommandResult::Reply(r) => {
+                assert!(r.text().contains("live: true"));
+                let v: serde_json::Value = serde_json::from_str(&r.json()).unwrap();
+                assert_eq!(v["harbor_connected"], serde_json::Value::Bool(true));
             }
             CommandResult::Exit => panic!("status must reply"),
         }
@@ -779,7 +847,9 @@ mod tests {
         };
 
         match dispatch("queue.push /tmp/a.mp3", &ctx, &mut rng) {
-            CommandResult::Reply(r) => assert!(r.text().contains("queued /tmp/a.mp3 (1)"), "{}", r.text()),
+            CommandResult::Reply(r) => {
+                assert!(r.text().contains("queued /tmp/a.mp3 (1)"), "{}", r.text())
+            }
             CommandResult::Exit => panic!("queue.push must reply"),
         }
         match dispatch("queue.push /tmp/b.mp3", &ctx, &mut rng) {
@@ -794,7 +864,9 @@ mod tests {
             CommandResult::Exit => panic!("queue.list must reply"),
         }
         match dispatch("queue.skip", &ctx, &mut rng) {
-            CommandResult::Reply(r) => assert!(r.text().contains("skipping queued track"), "{}", r.text()),
+            CommandResult::Reply(r) => {
+                assert!(r.text().contains("skipping queued track"), "{}", r.text())
+            }
             CommandResult::Exit => panic!("queue.skip must reply"),
         }
         match dispatch("queue.clear", &ctx, &mut rng) {
@@ -818,10 +890,19 @@ mod tests {
             custom: &[],
             event_tx: &event_tx,
         };
-        for cmd in ["queue.push /tmp/a.mp3", "queue.list", "queue.skip", "queue.clear"] {
+        for cmd in [
+            "queue.push /tmp/a.mp3",
+            "queue.list",
+            "queue.skip",
+            "queue.clear",
+        ] {
             match dispatch(cmd, &ctx, &mut rng) {
                 CommandResult::Reply(r) => {
-                    assert!(r.text().contains("no request.queue source"), "{cmd}: {}", r.text())
+                    assert!(
+                        r.text().contains("no request.queue source"),
+                        "{cmd}: {}",
+                        r.text()
+                    )
                 }
                 CommandResult::Exit => panic!("{cmd} must reply"),
             }
@@ -885,7 +966,9 @@ mod tests {
             event_tx: &event_tx,
         };
         match dispatch("ping", &ctx, &mut SmallRng::from_entropy()) {
-            CommandResult::Reply(r) => assert!(r.text().contains("unknown command"), "{}", r.text()),
+            CommandResult::Reply(r) => {
+                assert!(r.text().contains("unknown command"), "{}", r.text())
+            }
             CommandResult::Exit => panic!("must reply"),
         }
     }
@@ -897,7 +980,10 @@ mod tests {
         assert_eq!(split_json_prefix("json   queue.list"), (true, "queue.list"));
         assert_eq!(split_json_prefix("status"), (false, "status"));
         assert_eq!(split_json_prefix("jsonify"), (false, "jsonify"));
-        assert_eq!(split_json_prefix("queue.push /tmp/a.mp3"), (false, "queue.push /tmp/a.mp3"));
+        assert_eq!(
+            split_json_prefix("queue.push /tmp/a.mp3"),
+            (false, "queue.push /tmp/a.mp3")
+        );
     }
 
     #[test]
@@ -954,7 +1040,10 @@ mod tests {
             match dispatch(rest, &ctx, &mut rng) {
                 CommandResult::Reply(r) => {
                     let text = r.json();
-                    assert!(!text.contains('\n'), "{cmd}: json must be single-line: {text}");
+                    assert!(
+                        !text.contains('\n'),
+                        "{cmd}: json must be single-line: {text}"
+                    );
                     let v: Value = serde_json::from_str(&text).expect("valid json");
                     let obj = v.as_object().expect("json object");
                     assert!(obj.contains_key("ok"), "{cmd}: missing ok: {text}");
@@ -1018,10 +1107,19 @@ mod tests {
 
     #[test]
     fn content_length_is_case_insensitive_and_optional() {
-        assert_eq!(content_length("GET / HTTP/1.1\r\nContent-Length: 12\r\n"), Some(12));
-        assert_eq!(content_length("GET / HTTP/1.1\r\ncontent-length: 4\r\n"), Some(4));
+        assert_eq!(
+            content_length("GET / HTTP/1.1\r\nContent-Length: 12\r\n"),
+            Some(12)
+        );
+        assert_eq!(
+            content_length("GET / HTTP/1.1\r\ncontent-length: 4\r\n"),
+            Some(4)
+        );
         assert_eq!(content_length("GET / HTTP/1.1\r\nHost: x\r\n"), None);
-        assert_eq!(content_length("GET / HTTP/1.1\r\nContent-Length: nope\r\n"), None);
+        assert_eq!(
+            content_length("GET / HTTP/1.1\r\nContent-Length: nope\r\n"),
+            None
+        );
     }
 
     #[test]
@@ -1059,7 +1157,10 @@ mod tests {
         let (code, body) = http_route("GET", "/jingles", "", &ctx, &mut rng);
         assert_eq!(code, 200);
         let v: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(v["jingles"], serde_json::json!(["jingles/a-intro.mp3", "jingles/b-sting.wav"]));
+        assert_eq!(
+            v["jingles"],
+            serde_json::json!(["jingles/a-intro.mp3", "jingles/b-sting.wav"])
+        );
 
         let (code, body) = http_route("POST", "/cmd", r#"{"command":"skip"}"#, &ctx, &mut rng);
         assert_eq!(code, 200);
@@ -1073,7 +1174,13 @@ mod tests {
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["ok"], false);
         assert!(v["error"].as_str().unwrap().contains("unknown command"));
-        let (code, body) = http_route("POST", "/cmd", r#"{"command":"jingles.play 0"}"#, &ctx, &mut rng);
+        let (code, body) = http_route(
+            "POST",
+            "/cmd",
+            r#"{"command":"jingles.play 0"}"#,
+            &ctx,
+            &mut rng,
+        );
         assert_eq!(code, 400);
         assert!(body.contains("jingle missing"));
 

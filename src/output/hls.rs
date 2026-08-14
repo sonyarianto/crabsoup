@@ -7,15 +7,15 @@
 //! writes it.
 
 use std::fs;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
-use std::sync::Arc;
 
+use crate::Result;
 use crate::config::HlsOutputConfig;
 use crate::engine::tap::AudioFrame;
 use crate::output::encoder::{AacEncoder, Encoder};
 use crate::output::mpegts::{MpegTsMuxer, split_adts};
-use crate::Result;
 
 /// One AAC frame is 1024 samples per channel on the 90 kHz HLS clock.
 const AAC_FRAME_SAMPLES: u64 = 1024;
@@ -139,12 +139,7 @@ impl HlsOutput {
 
     /// Route ADTS frames into segments, closing a segment once its window
     /// crosses `segment_seconds`.
-    fn feed(
-        &mut self,
-        adts: &[u8],
-        seg: &mut Segment,
-        frames_total: u64,
-    ) -> Result<u64> {
+    fn feed(&mut self, adts: &[u8], seg: &mut Segment, frames_total: u64) -> Result<u64> {
         if adts.is_empty() {
             return Ok(frames_total);
         }
@@ -328,7 +323,10 @@ mod tests {
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().ends_with(".ts"))
             .count();
-        assert!(segments <= 4, "retention=2 should cap window, got {segments}");
+        assert!(
+            segments <= 4,
+            "retention=2 should cap window, got {segments}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

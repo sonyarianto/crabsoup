@@ -36,19 +36,19 @@ use rand::{Rng, SeedableRng};
 use symphonia::core::audio::SignalSpec;
 
 use crate::config::{
-    collect_audio, ControlConfig, FileOutputConfig, HlsOutputConfig, LiveConfig, MixerConfig,
-    OutputConfig, OutputFormat, OutputProtocol, SoundcardOutputConfig, StreamConfig,
+    ControlConfig, FileOutputConfig, HlsOutputConfig, LiveConfig, MixerConfig, OutputConfig,
+    OutputFormat, OutputProtocol, SoundcardOutputConfig, StreamConfig, collect_audio,
 };
 use crate::engine::effects::{Agc, Amplify, Compressor, EffectSource};
 use crate::engine::mixer::{CrossfadeMixer, SmartFade};
-use crate::request::{resolve, RequestConfig, RequestUri, TrackCues};
+use crate::request::{RequestConfig, RequestUri, TrackCues, resolve};
 use crate::source::blank_detect::{BlankDetectConfig, BlankDetectSource};
 use crate::source::cue_cut::CueCutSource;
 use crate::source::pipe::{PcmFormat, PipeConfig, PipeSource};
-use crate::source::soundcard::{SoundcardInputConfig, SoundcardInputSource};
 use crate::source::playlist::Playlist;
 use crate::source::replaygain::ReplayGainSource;
 use crate::source::request::{RequestQueue, RequestQueueSource};
+use crate::source::soundcard::{SoundcardInputConfig, SoundcardInputSource};
 use crate::source::{AudioSource, BlankSource, SilenceSource, SineSource};
 
 /// Everything the engine needs after a `.lua` script finishes evaluating.
@@ -134,7 +134,10 @@ pub enum ScriptEvent {
     /// `request.dynamic`: ask the Lua callback for the next request URI
     /// (`Some(uri)`) or the end of the stream (`None`). The audio thread
     /// never blocks on the reply — it polls and returns silence meanwhile.
-    NextRequest { index: usize, reply: mpsc::Sender<Option<String>> },
+    NextRequest {
+        index: usize,
+        reply: mpsc::Sender<Option<String>>,
+    },
     /// A `blank.detect` source went blank (dead air detected).
     Blank { hook_id: usize },
     /// `map_metadata`: rewrite a track's title. The callback runs on the
@@ -469,7 +472,11 @@ struct MapMetadataSource {
 }
 
 impl MapMetadataSource {
-    fn new(child: Box<dyn AudioSource>, event_tx: mpsc::Sender<ScriptEvent>, hook_id: usize) -> Self {
+    fn new(
+        child: Box<dyn AudioSource>,
+        event_tx: mpsc::Sender<ScriptEvent>,
+        hook_id: usize,
+    ) -> Self {
         Self {
             child,
             event_tx,
@@ -701,7 +708,10 @@ impl AudioSource for DynamicRequestSource {
             if current.is_exhausted() {
                 log::info!(
                     "request.dynamic: finished {}",
-                    self.current_uri.as_ref().map(|u| u.display()).unwrap_or_default()
+                    self.current_uri
+                        .as_ref()
+                        .map(|u| u.display())
+                        .unwrap_or_default()
                 );
                 self.current = None;
                 self.current_uri = None;
@@ -763,9 +773,7 @@ impl ScriptState {
             "duck_seconds" => num!(self.mixer.duck_seconds, f64),
             "request_timeout" => num!(self.request.timeout_secs, u64),
             "request_retries" => num!(self.request.retries, u32),
-            other => {
-                return Err(mlua::Error::runtime(format!("unknown setting \"{other}\"")))
-            }
+            other => return Err(mlua::Error::runtime(format!("unknown setting \"{other}\""))),
         }
         Ok(())
     }
@@ -816,7 +824,10 @@ struct FallbackSource {
 
 impl FallbackSource {
     fn new(children: Vec<LuaSource>) -> Self {
-        Self { children, current: 0 }
+        Self {
+            children,
+            current: 0,
+        }
     }
 
     /// Index of the first child that can still produce audio.
@@ -855,8 +866,7 @@ impl AudioSource for FallbackSource {
 
     fn label(&self) -> Option<String> {
         if let Some(i) = self.active() {
-            return self
-                .children[i]
+            return self.children[i]
                 .0
                 .lock()
                 .unwrap()
@@ -1023,7 +1033,9 @@ impl AudioSource for AddSource {
     fn is_exhausted(&self) -> bool {
         // The sum ends when every child has ended; a looping bed keeps the
         // mix alive indefinitely.
-        self.children.iter().all(|c| c.0.lock().unwrap().is_exhausted())
+        self.children
+            .iter()
+            .all(|c| c.0.lock().unwrap().is_exhausted())
     }
 
     fn remaining_seconds(&self) -> Option<f64> {
@@ -1190,7 +1202,11 @@ impl ScheduleSource {
                 return None;
             }
             let child = self.children.get(slot.child)?.0.lock().unwrap();
-            if child.is_exhausted() { None } else { Some(slot.child) }
+            if child.is_exhausted() {
+                None
+            } else {
+                Some(slot.child)
+            }
         })
     }
 
@@ -1300,7 +1316,9 @@ impl AudioSource for ScheduleSource {
     }
 
     fn is_exhausted(&self) -> bool {
-        self.children.iter().all(|c| c.0.lock().unwrap().is_exhausted())
+        self.children
+            .iter()
+            .all(|c| c.0.lock().unwrap().is_exhausted())
     }
 
     fn remaining_seconds(&self) -> Option<f64> {
@@ -1364,10 +1382,18 @@ fn parse_hhmm(value: &str) -> mlua::Result<u32> {
     let mut parts = value.split(':');
     let (h, m) = match (parts.next(), parts.next(), parts.next()) {
         (Some(h), Some(m), None) => (h, m),
-        _ => return Err(mlua::Error::runtime(format!("switch: bad time {value:?}, use \"HH:MM\""))),
+        _ => {
+            return Err(mlua::Error::runtime(format!(
+                "switch: bad time {value:?}, use \"HH:MM\""
+            )));
+        }
     };
-    let h: u32 = h.parse().map_err(|_| mlua::Error::runtime(format!("switch: bad time {value:?}")))?;
-    let m: u32 = m.parse().map_err(|_| mlua::Error::runtime(format!("switch: bad time {value:?}")))?;
+    let h: u32 = h
+        .parse()
+        .map_err(|_| mlua::Error::runtime(format!("switch: bad time {value:?}")))?;
+    let m: u32 = m
+        .parse()
+        .map_err(|_| mlua::Error::runtime(format!("switch: bad time {value:?}")))?;
     if h > 23 || m > 59 {
         return Err(mlua::Error::runtime(format!("switch: bad time {value:?}")));
     }
@@ -1387,7 +1413,7 @@ fn weekday_number(name: &str) -> mlua::Result<u8> {
         other => {
             return Err(mlua::Error::runtime(format!(
                 "switch: unknown weekday {other:?} (use \"mon\"..\"sun\" or 0=Sunday..6=Saturday)"
-            )))
+            )));
         }
     };
     Ok(n)
@@ -1407,7 +1433,7 @@ fn parse_when(table: &Table) -> mlua::Result<TimePredicate> {
                     _ => {
                         return Err(mlua::Error::runtime(
                             "switch: `days` entries must be weekday names or 0-6",
-                        ))
+                        ));
                     }
                 }
             }
@@ -1441,7 +1467,11 @@ fn playlist_requests(opts: &Table) -> mlua::Result<Vec<RequestUri>> {
     if let Some(dir) = &directory {
         let mut paths = Vec::new();
         collect_audio(&PathBuf::from(dir), &mut paths);
-        requests.extend(paths.into_iter().map(|p| RequestUri::new(p.to_str().unwrap_or_default())));
+        requests.extend(
+            paths
+                .into_iter()
+                .map(|p| RequestUri::new(p.to_str().unwrap_or_default())),
+        );
     }
     // `files` entries may be paths or http:// URLs.
     requests.extend(files.iter().map(|f| RequestUri::new(f)));
@@ -1468,7 +1498,12 @@ fn crossfading_playlist(
     let mixer_cfg = state.borrow().mixer.clone();
     let request = state.borrow().request;
     let playlist = Playlist::new(requests, shuffle, loop_playlist, request, spec, fpb, None);
-    Box::new(CrossfadeMixer::new(Box::new(playlist), &mixer_cfg, spec.rate, chans))
+    Box::new(CrossfadeMixer::new(
+        Box::new(playlist),
+        &mixer_cfg,
+        spec.rate,
+        chans,
+    ))
 }
 
 /// Evaluate a `.lua` script and return the runtime plus the engine wiring.
@@ -1498,17 +1533,17 @@ fn table_to_json(t: &mlua::Table) -> Result<serde_json::Value, String> {
             }
             other => {
                 is_array = false;
-                obj.insert(
-                    other.to_string().map_err(|e| e.to_string())?,
-                    json,
-                );
+                obj.insert(other.to_string().map_err(|e| e.to_string())?, json);
             }
         }
     }
     if is_array && next_index > 1 {
         let mut items = Vec::with_capacity(next_index - 1);
         for i in 1..next_index {
-            items.push(obj.remove(&i.to_string()).unwrap_or(serde_json::Value::Null));
+            items.push(
+                obj.remove(&i.to_string())
+                    .unwrap_or(serde_json::Value::Null),
+            );
         }
         Ok(serde_json::Value::Array(items))
     } else {
@@ -1528,7 +1563,7 @@ fn value_to_json(v: &mlua::Value) -> Result<serde_json::Value, String> {
             return Err(format!(
                 "unsupported Lua value in http_post payload: {}",
                 other.type_name()
-            ))
+            ));
         }
     })
 }
@@ -1607,13 +1642,16 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
             let loop_playlist: bool = opts.get("loop").unwrap_or(true);
             let global = smart_state.borrow().mixer.crossfade_seconds;
             let fade_out: f64 = opts.get::<Option<f64>>("fade_out")?.unwrap_or(global);
-            let fade_mid: f64 = opts.get::<Option<f64>>("fade_mid")?.unwrap_or(fade_out / 2.0);
+            let fade_mid: f64 = opts
+                .get::<Option<f64>>("fade_mid")?
+                .unwrap_or(fade_out / 2.0);
             let threshold_db: f32 = opts.get("threshold").unwrap_or(-30.0);
             let (spec, fpb) = bus(&smart_state);
             let chans = spec.channels.count();
             let mixer_cfg = smart_state.borrow().mixer.clone();
             let request = smart_state.borrow().request;
-            let playlist = Playlist::new(requests, shuffle, loop_playlist, request, spec, fpb, None);
+            let playlist =
+                Playlist::new(requests, shuffle, loop_playlist, request, spec, fpb, None);
             let mixer = CrossfadeMixer::new(Box::new(playlist), &mixer_cfg, spec.rate, chans)
                 .with_smart_fade(SmartFade {
                     fade_out,
@@ -1696,7 +1734,9 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
             // for a plain `bool` target (nil is falsy), which would flip the
             // safe default.
             let exhaust_while_blank: bool = match &opts {
-                Some(t) => t.get::<Option<bool>>("exhaust_while_blank")?.unwrap_or(true),
+                Some(t) => t
+                    .get::<Option<bool>>("exhaust_while_blank")?
+                    .unwrap_or(true),
                 None => true,
             };
             let on_blank: Option<mlua::Function> = match &opts {
@@ -1783,8 +1823,7 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         lua.create_function(move |_, (mut source, gain): (LuaSource, f64)| {
             let (spec, _) = bus(&amp_state);
             let child = source.take();
-            let src =
-                EffectSource::new(child, Amplify::new(gain as f32), spec.channels.count());
+            let src = EffectSource::new(child, Amplify::new(gain as f32), spec.channels.count());
             Ok(LuaSource::new(Box::new(src)))
         })?,
     )?;
@@ -1849,11 +1888,7 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         let composed: Box<dyn AudioSource> = match kind.as_str() {
             "fallback" | "sequence" => Box::new(FallbackSource::new(sources)),
             "random" => Box::new(RandomSource::new(sources)),
-            other => {
-                return Err(mlua::Error::runtime(format!(
-                    "unknown composer {other}"
-                )))
-            }
+            other => return Err(mlua::Error::runtime(format!("unknown composer {other}"))),
         };
         Ok(LuaSource::new(composed))
     })?;
@@ -1945,7 +1980,7 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
                 other => {
                     return Err(mlua::Error::runtime(format!(
                         "pipe: unknown format {other:?} (use \"s16le\" or \"s24le\")"
-                    )))
+                    )));
                 }
             };
             let config = PipeConfig {
@@ -1975,51 +2010,51 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         "mksafe",
         lua.create_function(|_, source: LuaSource| {
             let silence = LuaSource::new(Box::new(BlankSource::new()));
-            Ok(LuaSource::new(Box::new(FallbackSource::new(vec![source, silence]))))
+            Ok(LuaSource::new(Box::new(FallbackSource::new(vec![
+                source, silence,
+            ]))))
         })?,
     )?;
 
     // ---- daypart scheduling (Liquidsoap `switch`, `rotate`) --------------
     globals.set(
         "switch",
-        lua.create_function(
-            |_lua, (slots, opts): (Table, Option<Table>)| {
-                let track_sensitive: bool = match &opts {
-                    Some(t) => t.get("track_sensitive").unwrap_or(true),
-                    None => true,
-                };
-                let len = slots.len()?;
-                if len == 0 {
-                    return Err(mlua::Error::runtime(
-                        "switch: expected a list of {when = ..., src = ...} slots",
-                    ));
-                }
-                let mut children = Vec::new();
-                let mut predicates = Vec::new();
-                for i in 1..=len {
-                    let slot: Table = slots.get(i)?;
-                    let src: LuaSource = slot.get("src")?;
-                    let child = children.len();
-                    children.push(src);
-                    let when = match slot.get::<Option<Table>>("when")? {
-                        Some(t) => parse_when(&t)?,
-                        None => TimePredicate::always(),
-                    };
-                    predicates.push(SwitchSlot { when, child });
-                }
-                if !predicates.iter().any(|s| s.when.is_always()) {
-                    return Err(mlua::Error::runtime(
-                        "switch: expected a default child (a slot without `when`)",
-                    ));
-                }
-                let composed: Box<dyn AudioSource> = Box::new(ScheduleSource::new(
-                    ScheduleKind::Switch(predicates),
-                    children,
-                    track_sensitive,
+        lua.create_function(|_lua, (slots, opts): (Table, Option<Table>)| {
+            let track_sensitive: bool = match &opts {
+                Some(t) => t.get("track_sensitive").unwrap_or(true),
+                None => true,
+            };
+            let len = slots.len()?;
+            if len == 0 {
+                return Err(mlua::Error::runtime(
+                    "switch: expected a list of {when = ..., src = ...} slots",
                 ));
-                Ok(LuaSource::new(composed))
-            },
-        )?,
+            }
+            let mut children = Vec::new();
+            let mut predicates = Vec::new();
+            for i in 1..=len {
+                let slot: Table = slots.get(i)?;
+                let src: LuaSource = slot.get("src")?;
+                let child = children.len();
+                children.push(src);
+                let when = match slot.get::<Option<Table>>("when")? {
+                    Some(t) => parse_when(&t)?,
+                    None => TimePredicate::always(),
+                };
+                predicates.push(SwitchSlot { when, child });
+            }
+            if !predicates.iter().any(|s| s.when.is_always()) {
+                return Err(mlua::Error::runtime(
+                    "switch: expected a default child (a slot without `when`)",
+                ));
+            }
+            let composed: Box<dyn AudioSource> = Box::new(ScheduleSource::new(
+                ScheduleKind::Switch(predicates),
+                children,
+                track_sensitive,
+            ));
+            Ok(LuaSource::new(composed))
+        })?,
     )?;
 
     globals.set(
@@ -2042,7 +2077,11 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
                 weights
             };
             let composed: Box<dyn AudioSource> = Box::new(ScheduleSource::new(
-                ScheduleKind::Rotate { weights, cursor: 0, spins: 0 },
+                ScheduleKind::Rotate {
+                    weights,
+                    cursor: 0,
+                    spins: 0,
+                },
                 sources,
                 true,
             ));
@@ -2073,7 +2112,10 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
             jingle_state.borrow_mut().jingles.extend(paths.clone());
             // ...and returned as a plain (non-looped) playlist source so it
             // composes like any other source (jingles stay local paths).
-            let requests = paths.into_iter().map(|p| RequestUri::Local(p, None)).collect();
+            let requests = paths
+                .into_iter()
+                .map(|p| RequestUri::Local(p, None))
+                .collect();
             let src = crossfading_playlist(requests, false, false, &jingle_state);
             Ok(LuaSource::new(src))
         })?,
@@ -2087,6 +2129,7 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
             port: opts.get("port").unwrap_or(8005),
             mount: opts.get("mount").unwrap_or_else(|_| "/live".into()),
             password: opts.get("password").unwrap_or_else(|_| "dj".into()),
+            extra_passwords: opts.get("extra_passwords").ok().unwrap_or_default(),
         };
         harbor_state.borrow_mut().harbor = Some(cfg);
         // The harbor drives the priority mixer via MixCommand; the value
@@ -2128,18 +2171,20 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         Ok(())
     })?;
     let reg_state = state.clone();
-    let register_fn = lua.create_function(
-        move |_, (name, callback): (String, mlua::Function)| {
+    let register_fn =
+        lua.create_function(move |_, (name, callback): (String, mlua::Function)| {
             let trimmed = name.trim();
             if trimmed.is_empty() || trimmed.split_whitespace().count() > 1 {
                 return Err(mlua::Error::runtime(
                     "server.register: name must be a single non-empty word",
                 ));
             }
-            reg_state.borrow_mut().custom_commands.push((trimmed.to_string(), callback));
+            reg_state
+                .borrow_mut()
+                .custom_commands
+                .push((trimmed.to_string(), callback));
             Ok(())
-        },
-    )?;
+        })?;
     let server = lua.create_table()?;
     server.set("telnet", telnet_fn)?;
     server.set("register", register_fn)?;
@@ -2288,26 +2333,30 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
     let meta_tx = event_tx.clone();
     globals.set(
         "on_metadata",
-        lua.create_function(move |_, (mut source, callback): (LuaSource, mlua::Function)| {
-            let hook_id = meta_state.borrow().metadata_hooks.len();
-            let child = source.take();
-            meta_state.borrow_mut().metadata_hooks.push(callback);
-            let wrapped = OnMetadataSource::new(child, meta_tx.clone(), hook_id);
-            Ok(LuaSource::new(Box::new(wrapped)))
-        })?,
+        lua.create_function(
+            move |_, (mut source, callback): (LuaSource, mlua::Function)| {
+                let hook_id = meta_state.borrow().metadata_hooks.len();
+                let child = source.take();
+                meta_state.borrow_mut().metadata_hooks.push(callback);
+                let wrapped = OnMetadataSource::new(child, meta_tx.clone(), hook_id);
+                Ok(LuaSource::new(Box::new(wrapped)))
+            },
+        )?,
     )?;
 
     let track_state = state.clone();
     let track_tx = event_tx.clone();
     globals.set(
         "on_track",
-        lua.create_function(move |_, (mut source, callback): (LuaSource, mlua::Function)| {
-            let hook_id = track_state.borrow().track_hooks.len();
-            let child = source.take();
-            track_state.borrow_mut().track_hooks.push(callback);
-            let wrapped = OnTrackSource::new(child, track_tx.clone(), hook_id);
-            Ok(LuaSource::new(Box::new(wrapped)))
-        })?,
+        lua.create_function(
+            move |_, (mut source, callback): (LuaSource, mlua::Function)| {
+                let hook_id = track_state.borrow().track_hooks.len();
+                let child = source.take();
+                track_state.borrow_mut().track_hooks.push(callback);
+                let wrapped = OnTrackSource::new(child, track_tx.clone(), hook_id);
+                Ok(LuaSource::new(Box::new(wrapped)))
+            },
+        )?,
     )?;
 
     // ---- metadata rewrite (Liquidsoap `map_metadata`) ---------------------
@@ -2318,19 +2367,19 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
     let map_tx = event_tx.clone();
     globals.set(
         "map_metadata",
-        lua.create_function(move |_, (mut source, callback): (LuaSource, mlua::Function)| {
-            let hook_id = map_state.borrow().map_metadata_hooks.len();
-            let child = source.take();
-            map_state.borrow_mut().map_metadata_hooks.push(callback);
-            let wrapped = MapMetadataSource::new(child, map_tx.clone(), hook_id);
-            Ok(LuaSource::new(Box::new(wrapped)))
-        })?,
+        lua.create_function(
+            move |_, (mut source, callback): (LuaSource, mlua::Function)| {
+                let hook_id = map_state.borrow().map_metadata_hooks.len();
+                let child = source.take();
+                map_state.borrow_mut().map_metadata_hooks.push(callback);
+                let wrapped = MapMetadataSource::new(child, map_tx.clone(), hook_id);
+                Ok(LuaSource::new(Box::new(wrapped)))
+            },
+        )?,
     )?;
 
     // ---- evaluate ---------------------------------------------------------
-    lua.load(src)
-        .set_name("crabsoup.lua")
-        .exec()?;
+    lua.load(src).set_name("crabsoup.lua").exec()?;
 
     let mut s = state.borrow_mut();
     let result = ScriptResult {
@@ -2373,15 +2422,13 @@ mod tests {
 
     #[test]
     fn script_sets_settings_via_lua() {
-        let (_rt, res) = run(
-            r#"
+        let (_rt, res) = run(r#"
             set("sample_rate", 48000)
             set("channels", 1)
             set("crossfade_seconds", 4.5)
             input.harbor({port = 8006})
             output.preview(input.harbor({port = 8007}))
-            "#,
-        )
+            "#)
         .expect("script runs");
         assert_eq!(res.stream.sample_rate, 48000);
         assert_eq!(res.stream.channels, 1);
@@ -2408,12 +2455,10 @@ mod tests {
 
     #[test]
     fn server_register_runs_the_lua_handler_and_replies() {
-        let (rt, res) = run(
-            r#"
+        let (rt, res) = run(r#"
             server.register("ping", function(args) return "pong [" .. args .. "]" end)
             output.preview(sine({freq = 440, duration = 1}))
-            "#,
-        )
+            "#)
         .expect("script runs");
         assert_eq!(res.custom_commands, vec!["ping"]);
         let (reply_tx, reply_rx) = mpsc::channel();
@@ -2430,12 +2475,10 @@ mod tests {
 
     #[test]
     fn server_register_reports_callback_errors() {
-        let (rt, _res) = run(
-            r#"
+        let (rt, _res) = run(r#"
             server.register("boom", function() error("kaput") end)
             output.preview(sine({freq = 440, duration = 1}))
-            "#,
-        )
+            "#)
         .expect("script runs");
         let (reply_tx, reply_rx) = mpsc::channel();
         rt.event_tx()
@@ -2468,13 +2511,11 @@ mod tests {
 
     #[test]
     fn compose_sources_without_files() {
-        let (_rt, res) = run(
-            r#"
+        let (_rt, res) = run(r#"
             live = input.harbor({})
             backup = input.harbor({})
             output.preview(fallback({live, backup}))
-            "#,
-        )
+            "#)
         .expect("script runs");
         assert!(res.preview.is_some());
     }
@@ -2483,11 +2524,9 @@ mod tests {
     fn output_soundcard_registers_without_opening_a_device() {
         // Unlike `input.soundcard`, the device is opened only at connect()
         // time in main, so registration is deterministic anywhere.
-        let (_rt, res) = run(
-            r#"
+        let (_rt, res) = run(r#"
             output.soundcard({}, sine({freq = 440, duration = 1}))
-            "#,
-        )
+            "#)
         .expect("script runs");
         assert_eq!(res.soundcard_outputs.len(), 1);
         assert!(res.root.is_some(), "output.soundcard claims the root");
@@ -2516,11 +2555,9 @@ mod tests {
 
     #[test]
     fn sine_with_duration_drives_exactly_one_second_of_frames() {
-        let (_rt, res) = run(
-            r#"
+        let (_rt, res) = run(r#"
             output.preview(amplify(sine({freq = 220, duration = 1}), 0.5))
-            "#,
-        )
+            "#)
         .expect("script runs");
         let mut root = res.preview.expect("preview source");
         let mut buf = vec![0f32; 4096 * 2];
@@ -2538,11 +2575,9 @@ mod tests {
 
     #[test]
     fn blank_falls_through_to_the_next_child() {
-        let (_rt, res) = run(
-            r#"
+        let (_rt, res) = run(r#"
             output.preview(fallback({blank({duration = 0.1}), sine({duration = 1, freq = 100})}))
-            "#,
-        )
+            "#)
         .expect("script runs");
         let mut root = res.preview.expect("preview source");
         let mut buf = vec![0f32; 4096 * 2];
@@ -2559,11 +2594,9 @@ mod tests {
 
     #[test]
     fn mksafe_never_exhausts_and_plays_silence_after_the_child_ends() {
-        let (_rt, res) = run(
-            r#"
+        let (_rt, res) = run(r#"
             output.preview(mksafe(sine({freq = 440, duration = 0.05})))
-            "#,
-        )
+            "#)
         .expect("script runs");
         let mut root = res.preview.expect("preview source");
         let mut buf = vec![0f32; 4096 * 2];
@@ -2585,12 +2618,10 @@ mod tests {
 
     #[test]
     fn pipe_passthrough_plays_and_composes_with_mksafe() {
-        let (_rt, res) = run(
-            r#"
+        let (_rt, res) = run(r#"
             output.preview(mksafe(pipe({process = "cat", format = "s16le"},
                                        sine({freq = 440, duration = 0.2}))))
-            "#,
-        )
+            "#)
         .expect("script runs");
         let mut root = res.preview.expect("preview source");
         let mut buf = vec![0f32; 4096 * 2];
@@ -2604,15 +2635,19 @@ mod tests {
         }
         // 0.2 s at 44100 Hz through the pipe (a couple of 4096-frame chunks),
         // then the mksafe blank covers the exhausted pipe with silence.
-        assert!(non_silent >= 8000, "pipe produced only {non_silent} samples");
-        assert!(!root.is_exhausted(), "mksafe must keep the pipe source alive");
+        assert!(
+            non_silent >= 8000,
+            "pipe produced only {non_silent} samples"
+        );
+        assert!(
+            !root.is_exhausted(),
+            "mksafe must keep the pipe source alive"
+        );
     }
 
     #[test]
     fn pipe_requires_process_and_valid_format() {
-        let err = match run(
-            "output.preview(pipe({format = \"s16le\"}, sine({freq = 440})))",
-        ) {
+        let err = match run("output.preview(pipe({format = \"s16le\"}, sine({freq = 440})))") {
             Ok(_) => panic!("pipe without `process` must fail"),
             Err(e) => e,
         };
@@ -2629,12 +2664,10 @@ mod tests {
 
     #[test]
     fn mksafe_covers_a_failed_request_resolution_with_silence() {
-        let (_rt, res) = run(
-            r#"
+        let (_rt, res) = run(r#"
             q = request.queue()
             output.preview(mksafe(q))
-            "#,
-        )
+            "#)
         .expect("script runs");
         let queue = res.request_queue.as_ref().expect("queue registered");
         queue.push(RequestUri::new("/definitely/not/here.mp3"));
@@ -2642,7 +2675,8 @@ mod tests {
         let mut buf = vec![0f32; 4096 * 2];
         let n = root.next_buffer(&mut buf);
         assert_eq!(
-            n, buf.len(),
+            n,
+            buf.len(),
             "a failed resolve must yield silence, not an engine error"
         );
         assert!(buf[..n].iter().all(|&s| s == 0.0));
@@ -2651,12 +2685,10 @@ mod tests {
 
     #[test]
     fn add_sums_sources_sample_wise() {
-        let (_rt, res) = run(
-            r#"
+        let (_rt, res) = run(r#"
             output.preview(add({sine({freq = 440, amplitude = 0.5}),
                                  sine({freq = 440, amplitude = 0.5})}))
-            "#,
-        )
+            "#)
         .expect("script runs");
         let mut root = res.preview.expect("preview source");
         let mut buf = vec![0f32; 4096 * 2];
@@ -2664,18 +2696,19 @@ mod tests {
         // Two in-phase 0.5-amplitude sines sum to a ~1.0 peak (a doubling or
         // quadrupling bug would move it to 2.0/4.0 and must fail here).
         let peak = buf.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
-        assert!((peak - 1.0).abs() < 0.01, "add did not sum the sines (peak {peak})");
+        assert!(
+            (peak - 1.0).abs() < 0.01,
+            "add did not sum the sines (peak {peak})"
+        );
     }
 
     #[test]
     fn add_applies_per_source_weights() {
-        let (_rt, res) = run(
-            r#"
+        let (_rt, res) = run(r#"
             output.preview(add({sine({freq = 440, amplitude = 0.5}),
                                  sine({freq = 440, amplitude = 0.5})},
                                 {weights = {0.5, 1.0}}))
-            "#,
-        )
+            "#)
         .expect("script runs");
         let mut root = res.preview.expect("preview source");
         let mut buf = vec![0f32; 4096 * 2];
@@ -2689,12 +2722,10 @@ mod tests {
     fn add_keeps_playing_after_a_short_child_ends() {
         // A short child over an infinite one: when the short child exhausts,
         // the sum continues with the remaining child and never exhausts.
-        let (_rt, res) = run(
-            r#"
+        let (_rt, res) = run(r#"
             output.preview(add({sine({freq = 440, duration = 0.05, amplitude = 0.5}),
                                  sine({freq = 220, amplitude = 0.5})}))
-            "#,
-        )
+            "#)
         .expect("script runs");
         let mut root = res.preview.expect("preview source");
         let mut buf = vec![0f32; 4096 * 2];
@@ -2712,17 +2743,18 @@ mod tests {
             buf[..n].iter().any(|&s| s.abs() > 0.01),
             "bed must be audible after the short child ends"
         );
-        assert!(!root.is_exhausted(), "add must not exhaust while one child lives");
+        assert!(
+            !root.is_exhausted(),
+            "add must not exhaust while one child lives"
+        );
     }
 
     #[test]
     fn add_exhausts_when_every_child_ends() {
-        let (_rt, res) = run(
-            r#"
+        let (_rt, res) = run(r#"
             output.preview(add({sine({freq = 440, duration = 0.05, amplitude = 0.5}),
                                  sine({freq = 220, duration = 0.05, amplitude = 0.5})}))
-            "#,
-        )
+            "#)
         .expect("script runs");
         let mut root = res.preview.expect("preview source");
         let mut buf = vec![0f32; 4096 * 2];
@@ -2734,19 +2766,20 @@ mod tests {
             }
             total += n;
         }
-        assert!(root.is_exhausted(), "add must exhaust once all children end");
+        assert!(
+            root.is_exhausted(),
+            "add must exhaust once all children end"
+        );
         // 0.05 s stereo at 44.1 kHz = 4410 samples, no matter the splits.
         assert_eq!(total, 4410);
     }
 
     #[test]
     fn add_rejects_bad_weight_counts() {
-        let err = run(
-            r#"
+        let err = run(r#"
             output.preview(add({sine({freq = 440}), sine({freq = 220})},
                                 {weights = {0.5}}))
-            "#,
-        )
+            "#)
         .err()
         .expect("script fails");
         assert!(err.to_string().contains("weights"), "{}", err.to_string());
@@ -2754,20 +2787,20 @@ mod tests {
 
     #[test]
     fn add_rejects_an_empty_source_list() {
-        let err = run("output.preview(add({}))")
-            .err()
-            .expect("script fails");
-        assert!(err.to_string().contains("list of sources"), "{}", err.to_string());
+        let err = run("output.preview(add({}))").err().expect("script fails");
+        assert!(
+            err.to_string().contains("list of sources"),
+            "{}",
+            err.to_string()
+        );
     }
 
     #[test]
     fn cue_cut_skips_and_truncates_a_sine() {
-        let (_rt, res) = run(
-            r#"
+        let (_rt, res) = run(r#"
             output.preview(cue_cut(sine({freq = 100, duration = 1, amplitude = 1.0}),
                                     {cue_in = 0.05, cue_out = 0.15}))
-            "#,
-        )
+            "#)
         .expect("script runs");
         let mut root = res.preview.expect("preview source");
         let mut buf = vec![0f32; 4096 * 2];
@@ -2821,13 +2854,11 @@ mod tests {
         // The `fade_in`/`fade_out` options are the D2 step-2 per-track
         // crossfade override: the mixer reads them via `crossfade_overrides`
         // instead of the global `crossfade_seconds`.
-        let (_rt, res) = run(
-            r#"
+        let (_rt, res) = run(r#"
             output.preview(cue_cut(sine({freq = 100, duration = 1, amplitude = 1.0}),
                                     {cue_in = 0.05, cue_out = 0.15,
                                      fade_in = 2, fade_out = 3}))
-            "#,
-        )
+            "#)
         .expect("script runs");
         let root = res.preview.expect("preview source");
         assert_eq!(
@@ -2836,12 +2867,10 @@ mod tests {
             "cue_cut must report fade overrides to the crossfade mixer"
         );
         // Without fades, no overrides are reported (global window applies).
-        let (_rt, res) = run(
-            r#"
+        let (_rt, res) = run(r#"
             output.preview(cue_cut(sine({freq = 100, duration = 1}),
                                     {cue_in = 0.05, cue_out = 0.15}))
-            "#,
-        )
+            "#)
         .expect("script runs");
         let root = res.preview.expect("preview source");
         assert_eq!(root.crossfade_overrides(), None);
@@ -2877,12 +2906,10 @@ mod tests {
         if !media.exists() {
             return;
         }
-        let (_rt, res) = run(
-            r#"
+        let (_rt, res) = run(r#"
             output.preview(smart_crossfade({directory = "./media",
                                             fade_out = 1.0, fade_mid = 0.2}))
-            "#,
-        )
+            "#)
         .expect("script runs");
         let mut root = res.preview.expect("preview source");
         let mut buf = vec![0f32; 4096 * 2];
@@ -2907,16 +2934,14 @@ mod tests {
         // Two unresolvable requests are skipped, then nil ends the source.
         // The audio thread polls the reply (never blocks), so the test
         // drives the Lua event loop with drain_metadata on silent pulls.
-        let (rt, res) = run(
-            r#"
+        let (rt, res) = run(r#"
             n = 0
             d = request.dynamic(function()
                 n = n + 1
                 if n <= 2 then return "/definitely/not/here.mp3" else return nil end
             end)
             output.preview(d)
-            "#,
-        )
+            "#)
         .expect("script runs");
         let mut root = res.preview.expect("preview source");
         let mut buf = vec![0f32; 4096 * 2];
@@ -2929,7 +2954,10 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
-        assert!(root.is_exhausted(), "source must end when the callback returns nil");
+        assert!(
+            root.is_exhausted(),
+            "source must end when the callback returns nil"
+        );
         assert_eq!(
             rt.global::<i64>("n").expect("lua n"),
             3,
@@ -2972,7 +3000,10 @@ mod tests {
         }
         let _ = std::fs::remove_file(&dest);
         // 0.3 s stereo at 44.1 kHz = 26460 samples; the whole window plays.
-        assert!(total >= 26_000, "generated track not played (total {total})");
+        assert!(
+            total >= 26_000,
+            "generated track not played (total {total})"
+        );
         assert!(root.is_exhausted(), "source must end after the nil");
         // Exactly two callback invocations: the file request and the nil.
         assert_eq!(
@@ -3006,20 +3037,15 @@ mod tests {
 
     #[test]
     fn request_queue_registers_and_is_shared_with_the_control_port() {
-        let (_rt, res) = run(
-            r#"
+        let (_rt, res) = run(r#"
             q = request.queue()
             output.preview(fallback({q, sine({freq = 440, duration = 1})}))
-            "#,
-        )
+            "#)
         .expect("script runs");
         let queue = res.request_queue.expect("queue registered");
         assert!(queue.is_empty());
         queue.push(RequestUri::new("/tmp/x.mp3"));
-        assert_eq!(
-            queue.list(),
-            vec![RequestUri::new("/tmp/x.mp3")]
-        );
+        assert_eq!(queue.list(), vec![RequestUri::new("/tmp/x.mp3")]);
     }
 
     #[test]
@@ -3028,12 +3054,10 @@ mod tests {
         if !real.exists() {
             return;
         }
-        let (_rt, res) = run(
-            r#"
+        let (_rt, res) = run(r#"
             q = request.queue()
             output.preview(fallback({q, sine({freq = 440, duration = 2})}))
-            "#,
-        )
+            "#)
         .expect("script runs");
         let queue = res.request_queue.as_ref().expect("queue registered");
         let mut root = res.preview.expect("preview source");
@@ -3065,12 +3089,10 @@ mod tests {
 
     #[test]
     fn compress_reduces_a_loud_tone() {
-        let (_rt, res) = run(
-            r#"
+        let (_rt, res) = run(r#"
             output.preview(compress(sine({freq = 440, duration = 1, amplitude = 1.0}),
                                     {threshold = -12, ratio = 2, attack = 0, release = 0}))
-            "#,
-        )
+            "#)
         .expect("script runs");
         let mut root = res.preview.expect("preview source");
         let mut buf = vec![0f32; 4096 * 2];
@@ -3082,12 +3104,10 @@ mod tests {
 
     #[test]
     fn replaygain_composes_and_leaves_untagged_tracks_alone() {
-        let (_rt, res) = run(
-            r#"
+        let (_rt, res) = run(r#"
             output.preview(replaygain(sine({freq = 440, duration = 1, amplitude = 0.5}),
                                        {max_boost = 6, max_cut = 6}))
-            "#,
-        )
+            "#)
         .expect("script runs");
         let mut root = res.preview.expect("preview source");
         let mut buf = vec![0f32; 4096 * 2];
@@ -3099,15 +3119,13 @@ mod tests {
 
     #[test]
     fn on_metadata_callback_receives_titles_in_order() {
-        let (_rt, res) = run(
-            r#"
+        let (_rt, res) = run(r#"
             titles = {}
             src = on_metadata(sequence({sine({freq = 440, duration = 0.1}),
                                        sine({freq = 880, duration = 0.1})}),
                               function(m) titles[#titles + 1] = m.title end)
             output.preview(src)
-            "#,
-        )
+            "#)
         .expect("script runs");
         let mut root = res.preview.expect("preview source");
         let mut buf = vec![0f32; 4096 * 2];
@@ -3130,15 +3148,13 @@ mod tests {
 
     #[test]
     fn on_track_fires_at_each_track_boundary() {
-        let (_rt, res) = run(
-            r#"
+        let (_rt, res) = run(r#"
             tracks = 0
             src = on_track(sequence({sine({freq = 440, duration = 0.1}),
                                      sine({freq = 880, duration = 0.1})}),
                            function() tracks = tracks + 1 end)
             output.preview(src)
-            "#,
-        )
+            "#)
         .expect("script runs");
         let mut root = res.preview.expect("preview source");
         let mut buf = vec![0f32; 4096 * 2];
@@ -3153,14 +3169,12 @@ mod tests {
 
     #[test]
     fn on_track_fires_for_a_short_child_that_exhausts() {
-        let (_rt, res) = run(
-            r#"
+        let (_rt, res) = run(r#"
             tracks = {}
             src = on_track(blank({duration = 0.1}),
                            function() tracks[#tracks + 1] = true end)
             output.preview(src)
-            "#,
-        )
+            "#)
         .expect("script runs");
         let mut root = res.preview.expect("preview source");
         let mut buf = vec![0f32; 4096 * 2];
@@ -3178,15 +3192,13 @@ mod tests {
         // A source that goes silent partway (tone then forever-silence via
         // `add`) must trip the detector: the Lua `on_blank` fires once, and
         // the `fallback` composed around it switches to the backup child.
-        let (_rt, res) = run(
-            r#"
+        let (_rt, res) = run(r#"
             blanked = 0
             src = blank.detect(add({sine({freq = 440, duration = 0.3}), blank()}),
                                {threshold = -60, duration = 0.1, restart = 0.2,
                                 on_blank = function() blanked = blanked + 1 end})
             output.preview(fallback({src, sine({freq = 880})}))
-            "#,
-        )
+            "#)
         .expect("script runs");
         let mut root = res.preview.expect("preview source");
         let mut buf = vec![0f32; 4096 * 2];
@@ -3210,14 +3222,12 @@ mod tests {
 
     #[test]
     fn map_metadata_rewrites_titles_in_order() {
-        let (_rt, res) = run(
-            r#"
+        let (_rt, res) = run(r#"
             src = map_metadata(sequence({sine({freq = 440, duration = 0.2}),
                                          sine({freq = 880, duration = 0.2})}),
                                function(m) return {title = "Rewritten: " .. m.title} end)
             output.preview(src)
-            "#,
-        )
+            "#)
         .expect("script runs");
         let mut root = res.preview.expect("preview source");
         let mut buf = vec![0f32; 4096 * 2];
@@ -3240,12 +3250,10 @@ mod tests {
 
     #[test]
     fn map_metadata_nil_keeps_the_original_title() {
-        let (_rt, res) = run(
-            r#"
+        let (_rt, res) = run(r#"
             src = map_metadata(sine({freq = 440}), function(m) return nil end)
             output.preview(src)
-            "#,
-        )
+            "#)
         .expect("script runs");
         let mut root = res.preview.expect("preview source");
         let mut buf = vec![0f32; 4096 * 2];
@@ -3257,12 +3265,10 @@ mod tests {
 
     #[test]
     fn map_metadata_callback_error_keeps_the_original_title() {
-        let (_rt, res) = run(
-            r#"
+        let (_rt, res) = run(r#"
             src = map_metadata(sine({freq = 440}), function() error("boom") end)
             output.preview(src)
-            "#,
-        )
+            "#)
         .expect("script runs");
         let mut root = res.preview.expect("preview source");
         let mut buf = vec![0f32; 4096 * 2];
@@ -3277,12 +3283,10 @@ mod tests {
         // The event loop is never drained: the rewrite cannot land, so the
         // bounded pull budget must give up and report the raw label instead
         // of stalling the audio thread.
-        let (_rt, res) = run(
-            r#"
+        let (_rt, res) = run(r#"
             src = map_metadata(sine({freq = 440}), function(m) return {title = "never"} end)
             output.preview(src)
-            "#,
-        )
+            "#)
         .expect("script runs");
         let mut root = res.preview.expect("preview source");
         let mut buf = vec![0f32; 4096 * 2];
@@ -3298,19 +3302,20 @@ mod tests {
 
     #[test]
     fn blank_detect_leaves_healthy_audio_alone() {
-        let (_rt, res) = run(
-            r#"
+        let (_rt, res) = run(r#"
             blanked = 0
             output.preview(blank.detect(sine({freq = 440}),
                                         {duration = 0.2,
                                          on_blank = function() blanked = blanked + 1 end}))
-            "#,
-        )
+            "#)
         .expect("script runs");
         let mut root = res.preview.expect("preview source");
         let mut buf = vec![0f32; 4096 * 2];
         for _ in 0..4 {
-            assert!(root.next_buffer(&mut buf) > 0, "healthy audio keeps flowing");
+            assert!(
+                root.next_buffer(&mut buf) > 0,
+                "healthy audio keeps flowing"
+            );
         }
         assert_eq!(root.label().as_deref(), Some("sine 440 Hz"));
         assert!(!root.is_exhausted());
@@ -3332,7 +3337,13 @@ mod tests {
 
     impl BurstySource {
         fn new(label: &'static str) -> Self {
-            Self { label, burst1: 100, pause_pulls: 1, burst2: 100, state: 0 }
+            Self {
+                label,
+                burst1: 100,
+                pause_pulls: 1,
+                burst2: 100,
+                state: 0,
+            }
         }
     }
 
@@ -3414,13 +3425,11 @@ mod tests {
 
     #[test]
     fn multiple_outputs_share_one_root_source() {
-        let (_rt, res) = run(
-            r#"
+        let (_rt, res) = run(r#"
             src = sine({freq = 440, duration = 1})
             output.icecast({mount = "/a.mp3", format = "mp3"}, src)
             output.icecast({mount = "/b.ogg", format = "opus"}, src)
-            "#,
-        )
+            "#)
         .expect("script runs");
         assert_eq!(res.outputs.len(), 2);
         assert!(res.root.is_some());
@@ -3432,12 +3441,11 @@ mod tests {
 
     #[test]
     fn different_roots_for_multiple_outputs_are_rejected() {
-        let err = match run(
-            r#"
+        let err = match run(r#"
             output.icecast({mount = "/a.mp3"}, sine({freq = 440}))
             output.icecast({mount = "/b.mp3"}, sine({freq = 880}))
-            "#,
-        ) {
+            "#)
+        {
             Ok(_) => panic!("second output with a different root must fail"),
             Err(e) => e,
         };
@@ -3446,40 +3454,39 @@ mod tests {
 
     #[test]
     fn file_output_registers_and_shares_root() {
-        let (_rt, res) = run(
-            r#"
+        let (_rt, res) = run(r#"
             src = sine({freq = 440, duration = 1})
             output.file({path = "/tmp/crabsoup-c1.mp3", format = "mp3", bitrate = 64000}, src)
             output.icecast({mount = "/x.mp3"}, src)
-            "#,
-        )
+            "#)
         .expect("script runs");
         assert_eq!(res.file_outputs.len(), 1);
         assert_eq!(res.outputs.len(), 1);
         assert!(res.root.is_some());
         assert_eq!(res.file_outputs[0].format, OutputFormat::Mp3);
-        assert_eq!(res.file_outputs[0].path.to_str(), Some("/tmp/crabsoup-c1.mp3"));
+        assert_eq!(
+            res.file_outputs[0].path.to_str(),
+            Some("/tmp/crabsoup-c1.mp3")
+        );
         assert_eq!(res.file_outputs[0].bitrate, 64_000);
     }
 
     #[test]
     fn file_output_requires_path_and_shared_root() {
-        let err = match run(
-            r#"
+        let err = match run(r#"
             output.file({format = "mp3"}, sine({freq = 440}))
-            "#,
-        ) {
+            "#)
+        {
             Ok(_) => panic!("output.file without path must fail"),
             Err(e) => e,
         };
         assert!(err.to_string().contains("path is required"));
 
-        let err = match run(
-            r#"
+        let err = match run(r#"
             output.file({path = "/tmp/a.mp3"}, sine({freq = 440}))
             output.file({path = "/tmp/b.mp3"}, sine({freq = 880}))
-            "#,
-        ) {
+            "#)
+        {
             Ok(_) => panic!("second output.file with a different root must fail"),
             Err(e) => e,
         };
@@ -3488,29 +3495,29 @@ mod tests {
 
     #[test]
     fn hls_output_registers_and_defaults() {
-        let (_rt, res) = run(
-            r#"
+        let (_rt, res) = run(r#"
             src = sine({freq = 440, duration = 1})
             output.hls({directory = "/tmp/crabsoup-hls"}, src)
             output.icecast({mount = "/x.mp3"}, src)
-            "#,
-        )
+            "#)
         .expect("script runs");
         assert_eq!(res.hls_outputs.len(), 1);
         assert_eq!(res.outputs.len(), 1);
         assert!(res.root.is_some());
-        assert_eq!(res.hls_outputs[0].directory.to_str(), Some("/tmp/crabsoup-hls"));
+        assert_eq!(
+            res.hls_outputs[0].directory.to_str(),
+            Some("/tmp/crabsoup-hls")
+        );
         assert_eq!(res.hls_outputs[0].segment_seconds, 5.0);
         assert_eq!(res.hls_outputs[0].retention, 12);
     }
 
     #[test]
     fn hls_output_requires_directory() {
-        let err = match run(
-            r#"
+        let err = match run(r#"
             output.hls({}, sine({freq = 440}))
-            "#,
-        ) {
+            "#)
+        {
             Ok(_) => panic!("output.hls without directory must fail"),
             Err(e) => e,
         };
@@ -3519,12 +3526,10 @@ mod tests {
 
     #[test]
     fn normalize_boosts_a_quiet_tone() {
-        let (_rt, res) = run(
-            r#"
+        let (_rt, res) = run(r#"
             output.preview(normalize(sine({freq = 440, duration = 1, amplitude = 0.02}),
                                      {target = -6, attack = 0, release = 0}))
-            "#,
-        )
+            "#)
         .expect("script runs");
         let mut root = res.preview.expect("preview source");
         let mut buf = vec![0f32; 4096 * 2];
@@ -3584,20 +3589,38 @@ mod tests {
     fn time_predicate_matches_windows_and_days() {
         let always = TimePredicate::always();
         assert!(always.is_always());
-        assert!(always.matches(&LocalTime { weekday: 3, minutes: 0 }));
+        assert!(always.matches(&LocalTime {
+            weekday: 3,
+            minutes: 0
+        }));
 
         let window = TimePredicate {
             days: Some(vec![1, 2, 3, 4, 5]),
             from: Some(9 * 60),
             to: Some(17 * 60),
         };
-        let t = LocalTime { weekday: 2, minutes: 12 * 60 };
+        let t = LocalTime {
+            weekday: 2,
+            minutes: 12 * 60,
+        };
         assert!(window.matches(&t));
-        assert!(!window.matches(&LocalTime { weekday: 6, minutes: 12 * 60 }));
-        assert!(!window.matches(&LocalTime { weekday: 2, minutes: 8 * 60 }));
-        assert!(!window.matches(&LocalTime { weekday: 2, minutes: 17 * 60 }));
+        assert!(!window.matches(&LocalTime {
+            weekday: 6,
+            minutes: 12 * 60
+        }));
+        assert!(!window.matches(&LocalTime {
+            weekday: 2,
+            minutes: 8 * 60
+        }));
+        assert!(!window.matches(&LocalTime {
+            weekday: 2,
+            minutes: 17 * 60
+        }));
         // `to` is exclusive.
-        assert!(!window.matches(&LocalTime { weekday: 2, minutes: 17 * 60 }));
+        assert!(!window.matches(&LocalTime {
+            weekday: 2,
+            minutes: 17 * 60
+        }));
     }
 
     #[test]
@@ -3607,17 +3630,36 @@ mod tests {
             from: Some(22 * 60),
             to: Some(6 * 60),
         };
-        assert!(overnight.matches(&LocalTime { weekday: 0, minutes: 23 * 60 }));
-        assert!(overnight.matches(&LocalTime { weekday: 0, minutes: 3 * 60 }));
-        assert!(!overnight.matches(&LocalTime { weekday: 0, minutes: 12 * 60 }));
+        assert!(overnight.matches(&LocalTime {
+            weekday: 0,
+            minutes: 23 * 60
+        }));
+        assert!(overnight.matches(&LocalTime {
+            weekday: 0,
+            minutes: 3 * 60
+        }));
+        assert!(!overnight.matches(&LocalTime {
+            weekday: 0,
+            minutes: 12 * 60
+        }));
         // from == to is an empty window.
-        let empty = TimePredicate { days: None, from: Some(0), to: Some(0) };
-        assert!(!empty.matches(&LocalTime { weekday: 0, minutes: 0 }));
+        let empty = TimePredicate {
+            days: None,
+            from: Some(0),
+            to: Some(0),
+        };
+        assert!(!empty.matches(&LocalTime {
+            weekday: 0,
+            minutes: 0
+        }));
     }
 
     #[test]
     fn switch_stays_in_a_window_and_moves_to_the_default_when_it_closes() {
-        let clock = Arc::new(Mutex::new(LocalTime { weekday: 1, minutes: 9 * 60 }));
+        let clock = Arc::new(Mutex::new(LocalTime {
+            weekday: 1,
+            minutes: 9 * 60,
+        }));
         let fpb = 100;
         let a = LuaSource::new(Box::new(LabelCycler::new(0.25, &["a1", "a2"], 300)));
         let b = LuaSource::new(Box::new(LabelCycler::new(0.75, &["b1", "b2"], 300)));
@@ -3631,7 +3673,10 @@ mod tests {
                     },
                     child: 0,
                 },
-                SwitchSlot { when: TimePredicate::always(), child: 1 },
+                SwitchSlot {
+                    when: TimePredicate::always(),
+                    child: 1,
+                },
             ]),
             vec![a.clone(), b.clone()],
             true,
@@ -3654,7 +3699,10 @@ mod tests {
 
     #[test]
     fn switch_track_sensitive_holds_mid_track_until_the_boundary() {
-        let clock = Arc::new(Mutex::new(LocalTime { weekday: 1, minutes: 9 * 60 }));
+        let clock = Arc::new(Mutex::new(LocalTime {
+            weekday: 1,
+            minutes: 9 * 60,
+        }));
         let fpb = 100;
         let a = LuaSource::new(Box::new(LabelCycler::new(0.25, &["a1", "a2"], 300)));
         let b = LuaSource::new(Box::new(LabelCycler::new(0.75, &["b1", "b2"], 300)));
@@ -3668,7 +3716,10 @@ mod tests {
                     },
                     child: 0,
                 },
-                SwitchSlot { when: TimePredicate::always(), child: 1 },
+                SwitchSlot {
+                    when: TimePredicate::always(),
+                    child: 1,
+                },
             ]),
             vec![a.clone(), b.clone()],
             true,
@@ -3691,7 +3742,10 @@ mod tests {
 
     #[test]
     fn switch_with_track_sensitive_false_cuts_mid_track() {
-        let clock = Arc::new(Mutex::new(LocalTime { weekday: 1, minutes: 9 * 60 }));
+        let clock = Arc::new(Mutex::new(LocalTime {
+            weekday: 1,
+            minutes: 9 * 60,
+        }));
         let fpb = 100;
         let a = LuaSource::new(Box::new(LabelCycler::new(0.25, &["a1", "a2"], 300)));
         let b = LuaSource::new(Box::new(LabelCycler::new(0.75, &["b1", "b2"], 300)));
@@ -3705,7 +3759,10 @@ mod tests {
                     },
                     child: 0,
                 },
-                SwitchSlot { when: TimePredicate::always(), child: 1 },
+                SwitchSlot {
+                    when: TimePredicate::always(),
+                    child: 1,
+                },
             ]),
             vec![a.clone(), b.clone()],
             false,
@@ -3727,7 +3784,11 @@ mod tests {
         let a = LuaSource::new(Box::new(LabelCycler::new(0.25, &["a1", "a2"], 300)));
         let b = LuaSource::new(Box::new(LabelCycler::new(0.75, &["b1", "b2"], 300)));
         let mut src = ScheduleSource::new(
-            ScheduleKind::Rotate { weights: vec![1, 1], cursor: 0, spins: 0 },
+            ScheduleKind::Rotate {
+                weights: vec![1, 1],
+                cursor: 0,
+                spins: 0,
+            },
             vec![a.clone(), b.clone()],
             true,
         );
@@ -3739,7 +3800,12 @@ mod tests {
             seen.push(buf[0]);
         }
         // One track = 300 frames = 3 pulls: A, A, A, B, B, B, A, ...
-        assert_eq!(seen, vec![0.25, 0.25, 0.25, 0.75, 0.75, 0.75, 0.25, 0.25, 0.25, 0.75, 0.75, 0.75]);
+        assert_eq!(
+            seen,
+            vec![
+                0.25, 0.25, 0.25, 0.75, 0.75, 0.75, 0.25, 0.25, 0.25, 0.75, 0.75, 0.75
+            ]
+        );
     }
 
     #[test]
@@ -3748,7 +3814,11 @@ mod tests {
         let a = LuaSource::new(Box::new(LabelCycler::new(0.25, &["a1", "a2"], 300)));
         let b = LuaSource::new(Box::new(LabelCycler::new(0.75, &["b1", "b2"], 300)));
         let mut src = ScheduleSource::new(
-            ScheduleKind::Rotate { weights: vec![1, 2], cursor: 0, spins: 0 },
+            ScheduleKind::Rotate {
+                weights: vec![1, 2],
+                cursor: 0,
+                spins: 0,
+            },
             vec![a.clone(), b.clone()],
             true,
         );
@@ -3763,8 +3833,8 @@ mod tests {
         assert_eq!(
             seen,
             vec![
-                0.25, 0.25, 0.25, 0.75, 0.75, 0.75, 0.75, 0.75, 0.75,
-                0.25, 0.25, 0.25, 0.75, 0.75, 0.75,
+                0.25, 0.25, 0.25, 0.75, 0.75, 0.75, 0.75, 0.75, 0.75, 0.25, 0.25, 0.25, 0.75, 0.75,
+                0.75,
             ]
         );
     }
@@ -3776,7 +3846,11 @@ mod tests {
         let a = LuaSource::new(Box::new(LabelCycler::new(0.25, &["a1", "a2"], 100)));
         let b = LuaSource::new(Box::new(BlankSource::with_duration(0.0, 100)));
         let mut src = ScheduleSource::new(
-            ScheduleKind::Rotate { weights: vec![1, 1], cursor: 0, spins: 0 },
+            ScheduleKind::Rotate {
+                weights: vec![1, 1],
+                cursor: 0,
+                spins: 0,
+            },
             vec![a.clone(), b.clone()],
             true,
         );
@@ -3793,7 +3867,10 @@ mod tests {
 
     #[test]
     fn switch_skip_forces_a_repick() {
-        let clock = Arc::new(Mutex::new(LocalTime { weekday: 1, minutes: 9 * 60 }));
+        let clock = Arc::new(Mutex::new(LocalTime {
+            weekday: 1,
+            minutes: 9 * 60,
+        }));
         let fpb = 100;
         // A's first track is one buffer long (100 frames).
         let a = LuaSource::new(Box::new(LabelCycler::new(0.25, &["a1", "a2"], 100)));
@@ -3808,7 +3885,10 @@ mod tests {
                     },
                     child: 0,
                 },
-                SwitchSlot { when: TimePredicate::always(), child: 1 },
+                SwitchSlot {
+                    when: TimePredicate::always(),
+                    child: 1,
+                },
             ]),
             vec![a.clone(), b.clone()],
             true,
@@ -3855,13 +3935,11 @@ mod tests {
 
     #[test]
     fn switch_requires_a_default_child() {
-        let err = run(
-            r#"
+        let err = run(r#"
             output.preview(switch({
                 {when = {from = "09:00", to = "17:00"}, src = sine({freq = 440})}
             }))
-            "#,
-        )
+            "#)
         .err()
         .expect("script fails");
         assert!(err.to_string().contains("default child"));
@@ -3869,26 +3947,22 @@ mod tests {
 
     #[test]
     fn switch_rejects_bad_times_and_weekdays() {
-        let err = run(
-            r#"
+        let err = run(r#"
             output.preview(switch({
                 {when = {from = "25:00", to = "17:00"}, src = sine({freq = 440})},
                 {src = sine({freq = 880})}
             }))
-            "#,
-        )
+            "#)
         .err()
         .expect("script fails");
         assert!(err.to_string().contains("bad time"));
 
-        let err = run(
-            r#"
+        let err = run(r#"
             output.preview(switch({
                 {when = {days = {"funday"}}, src = sine({freq = 440})},
                 {src = sine({freq = 880})}
             }))
-            "#,
-        )
+            "#)
         .err()
         .expect("script fails");
         assert!(err.to_string().contains("unknown weekday"));
@@ -3896,13 +3970,11 @@ mod tests {
 
     #[test]
     fn rotate_registers_in_lua() {
-        let (_rt, res) = run(
-            r#"
+        let (_rt, res) = run(r#"
             a = sine({freq = 440, duration = 0.2})
             b = sine({freq = 880, duration = 0.2})
             output.preview(rotate({a, b}, {weights = {1, 2}}))
-            "#,
-        )
+            "#)
         .expect("script runs");
         let mut root = res.preview.expect("preview source");
         let mut buf = vec![0f32; 4096 * 2];
@@ -3926,10 +3998,7 @@ mod tests {
         let v = table_to_json(&arr).unwrap();
         assert_eq!(v, serde_json::json!(["a", "b", "c"]));
 
-        let mixed: mlua::Table = lua
-            .load("return {1, 2, name = \"x\"}")
-            .eval()
-            .unwrap();
+        let mixed: mlua::Table = lua.load("return {1, 2, name = \"x\"}").eval().unwrap();
         let v = table_to_json(&mixed).unwrap();
         assert_eq!(v["name"], "x");
         assert_eq!(v["1"], 1);
