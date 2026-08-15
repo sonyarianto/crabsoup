@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
+use super::effect::VideoEffects;
 use super::ffi::VideoDecoder;
 use super::frame::VideoFrame;
 use super::tap::VideoTap;
@@ -30,6 +31,8 @@ use crate::Result;
 pub struct VideoConfig {
     pub path: PathBuf,
     pub spec: VideoSpec,
+    /// `video.scale`/`video.fade` applied on the decode thread (Part H3).
+    pub effects: VideoEffects,
 }
 
 /// A sequence of video files played one at a time by a single decode
@@ -41,6 +44,8 @@ pub struct VideoPlaylistConfig {
     pub loop_playlist: bool,
     /// Seeded RNG for deterministic shuffle (used by tests).
     pub seed: Option<u64>,
+    /// `video.scale`/`video.fade` applied per track (Part H3).
+    pub effects: VideoEffects,
 }
 
 /// One slideshow picture: an image decoded to YUV420P at script evaluation
@@ -68,6 +73,8 @@ pub struct SlideshowConfig {
     pub loop_playlist: bool,
     /// Seeded RNG for deterministic shuffle (used by tests).
     pub seed: Option<u64>,
+    /// `video.scale`/`video.fade` applied on the render thread (Part H3).
+    pub effects: VideoEffects,
 }
 
 /// Static properties of a video stream, read once at script evaluation.
@@ -138,6 +145,7 @@ impl VideoSource {
         let path = config.path.clone();
         let tap = tap.clone();
         let engine_stop = stop.clone();
+        let effects = config.effects;
         let thread = std::thread::Builder::new()
             .name("video-decode".into())
             .spawn(move || {
@@ -148,6 +156,8 @@ impl VideoSource {
                         return;
                     }
                 };
+                // Fade-out needs the stream length up front (Part H3).
+                let duration = decoder.duration_us();
                 let start = Instant::now();
                 loop {
                     if thread_stop.load(Ordering::SeqCst) || engine_stop.load(Ordering::SeqCst) {
@@ -165,6 +175,11 @@ impl VideoSource {
                     if let Some(remaining) = due.checked_duration_since(Instant::now()) {
                         std::thread::sleep(remaining);
                     }
+                    let frame = if effects.is_empty() {
+                        frame
+                    } else {
+                        effects.apply(&frame, duration)
+                    };
                     tap.publish(Arc::new(frame));
                 }
                 log::info!("video source {path:?}: decode thread ended");
@@ -192,6 +207,7 @@ impl VideoSource {
         let shuffle = config.shuffle;
         let loop_playlist = config.loop_playlist;
         let seed = config.seed;
+        let effects = config.effects;
         let thread = std::thread::Builder::new()
             .name("video-playlist".into())
             .spawn(move || {
@@ -225,6 +241,9 @@ impl VideoSource {
                             continue;
                         }
                     };
+                    // Fade-out anchors on each track's own duration, since
+                    // the published timeline is offset across tracks (H3).
+                    let duration = decoder.duration_us();
                     loop {
                         if thread_stop.load(Ordering::SeqCst) || engine_stop.load(Ordering::SeqCst)
                         {
@@ -237,6 +256,11 @@ impl VideoSource {
                                 log::warn!("video playlist {}: {e}", path.display());
                                 break;
                             }
+                        };
+                        let frame = if effects.is_empty() {
+                            frame
+                        } else {
+                            effects.apply(&frame, duration)
                         };
                         let pts = offset_us + frame.pts_us;
                         let due = start + Duration::from_micros(pts);
@@ -289,6 +313,10 @@ impl VideoSource {
         let shuffle = config.shuffle;
         let loop_playlist = config.loop_playlist;
         let seed = config.seed;
+        let effects = config.effects;
+        // Fade-out needs the whole show's length; a looping show has none.
+        let duration_us = (!loop_playlist)
+            .then_some((tracks.len() as f64 * seconds_per_image * 1_000_000.0) as u64);
         let thread = std::thread::Builder::new()
             .name("video-slideshow".into())
             .spawn(move || {
@@ -342,7 +370,7 @@ impl VideoSource {
                         let (y, u, v) = match (&prev, f < transition_frames) {
                             (Some(p), true) => {
                                 let alpha = ((f + 1) * 256 / transition_frames) as u32;
-                                blend_planes(
+                                crate::video::blend_planes(
                                     &mut blend_y,
                                     &mut blend_u,
                                     &mut blend_v,
@@ -354,14 +382,13 @@ impl VideoSource {
                             }
                             _ => (show.y.clone(), show.u.clone(), show.v.clone()),
                         };
-                        tap.publish(Arc::new(VideoFrame::new(
-                            pts,
-                            spec.width,
-                            spec.height,
-                            y,
-                            u,
-                            v,
-                        )));
+                        let show_frame = VideoFrame::new(pts, spec.width, spec.height, y, u, v);
+                        let frame = if effects.is_empty() {
+                            show_frame
+                        } else {
+                            effects.apply(&show_frame, duration_us)
+                        };
+                        tap.publish(Arc::new(frame));
                     }
                     prev = Some(show.clone());
                     offset_us = start.elapsed().as_micros() as u64;
@@ -374,29 +401,6 @@ impl VideoSource {
             thread: Some(thread),
         })
     }
-}
-
-/// Crossfade `prev` into `curr` by `alpha` (0..=256, 256 = fully `curr`),
-/// writing whole planes. All three frames share one resolution (enforced
-/// at script evaluation), so planes can be blended element-wise.
-fn blend_planes(
-    dst_y: &mut [u8],
-    dst_u: &mut [u8],
-    dst_v: &mut [u8],
-    prev: &VideoFrame,
-    curr: &VideoFrame,
-    alpha: u32,
-) {
-    let a = alpha;
-    let b = 256 - alpha;
-    let mix = |dst: &mut [u8], from: &[u8], to: &[u8]| {
-        for (d, (p, c)) in dst.iter_mut().zip(from.iter().zip(to.iter())) {
-            *d = (((*p as u32) * b + (*c as u32) * a) >> 8) as u8;
-        }
-    };
-    mix(dst_y, &prev.y, &curr.y);
-    mix(dst_u, &prev.u, &curr.u);
-    mix(dst_v, &prev.v, &curr.v);
 }
 
 /// Fisher-Yates, deterministically seeded when `seed` is set.
@@ -417,7 +421,7 @@ fn shuffle_indices_rng(order: &mut [usize], rng: &mut SmallRng) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::video::testutil::{render_test_clip, render_test_solid};
+    use crate::video::testutil::{render_test_clip, render_test_solid, render_test_solid_clip};
     use std::sync::mpsc::Receiver;
     use std::time::Duration;
 
@@ -444,7 +448,11 @@ mod tests {
         let tap = Arc::new(VideoTap::new());
         let rx = tap.register();
         let spec = VideoSource::validate(&path).expect("validate");
-        let cfg = VideoConfig { path, spec };
+        let cfg = VideoConfig {
+            path,
+            spec,
+            effects: VideoEffects::default(),
+        };
         let handle =
             VideoSource::spawn(&cfg, tap, Arc::new(AtomicBool::new(false))).expect("spawn");
         let mut frames: Vec<u64> = Vec::new();
@@ -477,7 +485,11 @@ mod tests {
             .into_iter()
             .map(|p| {
                 let spec = VideoSource::validate(&p).expect("validate");
-                VideoConfig { path: p, spec }
+                VideoConfig {
+                    path: p,
+                    spec,
+                    effects: VideoEffects::default(),
+                }
             })
             .collect();
         VideoPlaylistConfig {
@@ -485,6 +497,7 @@ mod tests {
             shuffle,
             loop_playlist,
             seed: None,
+            effects: VideoEffects::default(),
         }
     }
 
@@ -550,6 +563,57 @@ mod tests {
     }
 
     #[test]
+    fn spawned_source_applies_scale_and_fade() {
+        // Solid white clip: deterministic pixels for the fade ramp.
+        let Some(path) = render_test_solid_clip("fx-spawn", 320, 240, "white") else {
+            return;
+        };
+        let tap = Arc::new(VideoTap::new());
+        let rx = tap.register();
+        let spec = VideoSource::validate(&path).expect("validate");
+        // Scale down to 160x120 and fade in over 1 s: the first frame must
+        // be fully black at the scaled size, the last frame near-white.
+        let cfg = VideoConfig {
+            path,
+            spec,
+            effects: VideoEffects {
+                scale: Some((160, 120)),
+                fade_in_seconds: 1.0,
+                fade_out_seconds: 0.0,
+            },
+        };
+        let handle =
+            VideoSource::spawn(&cfg, tap, Arc::new(AtomicBool::new(false))).expect("spawn");
+        let frames = collect_frames(&rx, 4);
+        assert!(
+            frames.len() >= 20,
+            "expected ~25 frames, got {}",
+            frames.len()
+        );
+        for f in &frames {
+            assert_eq!((f.width, f.height), (160, 120), "frames must be scaled");
+            assert_eq!(
+                f.plane_sizes(),
+                (160 * 120, 80 * 60, 80 * 60),
+                "YUV420P planes follow the scaled size"
+            );
+        }
+        // Fade-in over the whole 1 s clip: luma ramps 0 -> full.
+        assert!(frames[0].y.iter().all(|&p| p == 0), "fade-in starts black");
+        let mean = |f: &VideoFrame| f.y.iter().map(|&p| p as u32).sum::<u32>() / f.y.len() as u32;
+        assert!(
+            frames.windows(2).all(|w| mean(&w[0]) <= mean(&w[1])),
+            "fade-in must ramp monotonically"
+        );
+        assert!(
+            mean(frames.last().unwrap()) >= 220,
+            "fade-in ends near-white"
+        );
+        drop(handle);
+        std::fs::remove_file(&cfg.path).ok();
+    }
+
+    #[test]
     fn looping_playlist_restarts_without_pt_jump() {
         let Some(a) = render_test_clip("pl-loop") else {
             return;
@@ -590,15 +654,18 @@ mod tests {
                 VideoConfig {
                     path: a.clone(),
                     spec,
+                    effects: VideoEffects::default(),
                 },
                 VideoConfig {
                     path: missing,
                     spec,
+                    effects: VideoEffects::default(),
                 },
             ],
             shuffle: false,
             loop_playlist: false,
             seed: None,
+            effects: VideoEffects::default(),
         };
         let handle = VideoSource::spawn_playlist(&cfg, tap, Arc::new(AtomicBool::new(false)))
             .expect("spawn");
@@ -638,6 +705,7 @@ mod tests {
             shuffle: false,
             loop_playlist,
             seed: None,
+            effects: VideoEffects::default(),
         }
     }
 

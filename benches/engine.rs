@@ -305,6 +305,65 @@ fn encode(c: &mut Criterion) {
     }
 }
 
+/// Video path (Part H3, `--features video`): scale, crossfade blend and
+/// H.264 encode of one 640x360 YUV420P frame.
+#[cfg(feature = "video")]
+fn video_path(c: &mut Criterion) {
+    use crabsoup::video::{VideoEffects, VideoEncoder, VideoFrame, blend_planes};
+
+    let spec = crabsoup::video::VideoSpec {
+        width: 640,
+        height: 360,
+        frame_rate: 25.0,
+    };
+    let (w, h) = (spec.width as usize, spec.height as usize);
+    let frame = VideoFrame::new(
+        0,
+        w as u32,
+        h as u32,
+        vec![128u8; w * h],
+        vec![90u8; w / 2 * h / 2],
+        vec![190u8; w / 2 * h / 2],
+    );
+    let mut prev = frame.clone();
+    prev.y.fill(64);
+
+    let mut group = c.benchmark_group("video");
+    // One frame's worth of pixels, like the audio rows' 92.9 ms buffer.
+    group.throughput(Throughput::Elements((w * h) as u64));
+
+    group.bench_function("scale/640x360_to_320x180", |b| {
+        let eff = VideoEffects {
+            scale: Some((320, 180)),
+            ..Default::default()
+        };
+        b.iter(|| {
+            let out = eff.apply(&frame, None);
+            black_box(out);
+        });
+    });
+
+    group.bench_function("blend/crossfade_planes", |b| {
+        let mut y = vec![0u8; w * h];
+        let mut u = vec![0u8; w / 2 * h / 2];
+        let mut v = vec![0u8; w / 2 * h / 2];
+        b.iter(|| {
+            blend_planes(&mut y, &mut u, &mut v, &prev, &frame, 128);
+            black_box(&y);
+        });
+    });
+
+    group.bench_function("encode/h264_640x360", |b| {
+        let mut encoder =
+            VideoEncoder::h264(spec.width, spec.height, 25, 1, 1_500_000).expect("h264 open");
+        let _ = encoder.push(&frame).expect("first encode");
+        b.iter(|| {
+            let out = encoder.push(&frame).expect("encode frame");
+            black_box(out);
+        });
+    });
+}
+
 criterion::criterion_group!(
     benches,
     mixers,
@@ -314,4 +373,9 @@ criterion::criterion_group!(
     resampler,
     encode
 );
+#[cfg(feature = "video")]
+criterion::criterion_group!(benches_video, video_path);
+#[cfg(feature = "video")]
+criterion::criterion_main!(benches, benches_video);
+#[cfg(not(feature = "video"))]
 criterion::criterion_main!(benches);

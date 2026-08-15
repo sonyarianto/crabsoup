@@ -40,20 +40,11 @@ struct Cli {
 /// The first registered video track's spec — `video.video` first, then the
 /// first `video.playlist`/`video.single` track, then the first
 /// `video.slideshow` — shared by the video-enabled outputs (HLS and RTMP).
+/// Effects (Part H3) may rescale the published frames, so the encoder opens
+/// at the *scaled* spec. Defined in `script.rs` so it is unit-testable.
 #[cfg(feature = "video")]
 fn first_video_spec(result: &ScriptResult) -> Option<crabsoup::video::VideoSpec> {
-    result
-        .video
-        .first()
-        .map(|v| v.spec)
-        .or_else(|| {
-            result
-                .video_playlists
-                .first()
-                .and_then(|p| p.tracks.first())
-                .map(|t| t.spec)
-        })
-        .or_else(|| result.video_slideshows.first().map(|s| s.spec))
+    crabsoup::script::first_video_spec(result)
 }
 
 fn main() -> crabsoup::Result<()> {

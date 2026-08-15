@@ -432,8 +432,21 @@ Video is a parallel side-channel to the PCM bus, compiled out by default
   the playlist's (accumulated offset, wall-clock paced). A `"fade"`
   transition crossfades the previous picture into the current one over
   `transition_seconds` by blending whole planes element-wise with an
-  integer alpha 0..=256 (`blend_planes`); the first picture has no
-  transition (no `prev`).
+  integer alpha 0..=256 (`blend_planes` in `src/video/effect.rs`); the
+  first picture has no transition (no `prev`).
+- **Effects (Part H3)**: `video.scale({width, height}, marker)` and
+  `video.fade({fade_in, fade_out}, marker)` wrap any `video.*` marker
+  (the operator mutates the wrapped source's `VideoEffects` config via an
+  opaque `__src` registry key on the marker table) and are applied on the
+  source render threads — scale first, then fade — so every output sees
+  processed frames. `src/video/effect.rs` is pure Rust: scale is a
+  half-pixel-centered fixed-point bilinear YUV420P resampler (deterministic
+  across platforms, no new FFmpeg surface), fades blend whole planes toward
+  black. The fade windows anchor on the source's own timeline
+  (`VideoDecoder::duration_us()` for files, per-track duration in
+  playlists, total show length for slideshows; looping sources skip
+  fade-out). The marker's spec follows `VideoEffects::scaled_spec`, so
+  `first_video_spec` (main.rs) opens encoders at the scaled resolution.
 - **Mux**: `src/output/hls.rs` `VideoTrack` encodes to H.264 (libx264 via
   ffmpeg-next: baseline/ultrafast/zerolatency, 90 kHz time base, PTS==DTS,
   `AV_CODEC_FLAG_CLOSED_GOP` + `scenecut=0`) and muxes into the same

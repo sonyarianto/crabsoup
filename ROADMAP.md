@@ -127,6 +127,20 @@ rolling tail-level accumulation (sum of squares + VecDeque eviction) costs
 is statistically identical to the plain mixing row (107 µs) because the
 measurement pauses while a fade is in progress.
 
+Video-path rows (Part H3, recorded in the session that landed the effects +
+bench group; per 640x360 YUV420P frame, budget = one 25 fps frame = 40 ms):
+
+| benchmark | per frame | vs 40 ms frame time |
+|---|---|---|
+| video/scale/640x360_to_320x180 | 1.09 ms | 2.7 % |
+| video/blend/crossfade_planes | 29 µs | 0.07 % |
+| video/encode/h264_640x360 | 1.15 ms | 2.9 % |
+
+So the decode→effects→encode chain is dominated by the pure-Rust scale
+(~2.7 %) and libx264 ultrafast (~2.9 %); the crossfade blend is negligible.
+As with the audio rows, compare within one session (`--save-baseline` /
+`--load-baseline`), not against these absolute numbers.
+
 Full path (crossfade + compressor/agc/amplify + resample + encode) ≈ 2.6 ms
 per 92.9 ms buffer ≈ 2.8 % of one core. The one-time hotspot —
 `CrossfadeMixer`'s mixing loop, two `f64::powf` per sample making the mix
@@ -538,7 +552,7 @@ to a dedicated `src/video/ffi.rs` (and any encoder FFI next to
 paths stay allocation-free per the performance principles; every new module
 ships its inline tests and a `benches/` row.
 
-- [ ] **H1 — video file input + frame carrier.** **Decision (locked by
+- [x] **H1 — video file input + frame carrier.** **Decision (locked by
       PoC): parallel `VideoFrame` side-channel, not an extended
       `AudioFrame`** — only the tap and the four output consumers touch
       `AudioFrame` today (the whole pull chain is `&mut [f32]`), but video
@@ -586,7 +600,39 @@ ships its inline tests and a `benches/` row.
       a 13 s run of the example shape against real PNGs produced
       keyframe-aligned h264+aac segments whose frames change exactly at
       image boundaries (transition stills identified by frame checksums).
-- [ ] **H3 — basic video effects:** `video.fade` (in/out), `video.scale`.
+- [x] **H3 — basic video effects:** `video.fade` (in/out), `video.scale`.
+      **Shipped (behind the `video` cargo feature):** the effects are
+      composable operators over any `video.*` marker —
+      `video.scale({width, height}, src)` and
+      `video.fade({fade_in, fade_out}, src)` (seconds; both optional) —
+      that mutate the wrapped source's effect config and return an updated
+      marker (scale also rewrites the marker's `width`/`height`, so the
+      encoder opens at the scaled spec via `VideoEffects::scaled_spec`).
+      The marker registry is an opaque `__src` field on the marker table
+      (`video.kind:index`); effects fail fast on non-markers, non-positive
+      scale dims (odd sizes round up to even — YUV420P chroma is half
+      resolution) and negative fade windows. **Where effects run:** on the
+      source render threads (`VideoSource::spawn`/`spawn_playlist`/
+      `spawn_slideshow`), so every output (HLS, RTMP) gets processed frames
+      for free — scale first, then fade. **Implementation:**
+      `src/video/effect.rs` is pure Rust, no new FFmpeg/FFI surface: scale
+      is a half-pixel-centered fixed-point bilinear YUV420P resampler
+      (`scale_plane`, deterministic across platforms), fades blend whole
+      planes toward black (`blend_to_black`; the H2 crossfade `blend_planes`
+      was lifted here and shared). Fade windows anchor on the source's own
+      timeline: `VideoDecoder::duration_us()` (new, from the container
+      duration) for files, per-track duration in playlists, the whole show
+      length for slideshows; fade-out is skipped for looping sources, which
+      have no end. Tests (242 -> 277 with `rtmp,video`): `effect` unit
+      tests (plane layout/values through bilinear downscale, interpolation
+      midpoint, fade-alpha window math incl. the whole-stream-is-fade-out
+      case, scale+fade endpoint pixels) plus `source` and `script` tests
+      (a spawned solid-white clip fades black→white while being scaled,
+      marker spec rewrites, odd-size rounding, error cases, effects applied
+      to playlist and slideshow markers). **Benchmark rows recorded** under
+      Performance baseline: `video/scale/640x360_to_320x180` ~1.09 ms/frame,
+      `video/blend/crossfade_planes` ~29 µs/frame, `video/encode/
+      h264_640x360` ~1.15 ms/frame (each well under the 40 ms/frame budget).
 - [ ] **H4 — video encoders:** H.264/H.265/VP8/VP9 via FFI, muxed with the
       existing Opus/AAC/MP3 audio encoders into MPEG-TS/MP4.
 - [x] **H5 — RTMP output** (`output.rtmp`): `librtmp` FFI; verified live
@@ -632,7 +678,7 @@ ships its inline tests and a `benches/` row.
       module only warns while extracting metadata it will re-publish;
       it does not affect relaying). Requires `librtmp-dev` and the
       `rtmp` cargo feature; docs in `website/guide/video.md`.
-- [ ] **H6 — HLS video:** extend the existing `output.hls`
+- [x] **H6 — HLS video:** extend the existing `output.hls`
       (`src/output/hls.rs`) to video segments + master playlists — audio HLS
       already exists, so this is an extension, not a new output.
       **A/V interleaving shipped:** `output.hls({video = ...})` (the marker

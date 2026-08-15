@@ -23,9 +23,10 @@ Opus) to an Icecast server.
 - **Video (Part H, `--features video`)**: file → HLS(video) — `video.video`,
   `video.single`, `video.playlist` and `video.slideshow` (stills with
   optional crossfades) sources feed a decode thread publishing PTS-paced
-  frames to a shared tap; `output.hls({video = ...})` live-encodes them to
-  H.264 and muxes them into keyframe-aligned MPEG-TS segments with a
-  variant master playlist. See `examples/crabsoup.video.lua`
+  frames to a shared tap; `video.scale`/`video.fade` wrap any source as
+  per-source effects (Part H3); `output.hls({video = ...})` live-encodes
+  them to H.264 and muxes them into keyframe-aligned MPEG-TS segments with
+  a variant master playlist. See `examples/crabsoup.video.lua`
 - **RTMP (Part H5, `--features rtmp`)**: `output.rtmp` publishes the stream
   as FLV (raw AAC, optional H.264 video with `video = marker`) to any RTMP
   server such as nginx-rtmp or YouTube Live, with the Icecast-style

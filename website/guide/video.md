@@ -63,6 +63,34 @@ ss = video.slideshow({directory = "./art", seconds_per_image = 5,
   skipped with a warning; a sequence with no valid files fails the script.
 - `video.single(path)` is a one-track playlist that never loops.
 
+### Effects (Part H3): `video.scale`, `video.fade`
+
+Both operators wrap any `video.*` marker and return an updated marker
+(they compose, in any order):
+
+```lua
+src   = video.video("media/clip.mp4")
+scaled = video.scale({width = 1280, height = 720}, src)
+faded  = video.fade({fade_in = 2, fade_out = 3}, scaled)
+
+-- or straight from a playlist / slideshow:
+vpl = video.fade({fade_in = 1},
+                 video.scale({width = 640, height = 360},
+                             video.playlist({directory = "./media/video"})))
+```
+
+- `video.scale({width, height}, marker)` rescales to the target size
+  (odd dimensions round up to even — YUV420P chroma is half resolution).
+  The marker's `width`/`height` update, so outputs encode at the scaled
+  size.
+- `video.fade({fade_in, fade_out}, marker)` fades to/from black over the
+  first/last N seconds of the source's timeline (both optional; seconds).
+  For playlists and slideshows the fade-out anchors on each track's
+  duration (playlists) or the whole show's length (slideshows); looping
+  sources have no end, so `fade_out` is ignored for them.
+- Effects run on the source's render thread (scale first, then fade), so
+  every output — HLS or RTMP — gets the processed frames.
+
 ### The audio side
 
 The audio of each video file is **not** played by these operators — the

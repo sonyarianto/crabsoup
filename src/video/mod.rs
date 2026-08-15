@@ -6,6 +6,7 @@
 //! subscribe to both taps and interleave by PTS at mux time. The audio pull
 //! chain is untouched.
 
+pub mod effect;
 pub mod encode;
 pub mod ffi;
 pub mod frame;
@@ -14,6 +15,7 @@ pub mod tap;
 #[cfg(test)]
 pub mod testutil;
 
+pub use effect::{VideoEffects, blend_planes, scale_frame};
 pub use encode::{EncodedAu, VideoEncoder};
 pub use ffi::VideoDecoder;
 pub use frame::VideoFrame;

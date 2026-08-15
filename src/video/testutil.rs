@@ -44,6 +44,40 @@ pub fn render_test_clip_size(tag: &str, width: u32, height: u32) -> Option<PathB
     Some(path)
 }
 
+/// Render a 1 s 25 fps solid-color clip — deterministic pixels for
+/// effect/scale assertions (Part H3). Like [`render_test_clip`], skips the
+/// test entirely when no `ffmpeg` is installed.
+pub fn render_test_solid_clip(tag: &str, width: u32, height: u32, color: &str) -> Option<PathBuf> {
+    let path =
+        std::env::temp_dir().join(format!("crabsoup-solid-{}-{tag}.mp4", std::process::id()));
+    if path.exists() {
+        std::fs::remove_file(&path).ok();
+    }
+    let ok = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("color=c={color}:s={width}x{height}:d=1:r=25"),
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+        ])
+        .arg(&path)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        std::fs::remove_file(&path).ok();
+        return None;
+    }
+    Some(path)
+}
+
 /// Render a single testsrc frame to a PNG at `width`x`height` (Part H2).
 pub fn render_test_image(tag: &str, width: u32, height: u32) -> Option<PathBuf> {
     render_image(tag, &format!("testsrc=size={width}x{height}"))

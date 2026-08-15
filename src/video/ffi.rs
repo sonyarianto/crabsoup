@@ -85,6 +85,13 @@ impl VideoDecoder {
         (fr.0, fr.1)
     }
 
+    /// Duration of the container in microseconds, when the file carries
+    /// one — the fade-out window anchor for `video.fade` (Part H3).
+    pub fn duration_us(&self) -> Option<u64> {
+        let d = self.ictx.duration();
+        (d > 0).then_some(d as u64)
+    }
+
     /// Decode the whole file into frames, oldest first.
     pub fn decode_all(&mut self) -> Result<Vec<VideoFrame>> {
         let mut frames = Vec::new();

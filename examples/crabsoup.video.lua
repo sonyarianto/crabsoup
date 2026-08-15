@@ -34,6 +34,12 @@ vpl = video.playlist({directory = "./media/video", shuffle = false, loop = true}
 -- ss = video.slideshow({directory = "./art", seconds_per_image = 5,
 --                        transition = "fade", transition_seconds = 1})
 
+-- Effects variant (Part H3): scale down and dip to black at the start and
+-- end of each track. `video.scale`/`video.fade` wrap any video.* marker,
+-- compose, and update the marker's size so the encoder follows it.
+-- vpl = video.fade({fade_in = 1, fade_out = 1},
+--                   video.scale({width = 640, height = 360}, vpl))
+
 root = fallback({j, live, pl})
 
 -- Serve /var/www/hls with any web server; clients point at index.m3u8

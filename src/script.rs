@@ -1517,6 +1517,62 @@ fn playlist_requests(opts: &Table) -> mlua::Result<Vec<RequestUri>> {
     Ok(requests)
 }
 
+/// Resolve a `video.*` marker's `__src` registry entry to the source's
+/// effect config, for `video.scale`/`video.fade` (Part H3).
+#[cfg(feature = "video")]
+fn marker_effects<'a>(
+    s: &'a mut ScriptState,
+    marker: &mlua::Table,
+) -> mlua::Result<&'a mut crate::video::VideoEffects> {
+    let src: String = marker.get("__src").map_err(|_| {
+        mlua::Error::runtime(
+            "video.scale/video.fade: argument must be a video.* marker \
+             (the return value of video.video/video.playlist/video.single/video.slideshow)",
+        )
+    })?;
+    let (kind, idx) = src
+        .split_once(':')
+        .ok_or_else(|| mlua::Error::runtime("video.scale/video.fade: malformed marker"))?;
+    let idx: usize = idx
+        .parse()
+        .map_err(|_| mlua::Error::runtime("video.scale/video.fade: malformed marker"))?;
+    match kind {
+        "video" => s.video.get_mut(idx).map(|c| &mut c.effects),
+        "playlist" => s.video_playlists.get_mut(idx).map(|c| &mut c.effects),
+        "slideshow" => s.video_slideshows.get_mut(idx).map(|c| &mut c.effects),
+        _ => None,
+    }
+    .ok_or_else(|| {
+        mlua::Error::runtime("video.scale/video.fade: marker refers to no registered source")
+    })
+}
+
+/// The first registered video track's spec — `video.video` first, then the
+/// first `video.playlist`/`video.single` track, then the first
+/// `video.slideshow` — shared by the video-enabled outputs (HLS and RTMP).
+/// Effects (Part H3) may rescale the published frames, so the encoder opens
+/// at the *scaled* spec. Playlist-level effects (a `video.scale` on a
+/// playlist marker) live on the sequence config, not on individual tracks.
+#[cfg(feature = "video")]
+pub fn first_video_spec(result: &ScriptResult) -> Option<crate::video::VideoSpec> {
+    result
+        .video
+        .first()
+        .map(|v| v.effects.scaled_spec(v.spec))
+        .or_else(|| {
+            result
+                .video_playlists
+                .first()
+                .and_then(|p| p.tracks.first().map(|t| p.effects.scaled_spec(t.spec)))
+        })
+        .or_else(|| {
+            result
+                .video_slideshows
+                .first()
+                .map(|s| s.effects.scaled_spec(s.spec))
+        })
+}
+
 /// Collect and validate the video tracks for a `video.playlist` table
 /// (`directory` and/or `files`), sorted and deduped. Every file is probed
 /// at script evaluation; unreadable files are skipped with a warning.
@@ -1537,7 +1593,11 @@ fn video_playlist_configs(opts: &Table) -> mlua::Result<Vec<crate::video::VideoC
     let mut tracks = Vec::new();
     for path in paths {
         match crate::video::VideoSource::validate(&path) {
-            Ok(spec) => tracks.push(crate::video::VideoConfig { path, spec }),
+            Ok(spec) => tracks.push(crate::video::VideoConfig {
+                path,
+                spec,
+                effects: Default::default(),
+            }),
             Err(e) => log::warn!("video playlist skipping {}: {e}", path.display()),
         }
     }
@@ -1635,6 +1695,7 @@ fn video_slideshow_configs(opts: &Table) -> mlua::Result<crate::video::Slideshow
         shuffle,
         loop_playlist,
         seed: None,
+        effects: Default::default(),
     })
 }
 
@@ -2362,11 +2423,16 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
             s.video.push(crate::video::VideoConfig {
                 path: path.clone().into(),
                 spec,
+                effects: Default::default(),
             });
+            let index = s.video.len() - 1;
             let info = lua.create_table()?;
             info.set("path", path)?;
             info.set("width", spec.width)?;
             info.set("height", spec.height)?;
+            // Marker registry for `video.scale`/`video.fade` (Part H3):
+            // which source this marker wraps.
+            info.set("__src", format!("video:{index}"))?;
             Ok(info)
         })?;
 
@@ -2387,11 +2453,14 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
                 shuffle,
                 loop_playlist,
                 seed: None,
+                effects: Default::default(),
             });
+            let index = s.video_playlists.len() - 1;
             let info = lua.create_table()?;
             info.set("count", count)?;
             info.set("width", spec.width)?;
             info.set("height", spec.height)?;
+            info.set("__src", format!("playlist:{index}"))?;
             Ok(info)
         })?;
 
@@ -2406,15 +2475,19 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
                 tracks: vec![crate::video::VideoConfig {
                     path: path.clone().into(),
                     spec,
+                    effects: Default::default(),
                 }],
                 shuffle: false,
                 loop_playlist: false,
                 seed: None,
+                effects: Default::default(),
             });
+            let index = s.video_playlists.len() - 1;
             let info = lua.create_table()?;
             info.set("path", path)?;
             info.set("width", spec.width)?;
             info.set("height", spec.height)?;
+            info.set("__src", format!("playlist:{index}"))?;
             Ok(info)
         })?;
         let video = lua.create_table()?;
@@ -2430,13 +2503,49 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
             s.video_tap
                 .get_or_insert_with(|| Arc::new(crate::video::VideoTap::new()));
             s.video_slideshows.push(cfg);
+            let index = s.video_slideshows.len() - 1;
             let info = lua.create_table()?;
             info.set("count", count)?;
             info.set("width", width)?;
             info.set("height", height)?;
+            info.set("__src", format!("slideshow:{index}"))?;
             Ok(info)
         })?;
         video.set("slideshow", slideshow_fn)?;
+        let scale_state = state.clone();
+        let scale_fn = lua.create_function(move |_lua, (opts, marker): (Table, Table)| {
+            let width: i64 = opts.get("width")?;
+            let height: i64 = opts.get("height")?;
+            if width <= 0 || height <= 0 {
+                return Err(mlua::Error::runtime(
+                    "video.scale: width/height must be positive",
+                ));
+            }
+            // YUV420P needs even dimensions (chroma is half resolution), so
+            // odd sizes round up to the next even.
+            let (w, h) = (((width + 1) / 2) * 2, ((height + 1) / 2) * 2);
+            let mut s = scale_state.borrow_mut();
+            let effects = marker_effects(&mut s, &marker)?;
+            effects.scale = Some((w as u32, h as u32));
+            marker.set("width", w)?;
+            marker.set("height", h)?;
+            Ok(marker)
+        })?;
+        video.set("scale", scale_fn)?;
+        let fade_state = state.clone();
+        let fade_fn = lua.create_function(move |_lua, (opts, marker): (Table, Table)| {
+            let fade_in: f64 = opts.get::<Option<f64>>("fade_in")?.unwrap_or(0.0);
+            let fade_out: f64 = opts.get::<Option<f64>>("fade_out")?.unwrap_or(0.0);
+            if fade_in < 0.0 || fade_out < 0.0 {
+                return Err(mlua::Error::runtime("video.fade: in/out must be >= 0"));
+            }
+            let mut s = fade_state.borrow_mut();
+            let effects = marker_effects(&mut s, &marker)?;
+            effects.fade_in_seconds = fade_in;
+            effects.fade_out_seconds = fade_out;
+            Ok(marker)
+        })?;
+        video.set("fade", fade_fn)?;
         globals.set("video", video)?;
     }
 
@@ -2888,6 +2997,145 @@ mod tests {
         assert!(res.video_tap.is_some(), "shared video tap created");
         std::fs::remove_file(&a).ok();
         std::fs::remove_file(&b).ok();
+    }
+
+    #[cfg(feature = "video")]
+    #[test]
+    fn video_scale_and_fade_apply_to_the_wrapped_source() {
+        use crate::video::testutil::render_test_clip;
+        let Some(path) = render_test_clip("fx-script") else {
+            return;
+        };
+        let path_str = path.display().to_string();
+        let (_rt, res) = run(&format!(
+            r#"
+            set("sample_rate", 44100)
+            output.preview(sine({{freq = 440, duration = 1}}))
+            local src = video.video("{path_str}")
+            local scaled = video.scale({{width = 640, height = 360}}, src)
+            local faded = video.fade({{fade_in = 1, fade_out = 2}}, scaled)
+            assert(scaled.width == 640, "scale updates the marker spec")
+            assert(scaled.height == 360, "scale updates the marker spec")
+            assert(faded.width == 640, "fade keeps the scaled spec")
+            "#
+        ))
+        .expect("script runs");
+        let cfg = &res.video[0];
+        assert_eq!(cfg.effects.scale, Some((640, 360)), "scale applied");
+        assert_eq!(cfg.effects.fade_in_seconds, 1.0, "fade-in applied");
+        assert_eq!(cfg.effects.fade_out_seconds, 2.0, "fade-out applied");
+        assert_eq!(
+            cfg.effects.scaled_spec(cfg.spec).width,
+            640,
+            "scaled spec drives the encoder"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[cfg(feature = "video")]
+    #[test]
+    fn video_scale_rounds_odd_sizes_up_and_rejects_bad_args() {
+        use crate::video::testutil::render_test_clip;
+        let Some(path) = render_test_clip("fx-script-odd") else {
+            return;
+        };
+        let path_str = path.display().to_string();
+        let (_rt, res) = run(&format!(
+            r#"
+            set("sample_rate", 44100)
+            output.preview(sine({{freq = 440, duration = 1}}))
+            local src = video.video("{path_str}")
+            local scaled = video.scale({{width = 321, height = 359}}, src)
+            assert(scaled.width == 322 and scaled.height == 360, "odd sizes round up to even")
+            "#
+        ))
+        .expect("script runs");
+        assert_eq!(res.video[0].effects.scale, Some((322, 360)));
+
+        // Positive/negative: scale with a zero dimension, fade with negative
+        // windows, and effects on a non-marker all fail fast.
+        let err = run(&format!(
+            r#"
+            set("sample_rate", 44100)
+            output.preview(sine({{freq = 440, duration = 1}}))
+            video.scale({{width = 0, height = 100}}, video.video("{path_str}"))
+            "#
+        ))
+        .err()
+        .expect("zero dimension fails");
+        assert!(err.to_string().contains("positive"), "{err}");
+
+        let err = run(&format!(
+            r#"
+            set("sample_rate", 44100)
+            output.preview(sine({{freq = 440, duration = 1}}))
+            video.fade({{fade_out = -1}}, video.video("{path_str}"))
+            "#
+        ))
+        .err()
+        .expect("negative fade fails");
+        assert!(err.to_string().contains(">= 0"), "{err}");
+
+        let err = run(r#"
+            set("sample_rate", 44100)
+            output.preview(sine({freq = 440, duration = 1}))
+            video.scale({width = 100, height = 100}, {path = "x"})
+        "#)
+        .err()
+        .expect("non-marker fails");
+        assert!(err.to_string().contains("video.* marker"), "{err}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[cfg(feature = "video")]
+    #[test]
+    fn video_scale_and_fade_apply_to_playlist_and_slideshow() {
+        use crate::video::testutil::{render_test_clip, render_test_solid};
+        let Some(a) = render_test_clip("fx-pl") else {
+            return;
+        };
+        let Some(img) = render_test_solid("fx-ss", 320, 240, "black") else {
+            return;
+        };
+        let (a_str, img_str) = (a.display().to_string(), img.display().to_string());
+        let (_rt, res) = run(&format!(
+            r#"
+            set("sample_rate", 44100)
+            output.preview(sine({{freq = 440, duration = 1}}))
+            local p = video.playlist({{files = {{"{a_str}"}}}})
+            video.fade({{fade_in = 0.5}}, p)
+            local ss = video.slideshow({{files = {{"{img_str}"}}, seconds_per_image = 1}})
+            video.scale({{width = 160, height = 120}}, ss)
+            "#
+        ))
+        .expect("script runs");
+        assert_eq!(res.video_playlists[0].effects.fade_in_seconds, 0.5);
+        assert_eq!(res.video_slideshows[0].effects.scale, Some((160, 120)));
+        // Regression: a playlist-level scale must drive the output spec —
+        // first_video_spec reads the sequence's effects, not the track's.
+        let spec = first_video_spec(&res).expect("a video spec");
+        assert_eq!(
+            (spec.width, spec.height),
+            (320, 240),
+            "playlist fade-only keeps the native spec"
+        );
+        let (_rt, res2) = run(&format!(
+            r#"
+            set("sample_rate", 44100)
+            output.preview(sine({{freq = 440, duration = 1}}))
+            local p = video.playlist({{files = {{"{a_str}"}}}})
+            video.scale({{width = 160, height = 120}}, p)
+            "#
+        ))
+        .expect("script runs");
+        let spec = first_video_spec(&res2).expect("a video spec");
+        assert_eq!(
+            (spec.width, spec.height),
+            (160, 120),
+            "playlist-level scale changes the output spec"
+        );
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&img).ok();
     }
 
     #[cfg(feature = "video")]
