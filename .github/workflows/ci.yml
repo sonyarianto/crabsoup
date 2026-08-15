@@ -18,7 +18,7 @@ jobs:
       - name: Install system libraries
         run: |
           sudo apt-get update
-          sudo apt-get install -y autoconf automake libtool libmp3lame-dev libopus-dev
+          sudo apt-get install -y autoconf automake libtool libmp3lame-dev libopus-dev libasound2-dev
 
       - name: Build fdk-aac (no distro package; see README)
         run: |
