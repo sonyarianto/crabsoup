@@ -586,23 +586,20 @@ impl AacEncoder {
     }
 }
 
-impl Encoder for AacEncoder {
-    fn content_type(&self) -> &'static str {
-        "audio/aac"
-    }
-
-    fn encode(&mut self, pcm: &[f32]) -> Vec<u8> {
-        self.encode_aus(pcm).concat()
-    }
-
-    fn finish(&mut self) -> Vec<u8> {
-        // FDK-AAC drains via repeated calls with numInSamples == -1 until it
-        // reports AACENC_ENCODE_EOF.
+impl AacEncoder {
+    /// Drain the encoder tail as one access unit per chunk. FDK-AAC drains
+    /// via repeated calls with numInSamples == -1 until it reports
+    /// AACENC_ENCODE_EOF. The MP4 output (Part H4) needs the frames
+    /// separated to assign each its own PTS; the `Encoder` trait's
+    /// `finish` concatenates them instead.
+    pub fn finish_aus(&mut self) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         let mut guard = 0;
         loop {
             let (chunk, status, _) = self.encode_call(&[], true);
-            out.extend_from_slice(&chunk);
+            if !chunk.is_empty() {
+                out.push(chunk);
+            }
             if status == AACENC_ENCODE_EOF {
                 break;
             }
@@ -613,6 +610,20 @@ impl Encoder for AacEncoder {
             }
         }
         out
+    }
+}
+
+impl Encoder for AacEncoder {
+    fn content_type(&self) -> &'static str {
+        "audio/aac"
+    }
+
+    fn encode(&mut self, pcm: &[f32]) -> Vec<u8> {
+        self.encode_aus(pcm).concat()
+    }
+
+    fn finish(&mut self) -> Vec<u8> {
+        self.finish_aus().concat()
     }
 }
 

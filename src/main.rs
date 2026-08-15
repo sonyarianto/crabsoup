@@ -12,6 +12,8 @@ use crabsoup::live::harbor::Harbor;
 use crabsoup::output::file::FileOutput;
 use crabsoup::output::hls::HlsOutput;
 use crabsoup::output::icecast::IcecastOutput;
+#[cfg(feature = "video")]
+use crabsoup::output::mp4::Mp4Output;
 #[cfg(feature = "rtmp")]
 use crabsoup::output::rtmp::RtmpOutput;
 use crabsoup::output::soundcard::SoundcardOutput;
@@ -276,6 +278,36 @@ fn main() -> crabsoup::Result<()> {
             }
             output.run()
         }));
+    }
+
+    // MP4 outputs (Part H4): the file and streams are opened up front so a
+    // bad path fails fast; the consumer thread then interleaves A/V into
+    // the recording.
+    #[cfg(feature = "video")]
+    let mp4 = if cli.preview {
+        Vec::new()
+    } else {
+        result.mp4_outputs.clone()
+    };
+    #[cfg(feature = "video")]
+    for cfg in &mp4 {
+        // Part H4: an MP4 output marked `video` subscribes to the shared
+        // video tap; the first registered track's spec drives the H.264
+        // encoder.
+        let mp4_video = if cfg.video {
+            let tap = result.video_tap.clone().ok_or_else(|| {
+                "output.mp4({video = ...}) requires a video source in the script".to_string()
+            })?;
+            let spec = first_video_spec(&result)
+                .ok_or_else(|| "output.mp4 video track has no spec".to_string())?;
+            Some((tap.register(), spec))
+        } else {
+            None
+        };
+        let mut output = Mp4Output::new(cfg.clone(), tap.register(), spec.rate, chans, mp4_video);
+        output.set_shutdown(shutdown.clone());
+        output.connect().map_err(|e| format!("output.mp4: {e}"))?;
+        handles.push(std::thread::spawn(move || output.run()));
     }
 
     // Soundcard outputs: the device and stream are opened up front so a

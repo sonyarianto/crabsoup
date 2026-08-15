@@ -633,8 +633,29 @@ ships its inline tests and a `benches/` row.
       Performance baseline: `video/scale/640x360_to_320x180` ~1.09 ms/frame,
       `video/blend/crossfade_planes` ~29 µs/frame, `video/encode/
       h264_640x360` ~1.15 ms/frame (each well under the 40 ms/frame budget).
-- [ ] **H4 — video encoders:** H.264/H.265/VP8/VP9 via FFI, muxed with the
+- [x] **H4 — video encoders:** H.264/H.265/VP8/VP9 via FFI, muxed with the
       existing Opus/AAC/MP3 audio encoders into MPEG-TS/MP4.
+      **Shipped (MP4 file recording, `output.mp4`, behind the `video`
+      cargo feature):** `output.mp4({file, bitrate, video = marker}, source)`
+      in script.rs records the tap to a seekable MP4 via ffmpeg-next's `mov`
+      muxer — FDK-AAC on the raw transport (raw access units + ASC codecpar
+      extradata, no ADTS) and, when given a video-source marker, the shared
+      `VideoTap` through the H6 H.264 encoder (the avcC codecpar extradata
+      built from the first access unit's SPS/PPS via the FLV helpers, then
+      length-prefixed samples as `ff_isom_write_avcc` expects). New
+      `src/output/mp4.rs` mirrors the RTMP interleave model (audio clock
+      gates video AU flushing, periodic forced IDRs every ~2 s keep long
+      recordings seekable); the container header is deferred until the H.264
+      parameter sets exist (audio AUs parked), audio-only files start it at
+      connect. ffmpeg-next has no safe setters for the codec id or codecpar
+      extradata, so the module carries a small FFI shim (`av_malloc`'d
+      buffers into `AVCodecContext`/`AVCodecParameters` — the crate rule
+      reserves `unsafe` for FFI). Inline tests: audio-only and h264+aac
+      recordings through `Mp4Output` probed with ffprobe (skip without
+      ffmpeg). **Verified live:** an audio-only run (real MP3) and an A/V
+      run (8 s testsrc clip + 3 s sine) both decode clean with `ffmpeg -f
+      null -`, ffprobe reporting aac audio and h264 video at the source
+      resolution (640x360, no rescale) with the expected durations.
 - [x] **H5 — RTMP output** (`output.rtmp`): `librtmp` FFI; verified live
       against nginx-rtmp (below, Part H5 landing note).
       **Shipped (behind the `rtmp` cargo feature):** `output.rtmp({url,

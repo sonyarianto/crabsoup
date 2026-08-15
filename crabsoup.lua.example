@@ -97,3 +97,11 @@ output.icecast({host = "localhost", port = 8000,
 -- -- output.rtmp({url = "rtmp://localhost/live/stream", bitrate = 128000,
 -- --              video = vpl},
 -- --             fallback({j, live, pl}))
+
+-- MP4 file recording (video build only: `cargo build --release --features
+-- video`; drop `video = vpl` and the vpl line for audio-only). The file is
+-- opened at script start and finalized with the moov trailer when the tap
+-- ends or on shutdown, so it is always seekable.
+-- -- vpl = video.playlist({directory = "./media/video", loop = true})
+-- -- output.mp4({file = "/tmp/out.mp4", bitrate = 128000, video = vpl},
+-- --            fallback({j, live, pl}))

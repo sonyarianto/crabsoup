@@ -65,6 +65,8 @@ pub struct ScriptResult {
     pub hls_outputs: Vec<HlsOutputConfig>,
     #[cfg(feature = "rtmp")]
     pub rtmp_outputs: Vec<crate::config::RtmpOutputConfig>,
+    #[cfg(feature = "video")]
+    pub mp4_outputs: Vec<crate::config::Mp4OutputConfig>,
     pub soundcard_outputs: Vec<SoundcardOutputConfig>,
     /// Shared state of the `request.queue` source, handed to the telnet
     /// server for `queue.push`/`queue.list`/`queue.clear`/`queue.skip`.
@@ -107,6 +109,8 @@ struct ScriptState {
     hls_outputs: Vec<HlsOutputConfig>,
     #[cfg(feature = "rtmp")]
     rtmp_outputs: Vec<crate::config::RtmpOutputConfig>,
+    #[cfg(feature = "video")]
+    mp4_outputs: Vec<crate::config::Mp4OutputConfig>,
     soundcard_outputs: Vec<SoundcardOutputConfig>,
     request_queue: Option<Arc<RequestQueue>>,
     /// Named telnet commands registered by `server.register(name, fn)`;
@@ -2803,6 +2807,50 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
             })?,
         )?;
     }
+    // `output.mp4({file = ..., bitrate, video = marker}, root)` (Part H4):
+    // mux the tap into a seekable MP4 recording. Video, when given a
+    // video-source marker, subscribes to the shared tap exactly like
+    // `output.hls({video = ...})`. Requires the `video` feature (the muxer
+    // is ffmpeg).
+    #[cfg(feature = "video")]
+    {
+        let mp4_state = state.clone();
+        output.set(
+            "mp4",
+            lua.create_function(move |_, (opts, mut source): (Table, LuaSource)| {
+                let path: String = opts
+                    .get("file")
+                    .map_err(|_| mlua::Error::runtime("output.mp4: file is required"))?;
+                let video: Option<Table> = opts.get("video")?;
+                let has_video = video.is_some();
+                if has_video {
+                    // `video` must be a marker returned by the `video.*`
+                    // operators; that call also created the shared tap the
+                    // output subscribes to at startup.
+                    let s = mp4_state.borrow();
+                    if s.video_tap.is_none()
+                        || (s.video.is_empty()
+                            && s.video_playlists.is_empty()
+                            && s.video_slideshows.is_empty())
+                    {
+                        return Err(mlua::Error::runtime(
+                            "output.mp4({video = ...}) requires a video.video/\
+                             video.playlist/video.slideshow source registered first",
+                        ));
+                    }
+                }
+                let cfg = crate::config::Mp4OutputConfig {
+                    path: path.into(),
+                    bitrate: opts.get("bitrate").unwrap_or(128_000),
+                    video: has_video,
+                };
+                let mut s = mp4_state.borrow_mut();
+                claim_root(&mut s, &mut source)?;
+                s.mp4_outputs.push(cfg);
+                Ok(())
+            })?,
+        )?;
+    }
     globals.set("output", output)?;
 
     // ---- metadata hooks (Liquidsoap `on_metadata`, `on_track`) ---------------
@@ -2870,6 +2918,8 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         hls_outputs: std::mem::take(&mut s.hls_outputs),
         #[cfg(feature = "rtmp")]
         rtmp_outputs: std::mem::take(&mut s.rtmp_outputs),
+        #[cfg(feature = "video")]
+        mp4_outputs: std::mem::take(&mut s.mp4_outputs),
         soundcard_outputs: std::mem::take(&mut s.soundcard_outputs),
         request_queue: s.request_queue.take(),
         custom_commands: s.custom_commands.iter().map(|(n, _)| n.clone()).collect(),
@@ -4476,6 +4526,50 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("directory is required"));
+    }
+
+    #[cfg(feature = "video")]
+    #[test]
+    fn mp4_output_registers_and_defaults() {
+        let (_rt, res) = run(r#"
+            src = sine({freq = 440, duration = 1})
+            output.mp4({file = "/tmp/crabsoup-out.mp4"}, src)
+            "#)
+        .expect("script runs");
+        assert_eq!(res.mp4_outputs.len(), 1);
+        assert_eq!(
+            res.mp4_outputs[0].path.to_str(),
+            Some("/tmp/crabsoup-out.mp4")
+        );
+        assert_eq!(res.mp4_outputs[0].bitrate, 128_000);
+        assert!(!res.mp4_outputs[0].video, "video defaults to false");
+    }
+
+    #[cfg(feature = "video")]
+    #[test]
+    fn mp4_output_requires_file() {
+        let err = match run(r#"
+            output.mp4({}, sine({freq = 440}))
+            "#)
+        {
+            Ok(_) => panic!("output.mp4 without file must fail"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("file is required"));
+    }
+
+    #[cfg(feature = "video")]
+    #[test]
+    fn mp4_output_video_marker_requires_video_source() {
+        let err = match run(r#"
+            output.mp4({file = "/tmp/crabsoup-out.mp4", video = {}},
+                       sine({freq = 440}))
+            "#)
+        {
+            Ok(_) => panic!("output.mp4({{video = ...}}) without a video source must fail"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("requires a video"));
     }
 
     #[test]

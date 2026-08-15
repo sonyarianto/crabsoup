@@ -31,6 +31,10 @@ Opus) to an Icecast server.
   as FLV (raw AAC, optional H.264 video with `video = marker`) to any RTMP
   server such as nginx-rtmp or YouTube Live, with the Icecast-style
   reconnect loop. Audio-only with just `rtmp`; add `video` for h264+aac.
+- **MP4 recording (Part H4, `--features video`)**: `output.mp4` records the
+  tap to a seekable MP4 file (AAC-LC, optional H.264 video with
+  `video = marker`) via FFmpeg's mov muxer — the file is opened at script
+  start and finalized with the moov trailer on shutdown.
 - Graceful Ctrl-C shutdown
 
 ## Architecture
@@ -116,6 +120,7 @@ Per-format test scripts live in `examples/`:
 ./target/release/crabsoup -c examples/crabsoup.preview.lua # no broadcast
 ./target/release/crabsoup -c examples/crabsoup.video.lua    # file -> HLS(video)
 ./target/release/crabsoup -c examples/crabsoup.rtmp.lua     # file -> RTMP (nginx-rtmp)
+./target/release/crabsoup -c examples/crabsoup.mp4.lua      # file -> MP4 recording
 ```
 
 With an `output.icecast` call it connects to Icecast as a source. Without one

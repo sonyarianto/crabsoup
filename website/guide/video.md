@@ -1,14 +1,15 @@
 # Video
 
-Video support turns a Crabsoup install into a file → HLS(video) and file →
-RTMP engine: a video source feeds a decode thread that paces frames to
-their PTS on a shared fan-out tap, and `output.hls({video = ...})` muxes
-those frames — encoded live to H.264 — into the same MPEG-TS segments as
-the audio. The result is a master playlist (`index.m3u8`) plus the usual
-per-segment media playlist, all keyframe-aligned so players can join
-mid-stream. `output.rtmp({video = ...})` muxes the same frames into an
-FLV stream (H.264 + raw AAC) and publishes it to an RTMP server such as
-nginx-rtmp.
+Video support turns a Crabsoup install into a file → HLS(video), file →
+RTMP, and file → MP4 recording engine: a video source feeds a decode thread
+that paces frames to their PTS on a shared fan-out tap, and
+`output.hls({video = ...})` muxes those frames — encoded live to H.264 —
+into the same MPEG-TS segments as the audio. The result is a master
+playlist (`index.m3u8`) plus the usual per-segment media playlist, all
+keyframe-aligned so players can join mid-stream. `output.rtmp({video =
+...})` muxes the same frames into an FLV stream (H.264 + raw AAC) and
+publishes it to an RTMP server such as nginx-rtmp. `output.mp4({video =
+...})` muxes them into a seekable MP4 recording.
 
 Video is compiled in with the `video` cargo feature and needs the FFmpeg
 dev packages at build time (they are pulled via pkg-config):
@@ -89,7 +90,7 @@ vpl = video.fade({fade_in = 1},
   duration (playlists) or the whole show's length (slideshows); looping
   sources have no end, so `fade_out` is ignored for them.
 - Effects run on the source's render thread (scale first, then fade), so
-  every output — HLS or RTMP — gets the processed frames.
+  every output — HLS, RTMP, or MP4 — gets the processed frames.
 
 ### The audio side
 
@@ -166,6 +167,39 @@ Verify a running stream with `rtmpdump` (the `librtmp` CLI):
 ```sh
 timeout 10 rtmpdump -r rtmp://localhost/live/stream -o /tmp/cap.flv
 ffprobe -show_entries stream=codec_name,width,height /tmp/cap.flv
+```
+
+## `output.mp4` (H.264 + AAC recording)
+
+Pass any video source's marker to `output.mp4` to record the tap into a
+seekable MP4 (video optional, audio is always AAC-LC); `file` is required:
+
+```lua
+-- audio-only recording
+output.mp4({file = "shows/tonight.mp4", bitrate = 128000}, root)
+
+-- h264 + aac recording
+output.mp4({file = "shows/tonight.mp4", video = vpl,
+            bitrate = 128000}, root)
+```
+
+- The file is opened at script start (a bad path fails fast) and finalized
+  with the `moov` trailer when the tap ends or on shutdown — the recording
+  is always seekable.
+- The video side is identical to HLS/RTMP: subscribed to the shared
+  `VideoTap`, encoded to H.264 baseline, held until the audio clock
+  catches up. A periodic forced keyframe (~2 s) keeps long recordings
+  seekable.
+- The container is FFmpeg's `mov` muxer via ffmpeg-next, fed raw AAC
+  access units (no ADTS) plus length-prefixed H.264 — the same elementary
+  streams HLS and RTMP carry, so a recording and a live stream stay in
+  sync.
+
+Verify a recording the way the tests do:
+
+```sh
+ffprobe -show_entries stream=codec_type,codec_name,width,height show.mp4
+ffmpeg -v error -i show.mp4 -f null -     # decodes without errors
 ```
 
 ## Example

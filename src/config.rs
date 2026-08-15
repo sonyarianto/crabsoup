@@ -130,6 +130,21 @@ pub struct RtmpOutputConfig {
     pub video: bool,
 }
 
+/// Config for `output.mp4` (Part H4): mux the tap into an MP4 file (AAC
+/// audio, optional H.264 video) via ffmpeg's mov muxer. Requires the
+/// `video` feature.
+#[cfg(feature = "video")]
+#[derive(Debug, Clone)]
+pub struct Mp4OutputConfig {
+    /// Output file path (must end in `.mp4`).
+    pub path: PathBuf,
+    /// AAC encoder bitrate in bits per second.
+    pub bitrate: u32,
+    /// Mux the shared video tap into the MP4: requires a video source
+    /// registered in the same script.
+    pub video: bool,
+}
+
 impl Default for HlsOutputConfig {
     fn default() -> Self {
         Self {

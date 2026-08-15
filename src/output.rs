@@ -4,6 +4,8 @@ pub mod flv;
 pub mod hls;
 pub mod icecast;
 pub mod icecast_client;
+#[cfg(feature = "video")]
+pub mod mp4;
 pub mod mpegts;
 pub mod ogg_mux;
 #[cfg(feature = "rtmp")]

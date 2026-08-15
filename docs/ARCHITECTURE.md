@@ -477,6 +477,25 @@ Video is a parallel side-channel to the PCM bus, compiled out by default
 - **Master playlist**: `index.m3u8` (`#EXT-X-STREAM-INF`, RESOLUTION from
   the track spec, static CODECS) is written next to `playlist.m3u8` when
   `output.hls({video = ...})` is configured.
+- **MP4 recording (Part H4, `--features video`)**: `output.mp4`
+  (`src/output/mp4.rs`) records the tap to a seekable MP4 through
+  ffmpeg-next's `mov` muxer. Audio is FDK-AAC on the raw transport (raw
+  access units, no ADTS; the AudioSpecificConfig from `aacEncInfo` becomes
+  the `esds` codecpar extradata). With `video = marker` it subscribes to
+  the `VideoTap` like HLS/RTMP and muxes H.264 access units gated on the
+  audio clock, with periodic forced IDRs (~2 s) keeping the recording
+  seekable. The mov muxer needs the avcC in the stream's codecpar (first
+  byte 0x01) and length-prefixed samples (`ff_isom_write_avcc` writes
+  packet data as-is then), so `mp4.rs` builds avcC from the first access
+  unit's SPS/PPS via the FLV helpers and repacks each AU with
+  `flv::avcc_nalus`. The container header is deferred until those
+  parameter sets exist (audio AUs park in `pending_audio`); audio-only
+  files start the header at `connect`. ffmpeg-next exposes no safe setters
+  for the codec id or codecpar extradata, so the module carries a small FFI
+  shim (`av_malloc`'d buffers into `AVCodecContext`/`AVCodecParameters` —
+  alongside the encoder FFI, the only `unsafe` surface). The file is
+  opened up front in `connect` so a bad path fails at startup; `run` writes
+  the trailer (moov) when the tap closes or on shutdown.
 
 ## Gotchas that have burned previous work
 
@@ -498,6 +517,17 @@ Video is a parallel side-channel to the PCM bus, compiled out by default
   always carry it so the size matches. The nginx-rtmp `codec: error
   parsing data frame` line is benign (its codec module warns while
   extracting metadata; relaying is unaffected).
+- MP4/movenc (Part H4): the mov muxer decides how to write packets from
+  the codecpar extradata. When the H.264 extradata's first byte is 0x01
+  (avcC) it writes packet data as-is — so feed length-prefixed access
+  units (`flv::avcc_nalus`) with an avcC built from SPS/PPS
+  (`flv::parameter_sets` → `flv::avcdcr`); without that it would try to
+  parse Annex-B from packet data and mis-size samples. AAC packets are
+  written as-is, so raw access units (no ADTS) + the ASC extradata are
+  correct. ffmpeg-next 7.x offers no safe setter for codecpar extradata or
+  the codec id, so `mp4.rs` pokes the `AVCodecContext`/`AVCodecParameters`
+  structs directly with `av_malloc`'d buffers (FFI is the crate's one
+  sanctioned `unsafe` surface).
 - `FallbackSource::label()` reports the *next* child's label the moment the
   current child exhausts (even on the current track's last pull), because
   it follows `active()`. Harmless for `on_metadata` (an event fires one
