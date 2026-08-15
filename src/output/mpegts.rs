@@ -13,28 +13,42 @@ const SYNC: u8 = 0x47;
 const PAT_PID: u16 = 0x0000;
 const PMT_PID: u16 = 0x1000;
 const AUDIO_PID: u16 = 0x1001;
+/// Part H6: the video elementary stream PID when `video` is enabled.
+const VIDEO_PID: u16 = 0x1002;
 /// ISO/IEC 13818-1 stream_type for ADTS AAC.
 const STREAM_TYPE_AAC: u8 = 0x0F;
+/// stream_type for H.264 (MPEG-4 AVC) video.
+const STREAM_TYPE_H264: u8 = 0x1B;
 /// PCR stamp period, ~100 ms in 90 kHz units.
 const PCR_INTERVAL: u64 = 9000;
 
-/// Muxes one AAC/ADTS program into 188-byte transport packets.
+/// Muxes one AAC/ADTS program into 188-byte transport packets. With
+/// `video`, the PMT also lists an H.264 elementary stream and
+/// [`MpegTsMuxer::push_video`] wraps access units on a second PID.
 pub struct MpegTsMuxer {
+    has_video: bool,
     cc_pat: u8,
     cc_pmt: u8,
     cc_audio: u8,
+    cc_video: u8,
     /// PTS at which the last PCR was stamped (90 kHz).
     last_pcr_pts: u64,
 }
 
 impl MpegTsMuxer {
-    pub fn new() -> Self {
+    pub fn new(has_video: bool) -> Self {
         Self {
+            has_video,
             cc_pat: 0,
             cc_pmt: 0,
             cc_audio: 0,
+            cc_video: 0,
             last_pcr_pts: u64::MAX,
         }
+    }
+
+    pub fn has_video(&self) -> bool {
+        self.has_video
     }
 
     /// Append the PAT and PMT sections, one PUSI packet each. Emitted at the
@@ -53,15 +67,22 @@ impl MpegTsMuxer {
         let crc = crc32_init(0xffff_ffff, &pat, &[]);
         pat.extend_from_slice(&crc.to_be_bytes());
 
+        // PMT: PCR_PID (audio) + one stream descriptor per active stream.
+        let extra = if self.has_video { 5 } else { 0 };
         let mut pmt = Vec::new();
         pmt.push(0x02); // table_id
-        pmt.extend_from_slice(&[0xb0, 0x12]); // section_length = 18
+        pmt.extend_from_slice(&[0xb0, (18 + extra) as u8]); // section_length
         pmt.extend_from_slice(&[0x00, 0x01]); // program_number
         pmt.push(0xc1); // version 0, current_next
         pmt.push(0x00); // section_number
         pmt.push(0x00); // last_section_number
         pmt.extend_from_slice(&pid_hi(AUDIO_PID)); // PCR_PID
         pmt.extend_from_slice(&[0x0f, 0x00]); // program_info_length (0)
+        if self.has_video {
+            pmt.push(STREAM_TYPE_H264);
+            pmt.extend_from_slice(&pid_hi(VIDEO_PID));
+            pmt.extend_from_slice(&[0x0f, 0x00]); // ES_info_length (0)
+        }
         pmt.push(STREAM_TYPE_AAC);
         pmt.extend_from_slice(&pid_hi(AUDIO_PID));
         pmt.extend_from_slice(&[0x0f, 0x00]); // ES_info_length (0)
@@ -125,6 +146,30 @@ impl MpegTsMuxer {
             self.last_pcr_pts = pts_90k;
         }
     }
+
+    /// Wrap one H.264 access unit in a PES packet (stream_id 0xE0) and emit
+    /// the TS packets. No DTS field: the encoder guarantees PTS == DTS.
+    pub fn push_video(&mut self, au: &[u8], pts_90k: u64, out: &mut Vec<u8>) {
+        let mut header = [0u8; 14];
+        header[0..3].copy_from_slice(&[0x00, 0x00, 0x01]);
+        header[3] = 0xE0;
+        let pes_len = 3 + 5 + au.len();
+        header[4] = (pes_len >> 8) as u8;
+        header[5] = pes_len as u8;
+        header[6] = 0x80; // data_alignment_indicator
+        header[7] = 0x80; // PTS present, no DTS
+        header[8] = 5;
+        header[9] = 0x21 | (((pts_90k >> 29) & 0x0e) as u8);
+        header[10] = (pts_90k >> 22) as u8;
+        header[11] = (((pts_90k >> 14) & 0xfe) | 1) as u8;
+        header[12] = (pts_90k >> 7) as u8;
+        header[13] = (((pts_90k << 1) & 0xfe) | 1) as u8;
+
+        let mut pes = Vec::with_capacity(header.len() + au.len());
+        pes.extend_from_slice(&header);
+        pes.extend_from_slice(au);
+        packetize(&pes, VIDEO_PID, None, &mut self.cc_video, out);
+    }
 }
 
 /// Slice `payload` into 188-byte packets (PUSI on the first), optionally
@@ -176,7 +221,7 @@ fn packetize(payload: &[u8], pid: u16, pcr: Option<u64>, cc: &mut u8, out: &mut 
 
 impl Default for MpegTsMuxer {
     fn default() -> Self {
-        Self::new()
+        Self::new(false)
     }
 }
 
@@ -212,7 +257,7 @@ mod tests {
 
     #[test]
     fn packets_are_188_bytes_with_sync_and_continuity() {
-        let mut mux = MpegTsMuxer::new();
+        let mut mux = MpegTsMuxer::new(false);
         let mut out = Vec::new();
         mux.write_program(&mut out);
         assert_eq!(out.len(), 2 * TS_PACKET_SIZE);
@@ -230,7 +275,7 @@ mod tests {
     // timestamp) — they document the layout, so allow the erasing-op lint.
     #[allow(clippy::erasing_op)]
     fn adts_wraps_in_pes_with_pts() {
-        let mut mux = MpegTsMuxer::new();
+        let mut mux = MpegTsMuxer::new(false);
         let mut out = Vec::new();
         // A realistic-size ADTS frame (200 bytes, as an AAC-LC 128 kbps
         // stereo frame would be) so the first TS packet carries the whole
@@ -269,5 +314,42 @@ mod tests {
         let frames = split_adts(&data);
         assert_eq!(frames.len(), 3);
         assert_eq!(frames.iter().map(|f| f.len()).sum::<usize>(), data.len());
+    }
+
+    #[test]
+    fn video_pmt_lists_video_stream_and_au_packets_on_video_pid() {
+        let mut mux = MpegTsMuxer::new(true);
+        let mut out = Vec::new();
+        mux.write_program(&mut out);
+        assert_eq!(out.len(), 2 * TS_PACKET_SIZE);
+        // PMT (second packet): TS header (4) + pointer_field (1), then the
+        // section: table_id 0x02, section_length 0x17 (video + audio entries,
+        // vs 0x12 audio-only).
+        assert_eq!(out[TS_PACKET_SIZE + 5], 0x02);
+        assert_eq!(out[TS_PACKET_SIZE + 6], 0xb0);
+        assert_eq!(out[TS_PACKET_SIZE + 7], 0x17);
+        // PMT payload: program_info, then video stream_type 0x1B + VIDEO_PID,
+        // then audio stream_type 0x0F + AUDIO_PID.
+        let pmt = &out[TS_PACKET_SIZE + 5..];
+        assert_eq!(pmt[12..13], [0x1b]);
+        assert_eq!(pmt[13..15], pid_hi(VIDEO_PID));
+        assert_eq!(pmt[17..18], [STREAM_TYPE_AAC]);
+        assert_eq!(pmt[18..20], pid_hi(AUDIO_PID));
+
+        // A small Annex-B access unit (start code + NAL type 5, IDR).
+        let au = [0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x00, 0x00];
+        mux.push_video(&au, 0, &mut out);
+        let first = &out[2 * TS_PACKET_SIZE..3 * TS_PACKET_SIZE];
+        assert_eq!(first[0], SYNC);
+        let pid = (((first[1] & 0x1f) as u16) << 8) | first[2] as u16;
+        assert_eq!(pid, VIDEO_PID);
+        // PUSI set; the tiny AU leaves stuffing in the adaptation field, so
+        // the first packet is adaptation + payload and the PES header sits
+        // after it at 4 + 1 + af_len (af_len = 188 - 4 - 23 - 1 = 160).
+        assert_ne!(first[1] & 0x40, 0);
+        assert_eq!(first[3] & 0x30, 0x30, "adaptation + payload");
+        assert_eq!(first[4], 160);
+        assert_eq!(&first[165..168], &[0x00, 0x00, 0x01]);
+        assert_eq!(first[168], 0xe0);
     }
 }

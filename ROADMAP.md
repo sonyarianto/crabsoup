@@ -561,8 +561,8 @@ ships its inline tests and a `benches/` row.
       engine wiring in `main.rs` (one decode thread per registered track,
       handles alive for the process lifetime). Audio decode stays on
       symphonia — ffmpeg-next is only for video decode and the future
-      mux/encode outputs. Remaining for H1/H6: A/V interleaving in an
-      output (a video consumer subscribing to the tap at mux time).
+      mux/encode outputs. A/V interleaving in an output shipped with H6
+      (the HLS segmenter subscribes to the tap at mux time).
 - [ ] **H2 — slideshow / image source** (`slideshow()`): images rendered to
       frames with optional transitions.
 - [ ] **H3 — basic video effects:** `video.fade` (in/out), `video.scale`.
@@ -573,6 +573,22 @@ ships its inline tests and a `benches/` row.
 - [ ] **H6 — HLS video:** extend the existing `output.hls`
       (`src/output/hls.rs`) to video segments + master playlists — audio HLS
       already exists, so this is an extension, not a new output.
+      **A/V interleaving shipped:** `output.hls({video = ...})` (the marker
+      `video.video(path)` returns) subscribes the segmenter to the shared
+      `VideoTap`. `src/video/encode.rs` wraps libx264 via ffmpeg-next
+      (baseline/ultrafast/zerolatency, 90 kHz time base, PTS == DTS, Annex-B
+      out — including repacking AVCC if it ever appears); `MpegTsMuxer`
+      gained a video PID + PMT video entry + `push_video` (PES stream id
+      0xE0, no DTS field); `src/output/hls.rs` `VideoTrack` encodes on the
+      mux thread with one-frame lookahead plus a PTS-ordered pending queue,
+      `flush_up_to(audio_pts)` before each audio frame and
+      `flush_remaining` at EOF, and segment rotation carries `has_video`.
+      End-to-end test: 1 s testsrc + sine audio through `HlsOutput`, every
+      segment probed with ffprobe (first segment must be h264+aac; audio
+      must survive every segment; skips without ffmpeg). **Known follow-up:**
+      segments currently start mid-GOP (no IDR on rotation) — players
+      joining at the playlist head are fine; keyframe-aligned segment
+      starts are a later improvement.
 - [ ] **H7 — video playlist** (`playlist`/`single` over video files) +
       **H8 — video streaming guide + examples**.
 

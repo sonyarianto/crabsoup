@@ -109,6 +109,9 @@ pub struct HlsOutputConfig {
     pub segment_seconds: f64,
     /// How many completed segments the on-disk window keeps.
     pub retention: usize,
+    /// Mux the shared video tap into the segments (Part H6): requires
+    /// `video.video(path)` registered in the same script.
+    pub video: bool,
 }
 
 impl Default for HlsOutputConfig {
@@ -117,6 +120,7 @@ impl Default for HlsOutputConfig {
             directory: "hls".into(),
             segment_seconds: 5.0,
             retention: 12,
+            video: false,
         }
     }
 }

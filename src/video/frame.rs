@@ -6,6 +6,7 @@
 //! `AudioFrame`, so the audio hot path is untouched.
 
 /// One decoded YUV420P picture.
+#[derive(Clone)]
 pub struct VideoFrame {
     /// Presentation timestamp in microseconds since stream start.
     pub pts_us: u64,

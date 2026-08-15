@@ -2369,10 +2369,32 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
             let directory: String = opts
                 .get("directory")
                 .map_err(|_| mlua::Error::runtime("output.hls: directory is required"))?;
+            let video: Option<Table> = opts.get("video")?;
+            let has_video = video.is_some();
+            if has_video {
+                // `video` must be the marker returned by `video.video(path)`;
+                // that call also created the shared tap the output subscribes
+                // to at startup.
+                let s = hls_state.borrow();
+                #[cfg(feature = "video")]
+                if s.video_tap.is_none() || s.video.is_empty() {
+                    return Err(mlua::Error::runtime(
+                        "output.hls({video = ...}) requires video.video(path) registered first",
+                    ));
+                }
+                #[cfg(not(feature = "video"))]
+                {
+                    let _ = s;
+                    return Err(mlua::Error::runtime(
+                        "output.hls({video = ...}) needs a video build (--features video)",
+                    ));
+                }
+            }
             let cfg = HlsOutputConfig {
                 directory: directory.into(),
                 segment_seconds: opts.get("segment_seconds").unwrap_or(5.0),
                 retention: opts.get("retention").unwrap_or(12),
+                video: has_video,
             };
             let mut s = hls_state.borrow_mut();
             claim_root(&mut s, &mut source)?;

@@ -198,7 +198,25 @@ fn main() -> crabsoup::Result<()> {
         result.hls_outputs.clone()
     };
     for cfg in &hls {
-        let mut output = HlsOutput::new(cfg.clone(), tap.register(), spec.rate, chans);
+        // Part H6: an HLS output marked `video` subscribes to the shared
+        // video tap; the first registered track's spec drives the encoder.
+        #[cfg(feature = "video")]
+        let hls_video = if cfg.video {
+            let tap = result.video_tap.clone().ok_or_else(|| {
+                "output.hls({video = ...}) requires video.video(path) in the script".to_string()
+            })?;
+            let spec = result
+                .video
+                .first()
+                .map(|v| v.spec)
+                .ok_or_else(|| "output.hls video track has no spec".to_string())?;
+            Some((tap.register(), spec))
+        } else {
+            None
+        };
+        #[cfg(not(feature = "video"))]
+        let hls_video = ();
+        let mut output = HlsOutput::new(cfg.clone(), tap.register(), spec.rate, chans, hls_video);
         output.set_shutdown(shutdown.clone());
         output.connect().map_err(|e| format!("output.hls: {e}"))?;
         handles.push(std::thread::spawn(move || output.run()));
