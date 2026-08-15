@@ -22,6 +22,25 @@ pub struct AudioFrame {
     pub(crate) pool: Option<Arc<FramePool>>,
 }
 
+/// Block for the next frame, waking every 100 ms to re-check `shutdown`.
+/// Consumer loops use this so they exit on Ctrl-C instead of blocking
+/// forever in `recv()` once the puller has stopped publishing frames.
+pub fn recv_frame_or_shutdown(
+    rx: &Receiver<Arc<AudioFrame>>,
+    shutdown: &AtomicBool,
+) -> Option<Arc<AudioFrame>> {
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return None;
+        }
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(frame) => return Some(frame),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
+        }
+    }
+}
+
 impl Drop for AudioFrame {
     fn drop(&mut self) {
         if let Some(pool) = self.pool.take() {

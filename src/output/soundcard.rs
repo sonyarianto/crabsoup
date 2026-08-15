@@ -21,7 +21,7 @@ use ringbuf::{HeapCons, HeapProd, HeapRb, traits::*};
 
 use crate::Result;
 use crate::config::SoundcardOutputConfig;
-use crate::engine::tap::AudioFrame;
+use crate::engine::tap::{AudioFrame, recv_frame_or_shutdown};
 use crate::resample::SincResampler;
 
 /// Ring capacity in device frames (double-buffered against the callback).
@@ -203,11 +203,7 @@ impl SoundcardOutput {
     /// or shutdown is requested. Dropping the driver thread at the end
     /// closes the device.
     pub fn run(&mut self) -> Result<()> {
-        while let Ok(frame) = self.rx.recv() {
-            if self.shutdown.load(Ordering::SeqCst) {
-                log::info!("shutdown requested, stopping soundcard output");
-                break;
-            }
+        while let Some(frame) = recv_frame_or_shutdown(&self.rx, &self.shutdown) {
             let _ = self.push_frame(&frame.pcm);
         }
         log::info!("output.soundcard: stopped");

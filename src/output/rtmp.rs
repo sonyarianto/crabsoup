@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use crate::Result;
 use crate::config::RtmpOutputConfig;
-use crate::engine::tap::AudioFrame;
+use crate::engine::tap::{AudioFrame, recv_frame_or_shutdown};
 use crate::output::encoder::AacEncoder;
 use crate::output::flv;
 
@@ -356,11 +356,7 @@ impl RtmpOutput {
 
         let mut audio_ts_ms: u64 = 0;
         let mut sent_audio_seq = false;
-        while let Ok(frame) = self.rx.recv() {
-            if self.shutdown.load(Ordering::SeqCst) {
-                log::info!("shutdown requested, ending RTMP stream");
-                break;
-            }
+        while let Some(frame) = recv_frame_or_shutdown(&self.rx, &self.shutdown) {
             let encoder = self.encoder.as_mut().unwrap();
             let aus = encoder.encode_aus(&frame.pcm);
             if aus.is_empty() {

@@ -9,12 +9,12 @@
 
 use std::fs;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Receiver;
 
 use crate::Result;
 use crate::config::HlsOutputConfig;
-use crate::engine::tap::AudioFrame;
+use crate::engine::tap::{AudioFrame, recv_frame_or_shutdown};
 use crate::output::encoder::{AacEncoder, Encoder};
 use crate::output::mpegts::{MpegTsMuxer, split_adts};
 #[cfg(feature = "video")]
@@ -158,11 +158,7 @@ impl HlsOutput {
         let mut seg = Segment::new(0, 0, has_video);
         let mut frames_total: u64 = 0;
 
-        while let Ok(frame) = self.rx.recv() {
-            if self.shutdown.load(Ordering::SeqCst) {
-                log::info!("shutdown requested, ending hls output");
-                break;
-            }
+        while let Some(frame) = recv_frame_or_shutdown(&self.rx, &self.shutdown) {
             #[cfg(feature = "video")]
             let audio_pts = frames_total.wrapping_mul(frame_dur);
             #[cfg(feature = "video")]

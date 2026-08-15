@@ -4,10 +4,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 
 use crabsoup::engine::mixer::{MixCommand, PriorityMixer, StatusHandle};
-use crabsoup::engine::tap::{AudioFrame, EngineTap};
+use crabsoup::engine::tap::{AudioFrame, EngineTap, recv_frame_or_shutdown};
 use crabsoup::live::harbor::Harbor;
 use crabsoup::output::file::FileOutput;
 use crabsoup::output::hls::HlsOutput;
@@ -27,9 +27,10 @@ use crabsoup::source::AudioSource;
     about = "Liquidsoap-inspired audio streaming engine"
 )]
 struct Cli {
-    /// Path to the .lua script (Lua).
-    #[arg(short, long, default_value = "crabsoup.lua")]
-    config: PathBuf,
+    /// Path to the .lua script (Lua). Required; running without it shows
+    /// help.
+    #[arg(short, long)]
+    config: Option<PathBuf>,
     /// Evaluate the script, print the resulting configuration, and exit.
     #[arg(long)]
     check: bool,
@@ -52,8 +53,12 @@ fn first_video_spec(result: &ScriptResult) -> Option<crabsoup::video::VideoSpec>
 fn main() -> crabsoup::Result<()> {
     env_logger::init();
     let cli = Cli::parse();
-    let src = std::fs::read_to_string(&cli.config)
-        .map_err(|e| format!("failed to read script {}: {e}", cli.config.display()))?;
+    let Some(config_path) = &cli.config else {
+        Cli::command().print_help()?;
+        return Ok(());
+    };
+    let src = std::fs::read_to_string(config_path)
+        .map_err(|e| format!("failed to read script {}: {e}", config_path.display()))?;
     let (runtime, mut result) = script::run(&src).map_err(|e| format!("script error: {e}"))?;
 
     if cli.check {
@@ -461,11 +466,7 @@ fn run_preview(
     status: StatusHandle,
 ) -> crabsoup::Result<()> {
     let mut last: Option<String> = None;
-    while let Ok(frame) = rx.recv() {
-        if shutdown.load(Ordering::SeqCst) {
-            log::info!("preview: shutdown requested");
-            return Ok(());
-        }
+    while let Some(frame) = recv_frame_or_shutdown(&rx, &shutdown) {
         let label = frame.label.as_deref().unwrap_or_default().to_string();
         status.set_current(&label);
         if Some(label.as_str()) != last.as_deref() {

@@ -7,12 +7,12 @@
 use std::fs::File;
 use std::io::Write;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Receiver;
 
 use crate::Result;
 use crate::config::FileOutputConfig;
-use crate::engine::tap::AudioFrame;
+use crate::engine::tap::{AudioFrame, recv_frame_or_shutdown};
 use crate::output::encoder::{Encoder, create_encoder};
 
 /// Consumes frames from the engine tap, encodes them, and writes the result
@@ -79,11 +79,7 @@ impl FileOutput {
     /// Consume frames until the stream ends (senders dropped) or shutdown is
     /// requested, then flush the encoder tail and close the file.
     pub fn run(&mut self) -> Result<()> {
-        while let Ok(frame) = self.rx.recv() {
-            if self.shutdown.load(Ordering::SeqCst) {
-                log::info!("shutdown requested, ending recording");
-                break;
-            }
+        while let Some(frame) = recv_frame_or_shutdown(&self.rx, &self.shutdown) {
             let encoded = self.encoder.as_mut().unwrap().encode(&frame.pcm);
             if let Some(file) = self.file.as_mut() {
                 file.write_all(&encoded)

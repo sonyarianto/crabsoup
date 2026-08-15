@@ -6,7 +6,7 @@ use std::time::Duration;
 use crate::Result;
 use crate::config::{OutputConfig, OutputFormat, OutputProtocol};
 use crate::engine::mixer::StatusHandle;
-use crate::engine::tap::AudioFrame;
+use crate::engine::tap::{AudioFrame, recv_frame_or_shutdown};
 use crate::output::encoder::{AacEncoder, Encoder, create_encoder};
 use crate::output::icecast_client::IcecastClient;
 
@@ -202,11 +202,7 @@ impl IcecastOutput {
     /// Consume frames from the tap until the stream ends (senders dropped)
     /// or shutdown is requested.
     pub fn run(&mut self) -> Result<()> {
-        while let Ok(frame) = self.rx.recv() {
-            if self.shutdown.load(Ordering::SeqCst) {
-                log::info!("shutdown requested, ending stream");
-                break;
-            }
+        while let Some(frame) = recv_frame_or_shutdown(&self.rx, &self.shutdown) {
             self.update_metadata(&frame);
 
             let encoded = self.encoder.as_mut().unwrap().encode(&frame.pcm);

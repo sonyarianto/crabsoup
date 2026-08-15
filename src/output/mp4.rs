@@ -21,7 +21,7 @@ use ffmpeg_next as ffmpeg;
 
 use crate::Result;
 use crate::config::Mp4OutputConfig;
-use crate::engine::tap::AudioFrame;
+use crate::engine::tap::{AudioFrame, recv_frame_or_shutdown};
 use crate::output::encoder::AacEncoder;
 use crate::output::flv;
 use crate::video::{EncodedAu, VideoEncoder, VideoFrame, VideoSpec};
@@ -87,11 +87,7 @@ impl Mp4Output {
     /// trailer (the moov atom).
     pub fn run(&mut self) -> Result<()> {
         let mut muxer = self.muxer.take().ok_or("output.mp4 not connected")?;
-        while let Ok(frame) = self.rx.recv() {
-            if self.shutdown.load(Ordering::SeqCst) {
-                log::info!("shutdown requested, ending mp4 output");
-                break;
-            }
+        while let Some(frame) = recv_frame_or_shutdown(&self.rx, &self.shutdown) {
             muxer.push_audio(&frame.pcm)?;
         }
         muxer.finish()?;

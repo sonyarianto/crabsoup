@@ -1,6 +1,15 @@
 # Crabsoup roadmap
 
 ## Done (verified end-to-end)
+- [x] **Ctrl-C shutdown deadlock fixed**: consumer loops blocked forever in
+      `rx.recv()` once the puller stopped publishing frames, so `main` hung
+      on `handle.join()` and the process never exited after SIGINT. All six
+      tap consumers (icecast, file, hls, mp4, rtmp, soundcard, preview) now
+      use `recv_frame_or_shutdown` (tap.rs): `recv_timeout(100 ms)` that
+      re-checks the shared flag. Verified: SIGINT exits cleanly, encoder
+      tails still flush.
+- [x] **CLI**: running without `-c` prints help and exits (was: silently
+      defaulted to `crabsoup.lua` and looked like a hang).
 - [x] YAML config (`-c crabsoup.yaml`)
 - [x] Playlist scheduling (directory scan, loop, shuffle)
 - [x] Gapless crossfades (`crossfade_seconds`, `fade_curve`)
