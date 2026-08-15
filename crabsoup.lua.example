@@ -47,7 +47,8 @@ pl = playlist({directory = "./media", shuffle = false, loop = true})
 -- source, so audio never stops. `USE_ST` toggles the chain for A/B.
 -- USE_ST = true
 -- if USE_ST then
---     st = pipe({process = 'stereo_tool_cmd_64_1101 -q -s audio.sts '
+--     st = pipe({process = 'tools/stereo_tool/stereo_tool_cmd_64 -q -s '
+--                       .. 'tools/stereo_tool/audio.sts '
 --                       .. '-b 16 -r 44100 -k "<your-key>" - -',
 --                format = "s16le"},
 --               pl)
