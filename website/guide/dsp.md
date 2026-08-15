@@ -15,6 +15,84 @@ Compressor: `compress(src, {threshold = -12, ratio = 2})`.
 
 AGC: `normalize(src, {target = -13})`.
 
+## `pitch(source, opts)` / `stretch(source, opts)`
+
+Time/pitch effects (Part I, pure-Rust WSOLA — no FFI): `pitch` shifts
+semitones, `stretch` changes the tempo ratio. Pitch is WSOLA tempo by
+`1/2^(s/12)` then a resample step read back from the internal
+interpolator, so pitch-shifting a track keeps its duration:
+
+```lua
+pitch(src, {semitones = -2})   -- a whole tone down
+stretch(src, {ratio = 1.25})   -- 25 % faster, pitch intact
+```
+
+## `echo(source, opts)`
+
+Multi-tap echo/feedback: `{delay, ping, feedback}` plus optional
+`delay2/ping2` and `delay3/ping3` for a second and third tap (up to 8 s
+of delay storage, e.g. `echo(src, {delay = 0.25, ping = 0.4, feedback =
+0.35})`).
+
+## `reverb(source, {ir, wet, dry})`
+
+Convolution reverb over an impulse-response file (`ir` is required).
+Uniformly partitioned overlap-save with zero added latency — reverb of a
+transient starts exactly at the transient:
+
+```lua
+reverb(src, {ir = "./media/hall.wav", wet = 0.3, dry = 0.7})
+```
+
+## `eq(source, {bands})` / `filter(source, opts)`
+
+RBJ-cookbook biquads (Direct Form 1): `eq` chains `bands` per channel in
+series, `filter` is a single band. Types: `lowpass`, `highpass`,
+`bandpass`, `notch`, `peaking`, `lowshelf`, `highshelf`; `freq` must be
+below Nyquist, `q > 0`, peaking/shelves take `gain` in dB:
+
+```lua
+eq(src, {bands = {{type = "lowpass", freq = 15000},
+                  {type = "peaking", freq = 1000, gain = 3, q = 1.0}}})
+filter(src, {type = "highpass", freq = 80})
+```
+
+## `stereo(source, {pan, width})` (+ `stereo.pan`, `stereo.widen`)
+
+Balance panning and mid-side width. Pan is a *balance* — the channel the
+image moves toward stays at unity, the far channel fades on a cos/sin
+quarter wave — so `pan = 0` is an exact passthrough and ±1 hard-cuts to
+one channel. Width is mid-side: 1 passes, 0 collapses to mono, > 1
+widens. `stereo` is a callable table, so the method forms compose:
+
+```lua
+stereo(src, {pan = -0.25, width = 1.4})
+stereo.widen(src, 1.4)
+```
+
+## `vocalremover(source, {strength, crossover})`
+
+The karaoke trick: cancels the centre channel (vocals) above the
+`crossover` (default 150 Hz) while keeping the low band as a mono sum,
+so the bass survives. `strength` 0 is an exact passthrough, 1 is full
+centre-cancel:
+
+```lua
+vocalremover(src, {strength = 1, crossover = 150})
+```
+
+## `bpm(path)` / `key(path)`
+
+Offline analysis (pure-Rust, no FFI): `bpm()` returns the tempo in BPM
+(spectral-flux onsets + autocorrelation), `key()` returns a
+`"A major"`-style name (chromagram correlated with Krumhansl–Kessler
+profiles):
+
+```lua
+tempo = bpm("./media/track.mp3")   -- e.g. 123.4
+k = key("./media/track.mp3")       -- e.g. "A major"
+```
+
 ## `replaygain(source, opts)`
 
 Per-track constant gain from the file's `REPLAYGAIN_TRACK_GAIN` tag
