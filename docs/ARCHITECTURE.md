@@ -34,7 +34,7 @@ One engine thread plus one thread per output:
 - Registers the Liquidsoap-flavoured Lua stdlib: `playlist`,
   `smart_crossfade`, `single`, `blank` (+ `blank.detect`), `sine`,
   `amplify`, `compress`, `normalize`, `replaygain`, `stretch`, `pitch`,
-  `echo`, `pipe`, `jingles`,
+  `echo`, `reverb`, `pipe`, `jingles`,
   `fallback`/`sequence`/`random`, `switch`, `rotate`, `mksafe`, `add`,
   `cue_cut`,   `map_metadata`, `request.queue`, `request.dynamic`,
   `input.harbor`, `input.soundcard`, `input.http`, `output.icecast`,
@@ -242,6 +242,30 @@ One engine thread plus one thread per output:
   `delay` worth of audio is dropped at child EOF (effects do not extend the
   track), and `EffectSource` forwards `remaining_seconds`/`label`/`skip`
   unchanged.
+
+## Convolution reverb (`src/engine/reverb.rs`)
+
+- `reverb(src, {ir, wet = 0.3, dry = 0.7})` wraps the source in a
+  `ConvReverb` — a uniformly partitioned overlap-save convolver. `ir` is a
+  file path, decoded once at operator-call time by `load_ir(path, rate)`
+  via symphonia (mono → one IR applied to every output channel, stereo →
+  two; extra channels dropped; a file not at the bus rate is resampled
+  with `SincResampler`). Errors surface as `reverb: {path}: {reason}`.
+- Partition `P` is the largest power of two in `[512, 32768]` that divides
+  the bus frames-per-buffer (else 2048), so one `process` call usually
+  yields exactly one block; FFT size `N = 2P`. Each block `m` keeps a ring
+  of `K = ceil(ir_len / P)` spectra and accumulates
+  `Σ_a ring[(m − a) mod K] · H_a` (partition `a` of the IR), then serves
+  the last `P` IFFT samples — the alias-free overlap-save region. Output
+  position `j` corresponds to input position `j`, so the effect adds zero
+  latency (it is a pure filter, unlike a delay).
+- Hot path allocates nothing: history window, spectra ring, IFFT
+  accumulator, per-channel block staging, the `out_ring` serving block
+  output, and the FFT scratch are all sized at construction and reused;
+  the per-buffer `Vec::clear()`/`mem::take` bookkeeping keeps capacity.
+  The multi-partition direct-convolution test and the partition-boundary
+  delta tests (1023/1024/2047/2048) pin the block alignment; rustfft's
+  inverse FFT is unnormalized, so the IFFT output is scaled by `1/N`.
 
 ## Mixer control (`src/engine/mixer.rs`)
 
@@ -590,6 +614,12 @@ Video is a parallel side-channel to the PCM bus, compiled out by default
   leg alone inverts the effect). The resample step must come from the
   read-back clamped tempo, not the requested factor, or clamped semitones
   drift off the ideal pitch/duration; the octave-up/down unit tests guard it.
+- Convolution reverb (Part I3): the pending-block `Vec` is drained into a
+  local via `std::mem::take` but must be `clear()`ed after processing — a
+  naive `self.pending = pending` restore replays every previously queued
+  block each call (1 → 2 → 3 process_block runs per buffer), corrupting
+  output at block boundaries with a ramp error; the multi-partition test
+  caught it.
 - The `on_metadata` closure stays in the Lua registry for the process
   lifetime, keeping its channel `Sender` alive: the event loop can never wait
   for channel disconnection, so it polls `recv_timeout` and exits on the

@@ -44,6 +44,7 @@ use crate::config::{collect_images, collect_video};
 use crate::engine::effects::{Agc, Amplify, Compressor, Echo, EffectSource};
 use crate::engine::mixer::{CrossfadeMixer, SmartFade};
 use crate::engine::pitch::{PitchMode, PitchSource};
+use crate::engine::reverb::{ConvReverb, load_ir};
 use crate::request::{RequestConfig, RequestUri, TrackCues, resolve};
 use crate::source::blank_detect::{BlankDetectConfig, BlankDetectSource};
 use crate::source::cue_cut::CueCutSource;
@@ -2199,6 +2200,38 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         })?,
     )?;
 
+    // ---- convolution reverb ----------------------------------------------
+    let reverb_state = state.clone();
+    globals.set(
+        "reverb",
+        lua.create_function(move |_, (mut source, opts): (LuaSource, Option<Table>)| {
+            let ir_path = match &opts {
+                Some(t) => t.get::<String>("ir")?,
+                None => {
+                    return Err(mlua::Error::runtime(
+                        "reverb: `ir` (impulse-response file) is required",
+                    ));
+                }
+            };
+            let wet = opt_f64(&opts, "wet", 0.3)?;
+            let dry = opt_f64(&opts, "dry", 0.7)?;
+            if !wet.is_finite() || !dry.is_finite() || wet < 0.0 || dry < 0.0 {
+                return Err(mlua::Error::runtime(
+                    "reverb: wet/dry must be finite and non-negative",
+                ));
+            }
+            let (spec, fpb) = bus(&reverb_state);
+            let ir = load_ir(&ir_path, spec.rate).map_err(mlua::Error::runtime)?;
+            let child = source.take();
+            let fx = ConvReverb::new(&ir, wet as f32, dry as f32, spec.channels.count(), fpb);
+            Ok(LuaSource::new(Box::new(EffectSource::new(
+                child,
+                fx,
+                spec.channels.count(),
+            ))))
+        })?,
+    )?;
+
     // ---- source composition ---------------------------------------------
     let composer = lua.create_function(|_, (children, kind): (Table, String)| {
         let sources = source_list(&children)?;
@@ -3616,6 +3649,32 @@ mod tests {
         out
     }
 
+    /// Mono 44.1 kHz PCM16 WAV whose IR is a unit delta `delta` frames in.
+    fn delta_ir_wav_bytes(delta: usize) -> Vec<u8> {
+        let n = delta + 1;
+        let mut data = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            let s = if i == delta { 32767i16 } else { 0i16 };
+            data.extend_from_slice(&s.to_le_bytes());
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+        out.extend_from_slice(b"WAVE");
+        out.extend_from_slice(b"fmt ");
+        out.extend_from_slice(&16u32.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&44_100u32.to_le_bytes());
+        out.extend_from_slice(&(44_100u32 * 2).to_le_bytes());
+        out.extend_from_slice(&2u16.to_le_bytes());
+        out.extend_from_slice(&16u16.to_le_bytes());
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&data);
+        out
+    }
+
     #[test]
     fn output_soundcard_registers_without_opening_a_device() {
         // Unlike `input.soundcard`, the device is opened only at connect()
@@ -4796,6 +4855,67 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("delay must be a positive"));
+    }
+
+    #[test]
+    fn reverb_delays_a_tone_by_the_ir() {
+        let ir_path =
+            std::env::temp_dir().join(format!("crabsoup-reverb-ir-{}.wav", std::process::id()));
+        std::fs::write(&ir_path, delta_ir_wav_bytes(100)).expect("write IR");
+        let ir = ir_path.display();
+        let (_rt, res) = run(&format!(
+            r#"
+            output.preview(reverb(sine({{freq = 1000, duration = 0.2}}),
+                                  {{ir = "{ir}", wet = 1, dry = 0}}))
+            "#
+        ))
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        let mut out = Vec::new();
+        while !root.is_exhausted() {
+            let n = root.next_buffer(&mut buf);
+            out.extend_from_slice(&buf[..n]);
+        }
+        let n = out.len();
+        assert_eq!(n, (0.2 * 44_100.0 * 2.0) as usize);
+        let energy_before: f64 = out[..200].iter().map(|&s| (s as f64) * (s as f64)).sum();
+        assert!(
+            energy_before < 1e-6,
+            "nothing before the 100-sample delay: {energy_before}"
+        );
+        // First loud frame of the 1000 Hz dry-delayed tone lands ~100 frames
+        // after the input onset (the tone crosses 0.5 in its 4th frame).
+        // First loud frame of the 1000 Hz dry-delayed tone lands ~100 frames
+        // after the input onset (peak 0.5, crosses 0.25 in its 2nd frame).
+        let first_loud = (0..n / 2)
+            .find(|&f| out[f * 2].abs() > 0.25)
+            .expect("delayed tone present");
+        assert!(
+            (100..112).contains(&first_loud),
+            "first loud frame {first_loud} not ~102 after a 100-sample delay"
+        );
+    }
+
+    #[test]
+    fn reverb_requires_ir_option() {
+        let err = match run(r#"output.preview(reverb(sine({})))"#) {
+            Ok(_) => panic!("reverb without ir must fail"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("ir"), "{err}");
+    }
+
+    #[test]
+    fn reverb_rejects_missing_ir_file() {
+        let err = match run(r#"
+            output.preview(reverb(sine({}), {ir = "/nonexistent/ir.wav"}))
+            "#)
+        {
+            Ok(_) => panic!("reverb with a missing ir must fail"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("reverb"), "{err}");
     }
 
     // ---- Phase 5: switch / rotate ----------------------------------------

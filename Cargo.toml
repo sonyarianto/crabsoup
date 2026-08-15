@@ -8,6 +8,7 @@ license = "MIT"
 [dependencies]
 # Audio decoding + resampling
 symphonia = { version = "0.5", features = ["all"] }
+rustfft = "6"
 # Basic auth decoding for the live harbor
 base64 = "0.22"
 # Concurrency & async (live harbor)

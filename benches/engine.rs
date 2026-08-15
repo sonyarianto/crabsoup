@@ -18,6 +18,7 @@ use crabsoup::config::MixerConfig;
 use crabsoup::engine::effects::{Agc, Amplify, Compressor, Echo, EffectSource};
 use crabsoup::engine::mixer::{CrossfadeMixer, PriorityMixer, SmartFade};
 use crabsoup::engine::pitch::{PitchMode, PitchSource};
+use crabsoup::engine::reverb::ConvReverb;
 use crabsoup::output::encoder::{AacEncoder, Encoder, Mp3Encoder, OpusEncoder};
 use crabsoup::resample::SincResampler;
 use crabsoup::source::{AudioSource, SineSource, SourceProvider};
@@ -288,6 +289,31 @@ fn effects(c: &mut Criterion) {
     });
 }
 
+fn reverb(c: &mut Criterion) {
+    let mut group = c.benchmark_group("reverb");
+    group.throughput(Throughput::Elements(BUF as u64));
+
+    for (name, seconds) in [("partitioned_1s_ir", 1.0f64), ("partitioned_3s_ir", 3.0)] {
+        group.bench_function(name, |b| {
+            // Exponentially decaying IR: short, well-behaved kernels
+            // (a near-constant IR would alias into a long reverberant tail).
+            let n = (seconds * RATE as f64) as usize;
+            let ir = (0..n)
+                .map(|i| ((i as f32) * 0.001).sin() * (-3.0 * i as f32 / n as f32).exp())
+                .collect::<Vec<f32>>();
+            let child: Box<dyn AudioSource> =
+                Box::new(SineSource::new(440.0, None, 0.5, RATE, CHANS));
+            let mut chain =
+                EffectSource::new(child, ConvReverb::new(&[ir], 0.3, 0.7, CHANS, FPB), CHANS);
+            let mut buf = vec![0.0f32; BUF];
+            b.iter(|| {
+                chain.next_buffer(&mut buf);
+                black_box(&buf);
+            });
+        });
+    }
+}
+
 /// One foreign call per 4096-frame buffer — the per-buffer boundary cost the
 /// SoundTouch-via-FFI option (Part I1) would pay, measured with a no-op.
 mod ffi_noop {
@@ -446,6 +472,7 @@ criterion::criterion_group!(
     smart_crossfade,
     live_handoff,
     effects,
+    reverb,
     pitch,
     resampler,
     encode

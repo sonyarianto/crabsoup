@@ -144,6 +144,16 @@ resample leg (+7 semitones).
 | pitch/stretch/tempo_1.5 | 17.0 ms | 18.3 % |
 | pitch/pitch/+7_semitones | 28.9 ms | 31.1 % |
 
+Reverb rows (Part I3, recorded in the session that landed `reverb`; 1 s /
+3 s exponentially-decaying IRs, `ConvReverb` at P = 4096, N = 8192,
+K = 11 / 33 partitions). Convolution dominates as expected — the 1 s IR is
+~7x the echo rows, the 3 s IR ~20x — but both stay under 2 % of one core:
+
+| benchmark | per 92.9 ms buffer | vs real-time |
+|---|---|---|
+| reverb/partitioned_1s_ir | 670 µs | 0.72 % |
+| reverb/partitioned_3s_ir | 1.72 ms | 1.85 % |
+
 Video-path rows (Part H3, recorded in the session that landed the effects +
 bench group; per 640x360 YUV420P frame, budget = one 25 fps frame = 40 ms):
 
@@ -784,7 +794,8 @@ rows recorded against the baseline convention.
 
 ### Part I — advanced audio & effects (Phase 2, Q1 – Q2 2027)
 
-**Status: planned.** The product plan's Phase 2. Effects stay inline in the
+**Status: I1–I3 shipped** (see their rows below; I4 onwards still planned).
+The product plan's Phase 2. Effects stay inline in the
 pull chain (one thread per output, allocation-free hot paths), each landing
 with inline tests and a bench row; FFI-backed DSP (SoundTouch, aubio) gets
 its own confined module per the Part H convention note.
@@ -816,8 +827,34 @@ its own confined module per the Part H convention note.
       copy, multi-tap offsets, stereo phase, and script-level energy windows
       (dry-only first 50 ms vs aligned 1000 Hz copy after) + validation.
       Bench: single_tap ~76 µs / two_tap ~86 µs per 92.9 ms buffer.
-- [ ] **I2 — echo/delay** (multi-tap), **I3 — convolution reverb** (IR
-      files), **I4 — EQ/filters** (low/high-pass, parametric).
+- [x] **I3 — convolution reverb (IR files)**: landed as `reverb(src, {ir,
+      wet, dry})` over `src/engine/reverb.rs` — a uniformly partitioned
+      overlap-save convolver (`ConvReverb`) using rustfft, with
+      `load_ir(path, rate)` decoding any symphonia-readable file (mono →
+      one IR applied to every output channel, stereo → two; extra channels
+      dropped; off-rate IRs resampled via `SincResampler`). Partition `P`
+      is the largest power of two in `[512, 32768]` that divides the
+      frames-per-buffer (else 2048); each block computes
+      `Σ_a ring[(m-a) mod K] · H_a` and serves the last `P` IFFT samples
+      (overlap-save), so there is **zero added latency** — output position
+      j is input position j. `wet`/`dry` (defaults 0.3/0.7) mix the
+      convolution with the dry bus. All hot-path buffers (history window,
+      spectra ring, IFFT accumulator, block staging, output ring) are
+      sized at construction — the pull chain allocates nothing per buffer.
+      **Bug found while testing:** the pending-block Vec was restored
+      (not cleared) after processing, so every call re-ran all previously
+      queued blocks (1 → 2 → 3 process_block calls per buffer); output was
+      silently corrupted at block boundaries (ramp error at the block-2
+      start, worst last IFFT sample). Fixed with
+      `self.pending = pending; self.pending.clear();`. Tests: exact
+      passthrough (delta at 0), offset delay (delta at 100), deltas on the
+      partition boundaries (1023/1024/2047/2048), 2500-tap IR vs direct
+      convolution, wet/dry linearity, per-channel independence, and the
+      allocation-free pull path; script tests (a generated mono delta-WAV
+      delays a 1000 Hz tone by exactly 100 frames, missing-`ir` and
+      missing-file errors). Bench: `partitioned_1s_ir` ~670 µs /
+      `partitioned_3s_ir` ~1.72 ms per 92.9 ms buffer.
+- [ ] **I4 — EQ/filters** (low/high-pass, parametric).
 - [ ] **I5 — stereo imaging** (`stereo.widen`, `stereo.pan`, mid-side),
       **I6 — vocal remover** (centre-channel phase cancellation).
 - [ ] **I7 — BPM & key detection** (`aubio-rs` or `libvamp`), **I8 — speech
