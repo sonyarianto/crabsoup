@@ -113,6 +113,26 @@ cpal capture bridged into the bus via an SPSC ring. The device is opened
 synchronously at script evaluation, so a missing/broken device fails fast
 (`--check` is hardware-dependent for scripts that use it).
 
+## `input.http(url, {reconnect_backoff = 500})`
+
+A continuous relay/pull-stream source — Liquidsoap's `input.http`: the
+stream at `url` is `GET`ed and decoded live (MP3/Opus/Vorbis/AAC, format
+sniffed from the stream with the response `Content-Type` as a hint), so it
+keeps playing indefinitely while the upstream is up and reconnects with a
+backoff when the connection drops:
+
+```lua
+relay = input.http("https://feed.example.net/affiliate.mp3")
+output.preview(fallback({relay, playlist({directory = "./media"})}))
+```
+
+While disconnected the relay reports exhausted, so a `fallback` around it
+plays the local source in the gap and the relay preempts it the moment it
+reconnects — the "syndicated feed during the day, local automation
+overnight" shape, with no script-side handling. `reconnect_backoff` is the
+milliseconds between attempts (default 500). The connection timeout follows
+`set("request_timeout", N)` (default 30 s).
+
 ## `smart_crossfade({...})`
 
 A `playlist` whose transition window is chosen by the outgoing track's

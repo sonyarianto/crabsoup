@@ -1,6 +1,7 @@
 pub mod blank_detect;
 pub mod cue_cut;
 pub mod file;
+pub mod http;
 pub mod opus;
 pub mod pipe;
 pub mod playlist;

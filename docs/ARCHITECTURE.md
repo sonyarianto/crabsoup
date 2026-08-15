@@ -35,8 +35,9 @@ One engine thread plus one thread per output:
   `smart_crossfade`, `single`, `blank` (+ `blank.detect`), `sine`,
   `amplify`, `compress`, `normalize`, `replaygain`, `pipe`, `jingles`,
   `fallback`/`sequence`/`random`, `switch`, `rotate`, `mksafe`, `add`,
-  `cue_cut`, `map_metadata`, `request.queue`, `request.dynamic`,
-  `input.harbor`, `input.soundcard`, `output.icecast`, `output.file`,
+  `cue_cut`,   `map_metadata`, `request.queue`, `request.dynamic`,
+  `input.harbor`, `input.soundcard`, `input.http`, `output.icecast`,
+  `output.file`,
   `output.preview`, `output.soundcard`, `output.hls`, `server.telnet`,
   `server.register`, `on_metadata`, `on_track`, `http_post`, `set`, `log`.
 - `blank` is a *callable table* (a `__call` metamethod) so it can carry
@@ -347,6 +348,32 @@ drain-on-push kept, but ~13x faster on the pull (benchmarked in
 backpressure (waits for the consumer to drain) instead of dropping, so the
 newest audio is never silently lost — a fast `curl -T` upload throttles to
 real time and plays completely, as before.
+
+## Relay input (`input.http`, `src/source/http.rs`)
+
+Pulls a continuous remote stream (syndicated/affiliate feed) with the same
+shape as the harbor, inverted: a detached network thread `GET`s the URL and
+decodes the live body into an SPSC ring (`ringbuf::HeapRb`, `2 * 5 s` of
+audio, drop-oldest cap on pull), and the `AudioSource` half pops PCM
+lock-free — the audio thread never touches the network or blocks on it.
+Connection lifecycle is a reconnect loop mirroring `IcecastOutput`:
+`http_get_stream` (new in `src/request.rs`: streaming body — content-length
+bounded, chunked, or connection-close delimited — with `Icy-MetaData: 0`
+so Icecast/DNAS keep in-stream metadata out of the audio, up to 4
+redirects re-opening the transport per hop) → sniff the first Ogg page
+(fed back with `PrependReader`, the harbor trick) → OpusHead relays take
+the native `OpusSource` path; anything else goes to symphonia
+probe/`MediaSourceStream` over `ReadOnlySource` (no seek-back on a live
+stream), hinted by the response `Content-Type`. The decode pushes through
+`Sink` with backpressure on a full ring (never drops newest audio);
+connection end (clean EOF or read error) resets `connected` and sleeps an
+interruptible backoff (default 500 ms, `reconnect_backoff` option), broken
+early by the shared shutdown flag when the source is dropped. While
+disconnected, `is_exhausted()` is `true` (ring empty + not connected), so
+`fallback({input.http(url), local})` covers the gap with no script-side
+handling — the relay preempts, the local source plays the gap. URLs are
+shape-validated at script evaluation (scheme + non-empty host, no DNS);
+resolution happens per reconnect attempt.
 
 ## Gotchas that have burned previous work
 

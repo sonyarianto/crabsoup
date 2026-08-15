@@ -71,9 +71,10 @@ This section is the plan; the Done sections above stay the source of truth
 for what shipped.
 
 **Status: the original plan (Parts A–F) is fully shipped** — see the Done
-sections for landing notes. The open plan is [Part G](#part-g--remaining-product-parity-gaps-relay-input-clock-drift)
-(`input.http` relay + soundcard clock-drift compensation); the sections
-below that predate it are kept as history and are complete.
+sections for landing notes. Part G1 (`input.http` relay input) is shipped
+(see Done (cont.)); G2 (soundcard clock-drift compensation) is the remaining
+open item. The sections below that predate Part G are kept as history and
+are complete.
 
 ### Performance principles (apply to every phase)
 
@@ -416,7 +417,8 @@ operator-by-operator checklist. Confirmed absent by checking the source,
 not assumed: no relay/pull-stream input exists anywhere, and the
 soundcard work (F2) has no clock-drift story.
 
-- [ ] **G1 — `input.http`: continuous relay/pull-stream source**
+- [x] **G1 — `input.http`: continuous relay/pull-stream source** — shipped,
+      see Done (cont.) for the landing note.
       Everything crabsoup takes in is a local file, a request-resolved URI
       played once as a track, or a DJ *pushing* audio via `input.harbor`.
       There's no way to **pull a continuous remote stream and use it as a
@@ -497,9 +499,9 @@ soundcard work (F2) has no clock-drift story.
    (soundcard I/O via cpal) → F4 (`blank.detect`) → F3 (`map_metadata`),
    per the plan's suggested order (see Done (cont.)).
 9. Part G (remaining product-parity gaps) — **current plan**: G1
-   (`input.http` relay/pull source) → G2 (soundcard clock-drift
-   compensation). G1 first (higher product impact, no dependency on G2);
-   G2's simulated-skew test should be written before real hardware time.
+   (`input.http` relay/pull source) — **done** (see Done (cont.)); G2
+   (soundcard clock-drift compensation) remains, with its simulated-skew
+   test to be written before real hardware time.
 
 The original Liquidsoap-parity plan (Parts A–F) is complete; Part G is the
 only open plan section. If effort is constrained, G1 (`input.http`) is the
@@ -513,6 +515,40 @@ approximates the operator surface, not the language); LADSPA plugin hosting
 practice).
 
 ## Done (cont.)
+- [x] Part G1 (`input.http` relay/pull-stream source): a network thread
+      `GET`s the relay URL and decodes the live body into an SPSC ring
+      (the harbor's ringbuf bridge — no new concurrency primitive), so the
+      `AudioSource` half never touches the network. `src/request.rs` —
+      `HttpResponse` (a live streaming body: `Content-Length`-bounded,
+      chunked, or connection-close delimited) + `http_get_stream` (GET with
+      `Icy-MetaData: 0` so Icecast/DNAS don't interleave in-stream
+      metadata, up to 4 redirects re-opening the transport per hop) and
+      `validate_relay_url` (fail fast at script evaluation; no DNS). New
+      `src/source/http.rs` — `HttpSource::spawn(url, spec, fpb, timeout,
+      backoff)` validates, sizes the jitter ring to `2 * 5 s` of audio
+      (drop-oldest cap on pull keeps relay latency bounded), and runs a
+      detached reconnect loop: sniff the first Ogg page (fed back via
+      `PrependReader`, the harbor trick) → native `OpusSource` for
+      OpusHead relays (symphonia 0.5 has no Opus codec), else symphonia
+      probe/`MediaSourceStream` over `ReadOnlySource` hinted by the
+      `Content-Type` (no seek-back on a live stream) → decode packets into
+      the ring (`SampleBuffer::<f32>` + the shared `PcmConverter`), with
+      per-packet decode errors skipped like `FileSource`. Connection end
+      (clean EOF or read error) → reconnect with interruptible backoff
+      (default 500 ms, `reconnect_backoff` option), shutdown flag breaks
+      the sleep on drop; `Sink::push_samples` backpressures the decode
+      thread instead of dropping audio. `is_exhausted() == true` while
+      disconnected, so `fallback({input.http(url), local})` covers the gap
+      with zero script-side handling — relay preempts, local plays the
+      gap. Registered in the script as `input.http(url,
+      {reconnect_backoff = ms})`, label = last URL path segment. Inline
+      tests (224 -> 228): relays a streamed WAV served in halves and
+      reconnects after the drop (energy + reconnect-gap exhaustion),
+      exhausts while disconnected and recovers when the server appears,
+      malformed URLs rejected at spawn, and a script-level
+      `fallback({input.http(...), sine})` frequency test proving relay
+      preempts when up and the local sine covers the gap when down.
+      README + website guide updated.
 - [x] Structured (JSON) control-port replies: `src/control.rs` — dispatch
       now produces a structured `CommandReply` (success / error / custom /
       status / uptime / queued / list / playing), rendered to either the

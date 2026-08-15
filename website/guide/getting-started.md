@@ -12,7 +12,7 @@ live DJ input and one-shot jingles with crossfades, and broadcasts the result
   `compress`, `normalize`, `pipe`, `fallback`, `sequence`, `random`, `switch`,
   `rotate`, `jingles`, `mksafe`, `add`, `cue_cut`, `request.queue`,
   `request.dynamic`, `blank.detect`, `map_metadata`, `input.harbor`,
-  `input.soundcard`, `output.icecast`, `output.preview`, `output.soundcard`,
+  `input.soundcard`, `input.http`, `output.icecast`, `output.preview`, `output.soundcard`,
   `server.telnet`, `set`, `log`
 - **Playlist scheduling**: recursive directory scan, explicit file lists,
   loop and shuffle

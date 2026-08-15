@@ -601,7 +601,24 @@ fn connect_transport(
     }
 }
 
-/// Perform one `GET` (no retries) writing the body to `dest`. Each redirect
+/// Cheap shape validation of a relay URL (scheme + non-empty host), used by
+/// `input.http` to fail fast at script evaluation. No DNS resolution — the
+/// reconnect loop re-resolves per attempt.
+pub fn validate_relay_url(url: &str) -> crate::Result<()> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err(format!("not an http(s):// URL: {url}").into());
+    }
+    let host = url
+        .split_once("://")
+        .map(|(_, rest)| rest.split('/').next().unwrap_or(""))
+        .unwrap_or("");
+    if host.is_empty() {
+        return Err(format!("bad URL (empty host): {url}").into());
+    }
+    Ok(())
+}
+
+/// One `GET` (no retries) writing the body to `dest`. Each redirect
 /// hop re-opens the transport (the scheme may have changed), then runs the
 /// same status/header/body parsing over it.
 fn http_get(
@@ -677,6 +694,162 @@ fn http_get(
             std::io::copy(&mut reader, &mut file)?;
         }
         return Ok(());
+    }
+    Err("too many redirects".into())
+}
+
+/// A live HTTP response body: the status line and headers are already
+/// parsed, and `Read` yields the body — content-length bounded, chunked, or
+/// connection-close delimited (the Part G1 relay path, unlike
+/// [`http_get`]'s download-then-play). Reading to EOF consumes the
+/// connection; the caller decides when to reconnect.
+pub struct HttpResponse {
+    reader: BufReader<Transport>,
+    /// Remaining body bytes from `Content-Length`, if declared.
+    remaining: Option<u64>,
+    /// Decoding a `Transfer-Encoding: chunked` body.
+    chunked: bool,
+    /// Bytes left in the current chunk.
+    chunk_left: u64,
+    /// The `Content-Type` header, if any (relays use it as a format hint).
+    pub content_type: Option<String>,
+}
+
+impl Read for HttpResponse {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.chunked {
+            if self.chunk_left == 0 {
+                let mut size_line = String::new();
+                if self.reader.read_line(&mut size_line)? == 0 {
+                    return Ok(0);
+                }
+                // A chunk extension (`;ext=...`) may follow the size.
+                let size_str = size_line.split(';').next().unwrap_or("").trim();
+                let size = u64::from_str_radix(size_str, 16).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("bad chunk size {size_str:?}"),
+                    )
+                })?;
+                if size == 0 {
+                    // Trailer section; skip to the blank line.
+                    loop {
+                        let mut trailer = String::new();
+                        if self.reader.read_line(&mut trailer)? == 0
+                            || trailer.trim_end().is_empty()
+                        {
+                            break;
+                        }
+                    }
+                    return Ok(0);
+                }
+                self.chunk_left = size;
+            }
+            let take = buf.len().min(self.chunk_left as usize);
+            let n = self.reader.read(&mut buf[..take])?;
+            self.chunk_left -= n as u64;
+            if self.chunk_left == 0 {
+                let mut crlf = [0u8; 2];
+                let mut got = 0;
+                while got < 2 {
+                    let r = self.reader.read(&mut crlf[got..])?;
+                    if r == 0 {
+                        break;
+                    }
+                    got += r;
+                }
+            }
+            Ok(n)
+        } else if let Some(left) = self.remaining.as_mut() {
+            if *left == 0 {
+                return Ok(0);
+            }
+            let take = buf.len().min(*left as usize);
+            let n = self.reader.read(&mut buf[..take])?;
+            *left -= n as u64;
+            Ok(n)
+        } else {
+            self.reader.read(buf)
+        }
+    }
+}
+
+/// One `GET` (no retries) returning the response as a live stream instead
+/// of writing the body to a file — the relay/pull-source path. Redirects
+/// are followed (up to 4, re-opening the transport per hop) and only the
+/// final response is returned; `Icy-MetaData: 0` asks Icecast/DNAS not to
+/// interleave in-stream metadata with the audio.
+pub fn http_get_stream(
+    url: &str,
+    timeout: Duration,
+    tls_roots: Option<&Arc<rustls::RootCertStore>>,
+) -> crate::Result<HttpResponse> {
+    let mut target = HttpUrl::parse(url)?;
+    for _ in 0..4 {
+        let mut stream = connect_transport(&target, timeout, tls_roots)?;
+        write!(
+            stream,
+            "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: crabsoup/0.1\r\nConnection: close\r\nAccept: */*\r\nIcy-MetaData: 0\r\n\r\n",
+            target.path, target.host
+        )?;
+        stream.flush()?;
+
+        let mut reader = BufReader::new(stream);
+        let mut status_line = String::new();
+        reader.read_line(&mut status_line)?;
+        let mut status_words = status_line.split_whitespace();
+        let _protocol = status_words.next();
+        let code: u16 = status_words
+            .next()
+            .ok_or_else(|| format!("malformed status line: {status_line:?}"))?
+            .parse()
+            .map_err(|_| format!("malformed status line: {status_line:?}"))?;
+
+        let mut chunked = false;
+        let mut content_length: Option<u64> = None;
+        let mut content_type: Option<String> = None;
+        let mut location: Option<String> = None;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line)? == 0 {
+                break;
+            }
+            let trimmed = line.trim_end();
+            if trimmed.is_empty() {
+                break;
+            }
+            let Some((key, value)) = trimmed.split_once(':') else {
+                continue;
+            };
+            let value = value.trim();
+            match key.to_ascii_lowercase().as_str() {
+                "transfer-encoding" if value.eq_ignore_ascii_case("chunked") => chunked = true,
+                "content-length" => {
+                    content_length = value.parse().ok();
+                }
+                "content-type" => content_type = Some(value.to_string()),
+                "location" => location = Some(value.to_string()),
+                _ => {}
+            }
+        }
+
+        if (300..400).contains(&code) {
+            let Some(loc) = location else {
+                return Err(format!("redirect {code} without Location").into());
+            };
+            target = HttpUrl::parse(&target.join(&loc))?;
+            continue;
+        }
+        if code != 200 {
+            return Err(format!("HTTP {code} for {url}").into());
+        }
+        return Ok(HttpResponse {
+            reader,
+            remaining: if chunked { None } else { content_length },
+            chunked,
+            chunk_left: 0,
+            content_type,
+        });
     }
     Err("too many redirects".into())
 }

@@ -2154,9 +2154,32 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         .map_err(mlua::Error::runtime)?;
         Ok(LuaSource::new(Box::new(src)))
     })?;
+    // ---- relay/pull-stream source (Liquidsoap `input.http`) --------------
+    // A network thread GETs the URL and decodes the live body into a ring;
+    // while disconnected the source exhausts, so a
+    // `fallback({input.http(...), local})` covers the gap automatically.
+    let http_state = state.clone();
+    let http_fn = lua.create_function(move |_, (url, opts): (String, Option<Table>)| {
+        let (spec, fpb) = bus(&http_state);
+        let backoff_ms: u64 = match &opts {
+            Some(t) => t.get("reconnect_backoff").unwrap_or(500),
+            None => 500,
+        };
+        let timeout_secs = http_state.borrow().request.timeout_secs;
+        crate::source::http::HttpSource::spawn(
+            &url,
+            spec,
+            fpb,
+            Duration::from_secs(timeout_secs),
+            Duration::from_millis(backoff_ms),
+        )
+        .map_err(mlua::Error::runtime)
+        .map(|src| LuaSource::new(Box::new(src)))
+    })?;
     let input = lua.create_table()?;
     input.set("harbor", harbor_fn)?;
     input.set("soundcard", soundcard_fn)?;
+    input.set("http", http_fn)?;
     globals.set("input", input)?;
 
     let telnet_state = state.clone();
@@ -2518,6 +2541,118 @@ mod tests {
             "#)
         .expect("script runs");
         assert!(res.preview.is_some());
+    }
+
+    #[test]
+    fn input_http_relays_when_up_and_falls_back_when_down() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        // A bound-but-silent listener first (relay down), then a server that
+        // serves a 660 Hz WAV per connection (relay up). The script wraps the
+        // relay in a fallback with a local 440 Hz sine.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let url = format!("http://{addr}/feed.wav");
+        let script = format!(
+            "set(\"request_timeout\", 1)\n\
+             output.preview(fallback({{input.http(\"{url}\", {{reconnect_backoff = 20}}),\n\
+                                      sine({{freq = 440, duration = 5, amplitude = 0.5}})}}))\n"
+        );
+        let (_rt, res) = run(&script).expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+
+        // Sign changes per second across a window: 2*f for a sine.
+        let crossings_per_sec = |slice: &[f32]| {
+            let n = slice
+                .windows(2)
+                .filter(|w| (w[0] >= 0.0) != (w[1] >= 0.0))
+                .count() as f64;
+            n / (slice.len() as f64 / 44_100.0 / 2.0)
+        };
+
+        // Phase 1 — relay down: the 440 Hz sine covers the gap.
+        let mut got = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while got.len() < 44_100 && std::time::Instant::now() < deadline {
+            let n = root.next_buffer(&mut buf);
+            got.extend_from_slice(&buf[..n]);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let cps = crossings_per_sec(&got);
+        assert!(
+            (cps - 880.0).abs() / 880.0 < 0.25,
+            "expected 440 Hz fallback, got {cps} cps"
+        );
+
+        // Phase 2 — relay up: the relay preempts the fallback.
+        let wav = sine_wav_bytes(660.0, 0.3, 44_100);
+        let wav_len = wav.len();
+        std::thread::spawn(move || {
+            for _ in 0..64 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {wav_len}\r\n\r\n"
+                );
+                if stream.write_all(head.as_bytes()).is_err() {
+                    continue;
+                }
+                if stream.write_all(&wav).is_err() {
+                    continue;
+                }
+                let _ = stream.flush();
+            }
+        });
+        let mut saw_relay = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            let n = root.next_buffer(&mut buf);
+            got.extend_from_slice(&buf[..n]);
+            let window = &got[got.len().saturating_sub(44_100)..];
+            let cps = crossings_per_sec(window);
+            if cps > 1000.0 {
+                saw_relay = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            saw_relay,
+            "relay must preempt the fallback once it connects"
+        );
+    }
+
+    /// A minimal RIFF/WAVE sine (PCM 16-bit stereo) for the relay feed.
+    fn sine_wav_bytes(freq: f64, seconds: f64, rate: u32) -> Vec<u8> {
+        let n = (seconds * rate as f64) as usize;
+        let mut data = Vec::with_capacity(n * 4);
+        for i in 0..n {
+            let t = i as f64 / rate as f64;
+            let s = (2.0 * std::f64::consts::PI * freq * t).sin() as f32 * 0.5;
+            let sample = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+            for _ in 0..2 {
+                data.extend_from_slice(&sample.to_le_bytes());
+            }
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+        out.extend_from_slice(b"WAVE");
+        out.extend_from_slice(b"fmt ");
+        out.extend_from_slice(&16u32.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&2u16.to_le_bytes());
+        out.extend_from_slice(&rate.to_le_bytes());
+        out.extend_from_slice(&(rate * 4).to_le_bytes());
+        out.extend_from_slice(&4u16.to_le_bytes());
+        out.extend_from_slice(&16u16.to_le_bytes());
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&data);
+        out
     }
 
     #[test]

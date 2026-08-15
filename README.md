@@ -10,7 +10,7 @@ Opus) to an Icecast server.
   `normalize`, `pipe`, `fallback`, `sequence`, `random`, `switch`,
   `rotate`, `jingles`, `mksafe`, `add`, `cue_cut`, `request.queue`,
   `request.dynamic`, `blank.detect`, `map_metadata`, `input.harbor`,
-  `input.soundcard`, `output.icecast`, `output.preview`,
+  `input.soundcard`, `input.http`, `output.icecast`, `output.preview`,
   `output.soundcard`, `server.telnet`, `set`, `log`
 - Playlist scheduling: recursive directory scan, explicit file lists, loop and shuffle
 - Gapless crossfades with configurable overlap and fade curve
@@ -236,6 +236,7 @@ phase).
 | replaygain (liq `amplify` + RG tags) | `replaygain(src, {max_boost = 6, max_cut = 6})` | done |
 | `input.harbor(...)` | `input.harbor({...})` | done |
 | `input.soundcard()` | `input.soundcard({device = nil})` — cpal capture bridged into the bus via an SPSC ring | done |
+| `input.http(...)` | `input.http(url, {reconnect_backoff = 500})` — continuous relay/pull source, reconnects on drop, exhausts while disconnected so `fallback({relay, local})` composes | done |
 | `output.icecast(...)` | `output.icecast({...}, src)` | done (single output; multi-mount in Phase 4) |
 | `output.soundcard()` | `output.soundcard({device = nil}, src)` — tap consumer playing through the device | done |
 | `output.file(...)` | `output.file({path, format}, src)` | done |
