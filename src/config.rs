@@ -314,6 +314,37 @@ fn is_video(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(feature = "video")]
+const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "gif", "tif", "tiff"];
+
+/// Recursively collect image files under `dir` (Part H2).
+#[cfg(feature = "video")]
+pub fn collect_images(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        log::warn!("video.slideshow directory not readable: {}", dir.display());
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_images(&path, out);
+        } else if is_image(&path) {
+            out.push(path);
+        }
+    }
+}
+
+#[cfg(feature = "video")]
+fn is_image(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            let e = e.to_ascii_lowercase();
+            IMAGE_EXTS.contains(&e.as_str())
+        })
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

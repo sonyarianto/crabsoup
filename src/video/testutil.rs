@@ -43,3 +43,43 @@ pub fn render_test_clip_size(tag: &str, width: u32, height: u32) -> Option<PathB
     }
     Some(path)
 }
+
+/// Render a single testsrc frame to a PNG at `width`x`height` (Part H2).
+pub fn render_test_image(tag: &str, width: u32, height: u32) -> Option<PathBuf> {
+    render_image(tag, &format!("testsrc=size={width}x{height}"))
+}
+
+/// Render a single solid-color frame to a PNG — deterministic pixels for
+/// slideshow blend assertions (Part H2).
+pub fn render_test_solid(tag: &str, width: u32, height: u32, color: &str) -> Option<PathBuf> {
+    render_image(tag, &format!("color=c={color}:s={width}x{height}"))
+}
+
+fn render_image(tag: &str, filter: &str) -> Option<PathBuf> {
+    let path =
+        std::env::temp_dir().join(format!("crabsoup-image-{}-{tag}.png", std::process::id()));
+    if path.exists() {
+        std::fs::remove_file(&path).ok();
+    }
+    let ok = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            filter,
+            "-frames:v",
+            "1",
+            "-pix_fmt",
+            "yuv420p",
+        ])
+        .arg(&path)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        std::fs::remove_file(&path).ok();
+        return None;
+    }
+    Some(path)
+}

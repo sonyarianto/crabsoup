@@ -563,8 +563,29 @@ ships its inline tests and a `benches/` row.
       symphonia — ffmpeg-next is only for video decode and the future
       mux/encode outputs. A/V interleaving in an output shipped with H6
       (the HLS segmenter subscribes to the tap at mux time).
-- [ ] **H2 — slideshow / image source** (`slideshow()`): images rendered to
-      frames with optional transitions.
+- [x] **H2 — slideshow / image source** (`video.slideshow(...)`): images
+      rendered to frames with optional transitions.
+      **Shipped:** `video.slideshow({directory/files, seconds_per_image,
+      transition = "fade"|"none", transition_seconds, fps, shuffle, loop})`
+      (marker consumed by `output.hls({video = ...})`, like `video.playlist`).
+      Every image is decoded to a YUV420P frame at script evaluation
+      (`VideoSource::decode_image`) — fail fast, and the render thread only
+      re-publishes decoded planes, so it can never fail mid-run; unreadable
+      images are skipped with a warning and all images must share one
+      resolution (same reason as playlists). `VideoSource::spawn_slideshow`
+      reuses the playlist pacing model: one render thread, an accumulated
+      PTS offset so the timeline never jumps at a picture switch, loop
+      re-shuffles per cycle, and an optional `"fade"` crossfade blends whole
+      planes of the previous picture into the current one over
+      `transition_seconds` (integer 0..=256 alpha, element-wise per plane).
+      Tests: three `video::source` tests (per-image frame count + pixel
+      equality across the switch, crossfade ramp strictly between the two
+      solid colors ending fully white, loop restart with monotonic PTS)
+      plus script tests (registration + HLS acceptance, mixed-resolution and
+      empty-directory errors, unknown-transition error). Live-verified:
+      a 13 s run of the example shape against real PNGs produced
+      keyframe-aligned h264+aac segments whose frames change exactly at
+      image boundaries (transition stills identified by frame checksums).
 - [ ] **H3 — basic video effects:** `video.fade` (in/out), `video.scale`.
 - [ ] **H4 — video encoders:** H.264/H.265/VP8/VP9 via FFI, muxed with the
       existing Opus/AAC/MP3 audio encoders into MPEG-TS/MP4.

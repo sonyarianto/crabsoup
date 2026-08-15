@@ -70,3 +70,11 @@ output.icecast({host = "localhost", port = 8000,
 -- output.hls({directory = "/var/www/hls", video = vpl,
 --             segment_seconds = 4, retention = 12},
 --            fallback({j, live, pl}))
+
+-- Slideshow variant: still images instead of a video playlist. Images are
+-- decoded once at script evaluation and crossfade over transition_seconds.
+-- -- ss = video.slideshow({directory = "./art", seconds_per_image = 5,
+-- --                        transition = "fade", transition_seconds = 1})
+-- -- output.hls({directory = "/var/www/hls", video = ss,
+-- --             segment_seconds = 4, retention = 12},
+-- --            fallback({j, live, pl}))

@@ -21,9 +21,10 @@ Opus) to an Icecast server.
 - Output: MP3 (via LAME), Ogg/Opus (via libopus + a built-in Ogg muxer with
   spec-correct CRC-32), or AAC/ADTS (via fdk-aac)
 - **Video (Part H, `--features video`)**: file → HLS(video) — `video.video`,
-  `video.single`, `video.playlist` sources feed a decode thread publishing
-  PTS-paced frames to a shared tap; `output.hls({video = ...})` live-encodes
-  them to H.264 and muxes them into keyframe-aligned MPEG-TS segments with a
+  `video.single`, `video.playlist` and `video.slideshow` (stills with
+  optional crossfades) sources feed a decode thread publishing PTS-paced
+  frames to a shared tap; `output.hls({video = ...})` live-encodes them to
+  H.264 and muxes them into keyframe-aligned MPEG-TS segments with a
   variant master playlist. See `examples/crabsoup.video.lua`
 - Graceful Ctrl-C shutdown
 

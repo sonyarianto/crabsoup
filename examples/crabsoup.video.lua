@@ -28,6 +28,12 @@ server.telnet({host = "127.0.0.1", port = 1234})
 -- Video side: same files as `pl`, same order, same loop setting.
 vpl = video.playlist({directory = "./media/video", shuffle = false, loop = true})
 
+-- Slideshow variant: swap `video = vpl` for `video = ss` below to stream
+-- still images instead of a video playlist. Images are decoded once at
+-- script evaluation and crossfade over transition_seconds.
+-- ss = video.slideshow({directory = "./art", seconds_per_image = 5,
+--                        transition = "fade", transition_seconds = 1})
+
 root = fallback({j, live, pl})
 
 -- Serve /var/www/hls with any web server; clients point at index.m3u8

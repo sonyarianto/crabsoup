@@ -20,7 +20,7 @@ a plain build — video is purely additive.
 
 ## Video sources
 
-Three operators register video tracks. Each one validates its files at
+Four operators register video tracks. Each one validates its files at
 script evaluation (fail fast) and returns an opaque marker table for
 `output.hls`.
 
@@ -30,6 +30,9 @@ video.single("media/clip.mp4")           -- same, registered as a sequence
 
 vpl = video.playlist({directory = "./media/video", shuffle = true})  -- loops by default
 vpl = video.playlist({files = {"a.mp4", "b.mp4"}, loop = false})     -- plays once
+
+ss = video.slideshow({directory = "./art", seconds_per_image = 5,
+                      transition = "fade", transition_seconds = 1})
 ```
 
 - `video.playlist` mirrors the audio `playlist`: a recursive `directory`
@@ -37,10 +40,17 @@ vpl = video.playlist({files = {"a.mp4", "b.mp4"}, loop = false})     -- plays on
   `shuffle` and `loop` (default `true`). Tracks play one at a time on a
   single decode thread with a **continuous PTS timeline** — no jump back
   when the next file starts.
-- **All tracks in one playlist must share a resolution**: video outputs
-  open their encoders at the first track's spec, and a differently-sized
-  frame would kill the encode. Unreadable files are skipped with a
-  warning; a playlist with no valid files fails the script.
+- `video.slideshow` plays still images (jpg, png, webp, bmp, gif, tif)
+  instead of video files: each image is shown for `seconds_per_image`
+  (default 5 s) at `fps` (default 25), optionally crossfading into the
+  previous picture over `transition_seconds` with `transition = "fade"`
+  (default `"none"`). The pictures are decoded once at script evaluation,
+  so the render thread only re-publishes them — a slideshow cannot fail
+  mid-run.
+- **All tracks in one playlist (or slideshow) must share a resolution**:
+  video outputs open their encoders at the first track's spec, and a
+  differently-sized frame would kill the encode. Unreadable files are
+  skipped with a warning; a sequence with no valid files fails the script.
 - `video.single(path)` is a one-track playlist that never loops.
 
 ### The audio side

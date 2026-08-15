@@ -408,7 +408,7 @@ handling — the relay preempts, the local source plays the gap. URLs are
 shape-validated at script evaluation (scheme + non-empty host, no DNS);
 resolution happens per reconnect attempt.
 
-## Video path (Parts H1/H6/H7, `--features video`)
+## Video path (Parts H1/H2/H6/H7, `--features video`)
 
 Video is a parallel side-channel to the PCM bus, compiled out by default
 (`video = ["dep:ffmpeg-next"]`; all FFmpeg `unsafe` stays inside
@@ -425,6 +425,15 @@ Video is a parallel side-channel to the PCM bus, compiled out by default
   the published timeline is continuous — the wall-clock pace is
   `start + published_pts`, and at track end the offset snaps to elapsed
   time. `loop` (default true) re-cycles and re-shuffles.
+- **Slideshow** (Part H2): `video.slideshow(...)` decodes each image to a
+  YUV420P `VideoFrame` at script evaluation (`VideoSource::decode_image`),
+  so `VideoSource::spawn_slideshow` only re-publishes decoded planes at a
+  chosen `fps` — the render thread cannot fail mid-run. The PTS model is
+  the playlist's (accumulated offset, wall-clock paced). A `"fade"`
+  transition crossfades the previous picture into the current one over
+  `transition_seconds` by blending whole planes element-wise with an
+  integer alpha 0..=256 (`blend_planes`); the first picture has no
+  transition (no `prev`).
 - **Mux**: `src/output/hls.rs` `VideoTrack` encodes to H.264 (libx264 via
   ffmpeg-next: baseline/ultrafast/zerolatency, 90 kHz time base, PTS==DTS,
   `AV_CODEC_FLAG_CLOSED_GOP` + `scenecut=0`) and muxes into the same
@@ -433,8 +442,9 @@ Video is a parallel side-channel to the PCM bus, compiled out by default
   `None` after each `send_frame`), so every segment starts with
   SPS/PPS/IDR and is independently joinable; `feed` rotates immediately
   once the tap is gone or stalled one extra window. The encoder opens at
-  the first registered track's spec; `video.playlist` therefore enforces
-  one resolution per list at script evaluation.
+  the first registered track's spec; `video.playlist` and
+  `video.slideshow` therefore enforce one resolution per list at script
+  evaluation.
 - **Master playlist**: `index.m3u8` (`#EXT-X-STREAM-INF`, RESOLUTION from
   the track spec, static CODECS) is written next to `playlist.m3u8` when
   `output.hls({video = ...})` is configured.

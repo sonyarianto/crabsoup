@@ -35,12 +35,12 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use symphonia::core::audio::SignalSpec;
 
-#[cfg(feature = "video")]
-use crate::config::collect_video;
 use crate::config::{
     ControlConfig, FileOutputConfig, HlsOutputConfig, LiveConfig, MixerConfig, OutputConfig,
     OutputFormat, OutputProtocol, SoundcardOutputConfig, StreamConfig, collect_audio,
 };
+#[cfg(feature = "video")]
+use crate::config::{collect_images, collect_video};
 use crate::engine::effects::{Agc, Amplify, Compressor, EffectSource};
 use crate::engine::mixer::{CrossfadeMixer, SmartFade};
 use crate::request::{RequestConfig, RequestUri, TrackCues, resolve};
@@ -82,6 +82,9 @@ pub struct ScriptResult {
     /// (Part H7).
     #[cfg(feature = "video")]
     pub video_playlists: Vec<crate::video::VideoPlaylistConfig>,
+    /// Slideshows registered via `video.slideshow(...)` (Part H2).
+    #[cfg(feature = "video")]
+    pub video_slideshows: Vec<crate::video::SlideshowConfig>,
     /// The shared video fan-out tap for the engine's video decode threads.
     #[cfg(feature = "video")]
     pub video_tap: Option<Arc<crate::video::VideoTap>>,
@@ -117,6 +120,9 @@ struct ScriptState {
     /// (Part H7).
     #[cfg(feature = "video")]
     video_playlists: Vec<crate::video::VideoPlaylistConfig>,
+    /// Slideshows registered via `video.slideshow(...)` (Part H2).
+    #[cfg(feature = "video")]
+    video_slideshows: Vec<crate::video::SlideshowConfig>,
     /// The shared video fan-out tap for the engine's video decode threads.
     #[cfg(feature = "video")]
     video_tap: Option<Arc<crate::video::VideoTap>>,
@@ -1552,6 +1558,82 @@ fn video_playlist_configs(opts: &Table) -> mlua::Result<Vec<crate::video::VideoC
     Ok(tracks)
 }
 
+/// Collect and validate the pictures for a `video.slideshow` table
+/// (`directory` and/or `files`), sorted and deduped. Every image is decoded
+/// to a YUV420P frame at script evaluation (fail fast; the render thread
+/// then only re-publishes the decoded planes); unreadable files are skipped
+/// with a warning. All images must share one resolution: video outputs open
+/// their encoders at the first track's spec, and the crossfade blends whole
+/// planes. Images carry no frame rate, so `fps` (default 25) is the output
+/// cadence.
+#[cfg(feature = "video")]
+fn video_slideshow_configs(opts: &Table) -> mlua::Result<crate::video::SlideshowConfig> {
+    let directory: Option<String> = opts.get("directory").ok().flatten();
+    let files: Vec<String> = opts.get("files").ok().unwrap_or_default();
+    let mut paths = Vec::new();
+    if let Some(dir) = &directory {
+        collect_images(&PathBuf::from(dir), &mut paths);
+    }
+    paths.extend(files.iter().map(PathBuf::from));
+    paths.sort();
+    paths.dedup();
+    let mut tracks = Vec::new();
+    for path in paths {
+        match crate::video::VideoSource::decode_image(&path) {
+            Ok(frame) => tracks.push(crate::video::SlideshowTrack { path, frame }),
+            Err(e) => log::warn!("video.slideshow skipping {}: {e}", path.display()),
+        }
+    }
+    if tracks.is_empty() {
+        return Err(mlua::Error::runtime(
+            "video.slideshow: no image files found (check `directory`/`files`)",
+        ));
+    }
+    let (w, h) = (tracks[0].frame.width, tracks[0].frame.height);
+    if let Some(bad) = tracks
+        .iter()
+        .find(|t| t.frame.width != w || t.frame.height != h)
+    {
+        return Err(mlua::Error::runtime(format!(
+            "video.slideshow: all images must share one resolution \
+             ({w}x{h}), got {}x{} in {}",
+            bad.frame.width,
+            bad.frame.height,
+            bad.path.display()
+        )));
+    }
+    let fps: f64 = opts.get("fps").unwrap_or(25.0);
+    let seconds_per_image: f64 = opts.get("seconds_per_image").unwrap_or(5.0);
+    // String, not Option-bool: a missing key errors, which is the default.
+    let transition: String = opts.get("transition").unwrap_or_else(|_| "none".into());
+    let transition_seconds: f64 = match transition.as_str() {
+        "none" => 0.0,
+        "fade" => opts.get("transition_seconds").unwrap_or(1.0),
+        other => {
+            return Err(mlua::Error::runtime(format!(
+                "video.slideshow: unknown transition {other:?} (use \"fade\" or \"none\")"
+            )));
+        }
+    };
+    let shuffle: bool = opts.get("shuffle").unwrap_or(false);
+    // Option-bool: mlua converts a missing key to Ok(false), so a plain
+    // unwrap_or(true) would default to *not* looping.
+    let loop_playlist: bool = opts.get("loop").ok().flatten().unwrap_or(true);
+    Ok(crate::video::SlideshowConfig {
+        tracks,
+        spec: crate::video::VideoSpec {
+            width: w,
+            height: h,
+            frame_rate: fps,
+        },
+        seconds_per_image,
+        transition_seconds,
+        shuffle,
+        loop_playlist,
+        seed: None,
+    })
+}
+
 /// A playlist whose tracks crossfade into each other, presented as a plain
 /// source so it composes inside fallback/random.
 fn crossfading_playlist(
@@ -2260,7 +2342,9 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
     // decode thread that publishes PTS-paced frames to the shared video tap.
     // `video.playlist(opts)`/`video.single(path)` (Part H7) register a
     // sequence played one file at a time on one decode thread with a
-    // continuous PTS timeline. The return values are opaque markers for
+    // continuous PTS timeline, and `video.slideshow(opts)` (Part H2)
+    // registers a sequence of still images rendered to PTS-paced frames
+    // with an optional crossfade. The return values are opaque markers for
     // video outputs.
     #[cfg(feature = "video")]
     {
@@ -2333,6 +2417,22 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         video.set("video", video_fn)?;
         video.set("playlist", playlist_fn)?;
         video.set("single", single_fn)?;
+        let ss_state = state.clone();
+        let slideshow_fn = lua.create_function(move |lua, opts: Table| {
+            let cfg = video_slideshow_configs(&opts)?;
+            let count = cfg.tracks.len();
+            let (width, height) = (cfg.spec.width, cfg.spec.height);
+            let mut s = ss_state.borrow_mut();
+            s.video_tap
+                .get_or_insert_with(|| Arc::new(crate::video::VideoTap::new()));
+            s.video_slideshows.push(cfg);
+            let info = lua.create_table()?;
+            info.set("count", count)?;
+            info.set("width", width)?;
+            info.set("height", height)?;
+            Ok(info)
+        })?;
+        video.set("slideshow", slideshow_fn)?;
         globals.set("video", video)?;
     }
 
@@ -2485,15 +2585,19 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
             let has_video = video.is_some();
             if has_video {
                 // `video` must be a marker returned by `video.video(path)`,
-                // `video.playlist(...)` or `video.single(path)`; that call
-                // also created the shared tap the output subscribes to at
-                // startup.
+                // `video.playlist(...)`, `video.single(path)` or
+                // `video.slideshow(...)`; that call also created the shared
+                // tap the output subscribes to at startup.
                 let s = hls_state.borrow();
                 #[cfg(feature = "video")]
-                if s.video_tap.is_none() || (s.video.is_empty() && s.video_playlists.is_empty()) {
+                if s.video_tap.is_none()
+                    || (s.video.is_empty()
+                        && s.video_playlists.is_empty()
+                        && s.video_slideshows.is_empty())
+                {
                     return Err(mlua::Error::runtime(
-                        "output.hls({video = ...}) requires a video.video/video.playlist \
-                         source registered first",
+                        "output.hls({video = ...}) requires a video.video/video.playlist/ \
+                         video.slideshow source registered first",
                     ));
                 }
                 #[cfg(not(feature = "video"))]
@@ -2601,6 +2705,8 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         video: std::mem::take(&mut s.video),
         #[cfg(feature = "video")]
         video_playlists: std::mem::take(&mut s.video_playlists),
+        #[cfg(feature = "video")]
+        video_slideshows: std::mem::take(&mut s.video_slideshows),
         #[cfg(feature = "video")]
         video_tap: s.video_tap.take(),
     };
@@ -2764,6 +2870,113 @@ mod tests {
         .expect("empty playlist must fail at evaluation");
         assert!(err.to_string().contains("no video files found"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(feature = "video")]
+    #[test]
+    fn video_slideshow_registers_and_hls_accepts_it() {
+        use crate::video::testutil::render_test_image;
+        let Some(a) = render_test_image("ss-script-a", 320, 240) else {
+            return;
+        };
+        let Some(b) = render_test_image("ss-script-b", 320, 240) else {
+            return;
+        };
+        let (a_str, b_str) = (a.display().to_string(), b.display().to_string());
+        let dir = std::env::temp_dir().join(format!("crabsoup-hls-ss-{}", std::process::id()));
+        let (_rt, res) = run(&format!(
+            r#"
+            set("sample_rate", 44100)
+            output.preview(sine({{freq = 440, duration = 1}}))
+            local ss = video.slideshow({{files = {{"{a_str}", "{b_str}"}},
+                fps = 30, seconds_per_image = 2,
+                transition = "fade", transition_seconds = 0.5}})
+            assert(ss.count == 2, "slideshow marker count")
+            assert(ss.width == 320 and ss.height == 240, "slideshow marker spec")
+            output.hls({{directory = "{}", video = ss}}, sine({{freq = 440, duration = 1}}))
+            "#,
+            dir.display()
+        ))
+        .expect("script runs");
+        assert_eq!(res.video_slideshows.len(), 1, "one slideshow registered");
+        let cfg = &res.video_slideshows[0];
+        assert_eq!(cfg.tracks.len(), 2);
+        assert_eq!(cfg.spec.frame_rate, 30.0, "fps option respected");
+        assert_eq!(cfg.seconds_per_image, 2.0);
+        assert_eq!(cfg.transition_seconds, 0.5);
+        assert!(cfg.loop_playlist, "loop defaults to true");
+        assert!(
+            res.hls_outputs.iter().all(|o| o.video),
+            "HLS output accepted the slideshow marker"
+        );
+        assert!(res.video_tap.is_some(), "shared video tap created");
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(feature = "video")]
+    #[test]
+    fn video_slideshow_rejects_mixed_resolutions_fast() {
+        use crate::video::testutil::render_test_image;
+        let Some(a) = render_test_image("ss-mix-a", 320, 240) else {
+            return;
+        };
+        let Some(b) = render_test_image("ss-mix-b", 160, 120) else {
+            return;
+        };
+        let (a_str, b_str) = (a.display().to_string(), b.display().to_string());
+        let err = run(&format!(
+            r#"
+            set("sample_rate", 44100)
+            output.preview(sine({{freq = 440, duration = 1}}))
+            video.slideshow({{files = {{"{a_str}", "{b_str}"}}}})
+            "#
+        ))
+        .err()
+        .expect("mixed resolutions must fail at evaluation");
+        assert!(
+            err.to_string().contains("must share one resolution"),
+            "{err}"
+        );
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    #[cfg(feature = "video")]
+    #[test]
+    fn video_slideshow_empty_directory_and_unknown_transition_fail() {
+        use crate::video::testutil::render_test_image;
+        let dir = std::env::temp_dir().join(format!("crabsoup-ss-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let err = run(&format!(
+            r#"
+            set("sample_rate", 44100)
+            output.preview(sine({{freq = 440, duration = 1}}))
+            video.slideshow({{directory = "{}"}})
+            "#,
+            dir.display()
+        ))
+        .err()
+        .expect("empty slideshow must fail at evaluation");
+        assert!(err.to_string().contains("no image files found"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+
+        let Some(a) = render_test_image("ss-xf-err", 320, 240) else {
+            return;
+        };
+        let a_str = a.display().to_string();
+        let err = run(&format!(
+            r#"
+            set("sample_rate", 44100)
+            output.preview(sine({{freq = 440, duration = 1}}))
+            video.slideshow({{files = {{"{a_str}"}}, transition = "zoom"}})
+            "#
+        ))
+        .err()
+        .expect("unknown transition must fail at evaluation");
+        assert!(err.to_string().contains("unknown transition"), "{err}");
+        std::fs::remove_file(&a).ok();
     }
 
     #[test]
