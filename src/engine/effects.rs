@@ -236,6 +236,73 @@ impl Effect for Agc {
     }
 }
 
+/// A multi-tap echo/delay (Liquidsoap `echo`).
+///
+/// Each tap reads the shared delay line at its own offset and adds
+/// `ping × read` to the dry signal; the value written back into the line is
+/// `dry + feedback × tapped`, so the echoes ring down at `feedback` gain.
+/// A tap's read position always trails its write position, so nothing in the
+/// buffer is ever read before it is written; a tap delayed exactly
+/// `max_delay` reads the slot about to be overwritten, which is the value
+/// written one full line ago — the correct full-delay echo.
+pub struct Echo {
+    /// `(delay in interleaved samples, ping)`.
+    taps: Vec<(usize, f32)>,
+    feedback: f32,
+    /// Circular delay line, one interleaved sample per slot.
+    line: Vec<f32>,
+    pos: usize,
+}
+
+impl Echo {
+    /// `taps` is `(delay seconds, ping)`; `max_delay` bounds the line and
+    /// any tap beyond it is clamped to it. `channels` sizes the delay in
+    /// interleaved samples (a `delay` of one frame = `channels` slots).
+    pub fn new(
+        taps: &[(f64, f32)],
+        feedback: f32,
+        max_delay: f64,
+        sample_rate: u32,
+        channels: usize,
+    ) -> Self {
+        let line_frames = ((max_delay * sample_rate as f64).round() as usize).max(1);
+        let line = vec![0.0f32; line_frames * channels.max(1)];
+        let taps = taps
+            .iter()
+            .map(|&(secs, ping)| {
+                let frames = ((secs * sample_rate as f64).round() as usize).max(1);
+                ((frames * channels.max(1)).min(line.len()), ping)
+            })
+            .collect();
+        Self {
+            taps,
+            feedback,
+            line,
+            pos: 0,
+        }
+    }
+}
+
+impl Effect for Echo {
+    fn process(&mut self, buf: &mut [f32], _channels: usize) {
+        let len = self.line.len();
+        if len == 0 {
+            return;
+        }
+        for s in buf.iter_mut() {
+            let dry = *s;
+            let mut acc = 0.0;
+            for (delay, ping) in &self.taps {
+                let read = (self.pos + len - delay) % len;
+                acc += ping * self.line[read];
+            }
+            self.line[self.pos] = dry + self.feedback * acc;
+            self.pos = (self.pos + 1) % len;
+            *s = dry + acc;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,6 +320,48 @@ mod tests {
         fn is_exhausted(&self) -> bool {
             false
         }
+    }
+
+    #[test]
+    fn echo_rings_down_an_impulse() {
+        // 10 Hz sample clock, 0.2 s delay = 2 samples; the ping 0.5 copy
+        // rings at feedback 1.0: 1, 0, 0.5, 0, 0.25, 0, 0.125, 0.
+        let mut fx = Echo::new(&[(0.2, 0.5)], 1.0, 1.0, 10, 1);
+        let mut buf = vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        fx.process(&mut buf, 1);
+        assert_eq!(buf, vec![1.0, 0.0, 0.5, 0.0, 0.25, 0.0, 0.125, 0.0]);
+    }
+
+    #[test]
+    fn echo_feedback_zero_emits_a_single_copy() {
+        let mut fx = Echo::new(&[(0.2, 0.5)], 0.0, 1.0, 10, 1);
+        let mut buf = vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        fx.process(&mut buf, 1);
+        assert_eq!(buf, vec![1.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn echo_multi_tap_emits_each_tap() {
+        // Taps at 0.1 s (1 sample, ping 0.5) and 0.2 s (2 samples, ping 0.25).
+        let mut fx = Echo::new(&[(0.1, 0.5), (0.2, 0.25)], 0.0, 1.0, 10, 1);
+        let mut buf = vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        fx.process(&mut buf, 1);
+        assert_eq!(buf[0], 1.0);
+        assert_eq!(buf[1], 0.5);
+        assert_eq!(buf[2], 0.25);
+        assert_eq!(buf[3], 0.0);
+    }
+
+    #[test]
+    fn echo_stereo_delay_counts_frames_not_samples() {
+        // 0.2 s at a 10 Hz clock = 2 frames = 4 interleaved samples; the
+        // mono impulse at frame 0 (L=1, R=0) echoes into frame 2's L slot.
+        let mut fx = Echo::new(&[(0.2, 0.5)], 0.0, 1.0, 10, 2);
+        let mut buf = vec![0.0f32; 16];
+        buf[0] = 1.0;
+        fx.process(&mut buf, 2);
+        assert_eq!(buf[4], 0.5, "delayed L copy");
+        assert_eq!(buf[5], 0.0, "delayed R stays silent");
     }
 
     #[test]

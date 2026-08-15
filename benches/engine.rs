@@ -15,7 +15,7 @@ use ringbuf::traits::*;
 use symphonia::core::audio::{Channels, SignalSpec};
 
 use crabsoup::config::MixerConfig;
-use crabsoup::engine::effects::{Agc, Amplify, Compressor, EffectSource};
+use crabsoup::engine::effects::{Agc, Amplify, Compressor, Echo, EffectSource};
 use crabsoup::engine::mixer::{CrossfadeMixer, PriorityMixer, SmartFade};
 use crabsoup::engine::pitch::{PitchMode, PitchSource};
 use crabsoup::output::encoder::{AacEncoder, Encoder, Mp3Encoder, OpusEncoder};
@@ -252,6 +252,34 @@ fn effects(c: &mut Criterion) {
             CHANS,
         ));
         let mut chain = EffectSource::new(agced, Amplify::new(0.9), CHANS);
+        let mut buf = vec![0.0f32; BUF];
+        b.iter(|| {
+            chain.next_buffer(&mut buf);
+            black_box(&buf);
+        });
+    });
+
+    group.bench_function("echo/single_tap", |b| {
+        let child: Box<dyn AudioSource> = Box::new(SineSource::new(440.0, None, 0.5, RATE, CHANS));
+        let mut chain = EffectSource::new(
+            child,
+            Echo::new(&[(0.25, 0.5)], 0.5, 1.0, RATE, CHANS),
+            CHANS,
+        );
+        let mut buf = vec![0.0f32; BUF];
+        b.iter(|| {
+            chain.next_buffer(&mut buf);
+            black_box(&buf);
+        });
+    });
+
+    group.bench_function("echo/two_tap", |b| {
+        let child: Box<dyn AudioSource> = Box::new(SineSource::new(440.0, None, 0.5, RATE, CHANS));
+        let mut chain = EffectSource::new(
+            child,
+            Echo::new(&[(0.25, 0.5), (0.5, 0.25)], 0.5, 1.0, RATE, CHANS),
+            CHANS,
+        );
         let mut buf = vec![0.0f32; BUF];
         b.iter(|| {
             chain.next_buffer(&mut buf);

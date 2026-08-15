@@ -34,7 +34,7 @@ One engine thread plus one thread per output:
 - Registers the Liquidsoap-flavoured Lua stdlib: `playlist`,
   `smart_crossfade`, `single`, `blank` (+ `blank.detect`), `sine`,
   `amplify`, `compress`, `normalize`, `replaygain`, `stretch`, `pitch`,
-  `pipe`, `jingles`,
+  `echo`, `pipe`, `jingles`,
   `fallback`/`sequence`/`random`, `switch`, `rotate`, `mksafe`, `add`,
   `cue_cut`,   `map_metadata`, `request.queue`, `request.dynamic`,
   `input.harbor`, `input.soundcard`, `input.http`, `output.icecast`,
@@ -222,6 +222,26 @@ One engine thread plus one thread per output:
   `label`, `replaygain_db`, `crossfade_overrides`, and `skip` forward to the
   child. At child EOF the stretch flush tail is drained before `is_exhausted`
   reports true.
+
+## Echo / delay (`src/engine/effects.rs`)
+
+- `echo(src, {delay, ping, feedback, delay2, ping2, delay3, ping3,
+  max_delay})` is an `Echo` effect: a shared circular delay line sized to
+  `max_delay` (default 2 s), with up to three taps. Each tap adds
+  `ping × line[read]` to the dry signal; the line is written with
+  `dry + feedback × tapped`, so a single tap rings down at `feedback` gain
+  (feedback 0 emits exactly one copy).
+- Delays are expressed in frames (`seconds × rate`, × channels in the
+  interleaved line) so multichannel stays phase-aligned; taps over
+  `max_delay` are clamped to it. `process` walks the buffer sample by sample
+  and a tap's read position always trails its write, so no sample is read
+  before it is written even when the delay is shorter than the buffer; a tap
+  delayed exactly `max_delay` reads the slot about to be overwritten, which
+  holds the value written one full line ago — the correct full-delay echo.
+- The delay line rings down only while the child keeps producing: the last
+  `delay` worth of audio is dropped at child EOF (effects do not extend the
+  track), and `EffectSource` forwards `remaining_seconds`/`label`/`skip`
+  unchanged.
 
 ## Mixer control (`src/engine/mixer.rs`)
 

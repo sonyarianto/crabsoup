@@ -113,6 +113,8 @@ anchors for later phases.
 | mixers/priority/passthrough | 7 µs | 0.008 % |
 | mixers/priority/ducking (SetLive per buffer) | 9 µs | 0.01 % |
 | effects/compressor+agc+amplify | 604 µs | 0.65 % |
+| effects/echo/single_tap (0.25 s, ping 0.5, fb 0.5) | 76 µs | 0.08 % |
+| effects/echo/two_tap (0.25 s + 0.5 s) | 86 µs | 0.09 % |
 | resampler/sinc16/44k_to_48k | 831 µs | 0.89 % |
 | resampler/sinc16/48k_to_44k1 | 795 µs | 0.86 % |
 | encode/mp3 (192 kbps) | 501 µs | 0.54 % |
@@ -800,6 +802,20 @@ its own confined module per the Part H convention note.
       ~220 Hz at constant duration; finite sources exhaust cleanly; remaining
       seconds scale with tempo) and script tests (stretch, pitch, ratio
       validation) all green.
+- [x] **I2 — echo/delay (multi-tap)**: landed as `echo(src, {delay, ping,
+      feedback, delay2/ping2, delay3/ping3, max_delay})` — an `Echo` effect
+      in `src/engine/effects.rs` reading a shared circular delay line, each
+      tap adding `ping × read` to the dry signal while the line is written
+      with `dry + feedback × tapped`, so echoes ring down at `feedback`. A
+      tap's read always trails its write, so intra-buffer reads never hit
+      unwritten samples (a tap at exactly `max_delay` reads the slot being
+      overwritten — the full-line-ago value, the correct echo). Delay counts
+      frames, not samples, so stereo stays in phase; `max_delay` bounds the
+      line and clamps overlong taps. Allocation-free in the pull chain.
+      Tests: impulse ringdown (1 → 0.5 → 0.25 → 0.125), feedback-off single
+      copy, multi-tap offsets, stereo phase, and script-level energy windows
+      (dry-only first 50 ms vs aligned 1000 Hz copy after) + validation.
+      Bench: single_tap ~76 µs / two_tap ~86 µs per 92.9 ms buffer.
 - [ ] **I2 — echo/delay** (multi-tap), **I3 — convolution reverb** (IR
       files), **I4 — EQ/filters** (low/high-pass, parametric).
 - [ ] **I5 — stereo imaging** (`stereo.widen`, `stereo.pan`, mid-side),

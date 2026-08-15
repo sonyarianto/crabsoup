@@ -41,7 +41,7 @@ use crate::config::{
 };
 #[cfg(feature = "video")]
 use crate::config::{collect_images, collect_video};
-use crate::engine::effects::{Agc, Amplify, Compressor, EffectSource};
+use crate::engine::effects::{Agc, Amplify, Compressor, Echo, EffectSource};
 use crate::engine::mixer::{CrossfadeMixer, SmartFade};
 use crate::engine::pitch::{PitchMode, PitchSource};
 use crate::request::{RequestConfig, RequestUri, TrackCues, resolve};
@@ -2148,6 +2148,54 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
             )
             .map_err(mlua::Error::runtime)?;
             Ok(LuaSource::new(Box::new(src)))
+        })?,
+    )?;
+
+    let echo_state = state.clone();
+    globals.set(
+        "echo",
+        lua.create_function(move |_, (mut source, opts): (LuaSource, Option<Table>)| {
+            let delay = opt_f64(&opts, "delay", 0.25)?;
+            let ping = opt_f64(&opts, "ping", 0.5)?;
+            let feedback = opt_f64(&opts, "feedback", 0.5)?;
+            let max_delay = opt_f64(&opts, "max_delay", 2.0)?;
+            if !delay.is_finite() || delay <= 0.0 {
+                return Err(mlua::Error::runtime(
+                    "echo: delay must be a positive finite number",
+                ));
+            }
+            if !ping.is_finite()
+                || !feedback.is_finite()
+                || !max_delay.is_finite()
+                || max_delay <= 0.0
+            {
+                return Err(mlua::Error::runtime(
+                    "echo: ping/feedback/max_delay must be finite (max_delay positive)",
+                ));
+            }
+            let delay2 = opt_f64(&opts, "delay2", 0.0)?;
+            let delay3 = opt_f64(&opts, "delay3", 0.0)?;
+            let mut taps = vec![(delay, ping as f32)];
+            if delay2 > 0.0 {
+                taps.push((delay2, opt_f64(&opts, "ping2", ping)? as f32));
+            }
+            if delay3 > 0.0 {
+                taps.push((delay3, opt_f64(&opts, "ping3", ping)? as f32));
+            }
+            let (spec, _) = bus(&echo_state);
+            let child = source.take();
+            let fx = Echo::new(
+                &taps,
+                feedback as f32,
+                max_delay,
+                spec.rate,
+                spec.channels.count(),
+            );
+            Ok(LuaSource::new(Box::new(EffectSource::new(
+                child,
+                fx,
+                spec.channels.count(),
+            ))))
         })?,
     )?;
 
@@ -4699,6 +4747,55 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("ratio must be a positive"));
+    }
+
+    #[test]
+    fn echo_adds_delayed_copies_of_a_tone() {
+        let (_rt, res) = run(r#"
+            output.preview(echo(sine({freq = 1000, duration = 0.2}),
+                                {delay = 0.05, ping = 0.5, feedback = 0}))
+            "#)
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        let mut energy = [0f64; 4];
+        let mut sample = 0usize;
+        let mut total = 0usize;
+        while !root.is_exhausted() {
+            let n = root.next_buffer(&mut buf);
+            total += n;
+            for &s in &buf[..n] {
+                // 50 ms windows (4410 interleaved stereo samples each):
+                // [0,0.05) dry, then dry + 0.5-delayed copy until the 0.2 s
+                // source ends (1000 Hz, so the 0.05 s delay is a whole
+                // number of periods and the copy aligns with the dry).
+                let w = (sample / 4410).min(3);
+                energy[w] += (s as f64) * (s as f64);
+                sample += 1;
+            }
+        }
+        assert_eq!(total, (0.2 * 44_100.0 * 2.0) as usize);
+        assert!(
+            energy[1] > energy[0] * 1.9,
+            "no echo in window 1: {energy:?}"
+        );
+        assert!(
+            energy[2] > energy[0] * 1.9,
+            "no echo in window 2: {energy:?}"
+        );
+        assert!(
+            (energy[3] - energy[2]).abs() < energy[0] * 0.1,
+            "ringdown should stop with feedback 0: {energy:?}"
+        );
+    }
+
+    #[test]
+    fn echo_rejects_negative_delay() {
+        let err = match run(r#"output.preview(echo(sine({}), {delay = -1}))"#) {
+            Ok(_) => panic!("echo negative delay must fail"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("delay must be a positive"));
     }
 
     // ---- Phase 5: switch / rotate ----------------------------------------

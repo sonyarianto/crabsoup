@@ -23,6 +23,8 @@ pl = playlist({directory = "./media", shuffle = false, loop = true})
 -- DSP effects chain (each wraps the previous stage):
 --   stretch({ratio = 1.5}, src)     tempo change, pitch preserved
 --   pitch({semitones = 7}, src)     key shift, duration preserved
+--   echo(src, {delay = 0.25, ping = 0.5, feedback = 0.5,
+--              delay2 = 0.5, ping2 = 0.25})   multi-tap echo
 --   amplify(src, gain); compress(src, opts); normalize(src, opts);
 --   replaygain(src);   -- see examples/crabsoup.dsp.lua for a full chain
 -- pl = normalize(pl, {target = -13, attack = 3, release = 0.5})
