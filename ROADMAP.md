@@ -746,6 +746,24 @@ ships its inline tests and a `benches/` row.
 Acceptance: file → RTMP and file → HLS(video) verified end-to-end (live);
 A/V stays in sync across a long clip; slideshow plays; video-path benchmark
 rows recorded against the baseline convention.
+**All acceptance items verified** in the session that landed H4:
+- **Long-clip A/V sync:** a 60 s testsrc+ sine pair recorded via `output.mp4`
+  with the real binary decodes clean; both streams start at PTS 0, the
+  video timeline is a uniform 40 ms grid across the whole clip (frames 30 →
+  1.16 s, 500 → 19.96 s, 1000 → 39.96 s, last → 59.92 s) while audio spans
+  0 → 60.02 s — start and end offsets both within one frame, no drift.
+- **Long-clip HLS:** the same 60 s pair through `output.hls` produced 16
+  keyframe-aligned segments; a mid-stream segment (t ≈ 24–28 s) probes as
+  h264+aac and decodes clean.
+- **Slideshow plays:** a 3-image crossfading slideshow → `output.mp4`
+  records h264 320x240 + aac at exactly 6.0 s, decoding with zero warnings.
+- **Slideshow grid fix:** the slideshow render thread set each new picture's
+  first PTS from wall clock (`start.elapsed()`), which drifts a fraction of
+  a frame off the ideal grid and puts two frames at nearly the same
+  timestamp at every picture switch — strict muxers flagged a duplicate DTS
+  on decode of the H4 recording. Now the offset accumulates the ideal
+  `frames_per_image × frame_us` like the playlist path, so the published
+  timeline is a strict 40 ms grid with all-PTS-unique frames.
 
 ### Part I — advanced audio & effects (Phase 2, Q1 – Q2 2027)
 

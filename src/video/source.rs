@@ -391,7 +391,11 @@ impl VideoSource {
                         tap.publish(Arc::new(frame));
                     }
                     prev = Some(show.clone());
-                    offset_us = start.elapsed().as_micros() as u64;
+                    // Keep the published timeline on the ideal frame grid —
+                    // wall clock (`start.elapsed()`) drifts sub-frame off it
+                    // at every picture switch and can put two frames at the
+                    // same timestamp, which strict muxers flag as a duplicate.
+                    offset_us += frames_per_image * frame_us;
                     index += 1;
                 }
                 log::info!("video.slideshow: render thread ended");
