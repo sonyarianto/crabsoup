@@ -604,6 +604,66 @@ anywhere, and the soundcard work (F2) had no clock-drift story.
       `docs/ARCHITECTURE.md`, same treatment as F2's other hardware
       checks.
 
+### Part G3 — production-script port case study (dailymate radio)
+
+**Status: gaps recorded; each is a backlog candidate for Phase 2/3
+(see Parts I–K).** The first real production `.liq` script ported to
+`crabsoup.lua`: a 24/7 music station broadcasting to HLS through a
+Thimeo Stereo Tool processor, with play-info side files. The mapping
+below is ground truth for what "Liquidsoap parity" means beyond the
+operator checklist — every gap came from porting a running station, not
+from a feature list.
+
+| Liquidsoap (production) | Crabsoup | Status |
+| --- | --- | --- |
+| `pipe(replay_delay = 1.0, process = "stereo_tool_cmd_64 - - -s dailymate_radio.sts ...")` | `pipe({process, format = "s16le"}, src)` — bounded queue + backpressure replace `replay_delay`; same Thimeo binary, same `.sts`, same license key | shipped, live-verified |
+| `source.on_metadata(fn)` writing `now-playing.txt` (JSON) | `on_metadata(src, fn)` fires with the title table — but the Lua sandbox has no `json.stringify`, so the file is hand-formatted | shipped minus JSON |
+| `playlist(reload_mode = "watch", "dailymate_radio.playlist")` — backend rewrites the playlist file, station picks it up live | static file list read once at script start; no file watching | **gap** |
+| `check_next = fn` writing `next-playing.txt` from the upcoming track's metadata | no next-track metadata hook (`on_track` fires at the boundary with the *current* track only) | **gap** |
+| HLS: 3 fdk-aac renditions (64k HE-AACv2 / 128k / 320k) + variant master playlist | `output.hls` — one AAC-LC stream per call; multi-output allows 3 parallel calls, but no master playlist tying them into one adaptive set | **gap** |
+| custom `segment_name` (timestamped), `persist_at` state file, `fallible = true` | fixed `seg-NNNNNN.ts` naming; no segment-state persistence across restarts | **gap** |
+
+Why 3 streams: HLS ABR is *client-driven* — the player picks a rendition
+from the master playlist based on measured bandwidth. A single stream
+leaves the player no choice, so "HLS is adaptive" only holds when the
+server offers multiple renditions; the 64/128/320 set *is* the
+adaptivity. Audio-only switching is subtler than video (64 vs 320 kbit/s
+is a 5x rate but a small perceptual step), yet still the standard way to
+cover weak networks without degrading good ones.
+
+Backlog candidates (acceptance sketched, sized for the Phase 2/3
+window of Parts I–K):
+- [ ] **G3.1 — playlist file watch-reload.** Re-read the playlist file
+      when its mtime changes (poll, not inotify — one `stat` per track
+      boundary is free). Acceptance: a test rewrites the file and asserts
+      the next track comes from the new list. Interim workaround for the
+      station: `request.dynamic` re-reading the file each call.
+- [ ] **G3.2 — next-track metadata hook.** `on_next_metadata(src, fn)`:
+      fires when the engine preloads the upcoming track (the preload
+      already happens for crossfades — this just reports its metadata).
+      Acceptance: `next-playing.txt` written before the track starts, on
+      both crossfade and queue paths.
+- [ ] **G3.3 — multi-rendition HLS + variant master playlist.**
+      `output.hls({renditions = {{bitrate = 64000, ...}, ...}, ...})`
+      fanning one tap into N AAC encodes and emitting a master `m3u8`
+      (EXT-X-MEDIA / EXT-X-STREAM-INF) alongside the per-rendition
+      playlists; optionally custom `segment_name` and `persist_at`
+      (segment counters + unfinished-segment list, so a restart resumes
+      cleanly) and `fallible = true` (silence while the source is
+      exhausted instead of failing the output). Acceptance: ffprobe reads
+      the master playlist and decodes a window of each rendition; killing
+      crabsoup mid-segment and restarting produces a playlist without
+      gap/drift.
+- [ ] **G3.4 — HE-AACv2 (MPEG-4 PS) encoder profile.** The encoder has
+      LC and HE (SBR); 64 kbit/s stereo needs PS (SBR + parametric
+      stereo, `AOT = 29`). Acceptance: a 64 kbit/s HE-AACv2 ADTS stream
+      decodes at 44.1 kHz stereo via ffprobe.
+- [ ] **G3.5 — `json.stringify` in the Lua sandbox.** A stdlib function
+      (plus `json.parse`) so side-file writers (now/next-playing.txt) and
+      telnet handlers emit machine-readable output without hand-rolled
+      string building. Acceptance: `json.stringify({title = "x"})`
+      round-trips through `json.parse`.
+
 ### Suggested execution order
 
 1. Buffer-reuse pass in `CrossfadeMixer`/`PriorityMixer` (perf, low risk, no
