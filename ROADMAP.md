@@ -633,11 +633,30 @@ cover weak networks without degrading good ones.
 
 Backlog candidates (acceptance sketched, sized for the Phase 2/3
 window of Parts I–K):
-- [ ] **G3.1 — playlist file watch-reload.** Re-read the playlist file
-      when its mtime changes (poll, not inotify — one `stat` per track
-      boundary is free). Acceptance: a test rewrites the file and asserts
-      the next track comes from the new list. Interim workaround for the
-      station: `request.dynamic` re-reading the file each call.
+- [ ] **G3.1 — playlist source watch-reload (file *and* directory).**
+      The playlist's list of tracks is read once at script start; a
+      running station cannot pick up changes without a restart. Two
+      production cases share one hook ("the source list can change at
+      runtime") and should share one `watch` mode:
+      - **Playlist file rewritten by a backend** (dailymate radio):
+        `dailymate_radio.playlist` is regenerated externally; the
+        station must pick up the new list live.
+      - **Directory pickup**: files added to a scanned folder should
+        enter the rotation automatically; the folder's mtime is polled
+        at track boundaries (one `stat` per boundary is free — inotify
+        only if a folder is genuinely huge), then re-scanned.
+      Semantics to nail down before implementing: new files enter the
+      rotation (dedup against the current list); removed files drop
+      quietly — including one that is mid-preload for a crossfade (skip,
+      don't error); a re-scan never reshuffles the running order or
+      repeats the current track; the track already preloaded as "next"
+      stays honoured. Granularity is the track boundary (same as
+      `switch` dayparting), never mid-track.
+      Acceptance: a test rewrites the playlist file (or adds a file to
+      the directory) and asserts the next track comes from the new
+      source, with shuffle/loop continuity preserved.
+      Interim workaround for the station: `request.dynamic` re-reading
+      the file / re-scanning the directory each call.
 - [ ] **G3.2 — next-track metadata hook.** `on_next_metadata(src, fn)`:
       fires when the engine preloads the upcoming track (the preload
       already happens for crossfades — this just reports its metadata).
