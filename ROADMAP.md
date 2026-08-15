@@ -28,6 +28,14 @@
       so they cannot overtake each other); the output thread never blocks.
       Confirmed live: `tap: consumer slow, dropping frame` at exactly the
       metadata-update moments, gone after the fix.
+- [x] **Stale-buffer repeats in the mixers (hardening)**: both
+      `CrossfadeMixer` and `PriorityMixer` mixed over `n_a.max(n_b)` /
+      `n_m.max(n_o)` frames, so a track whose final buffer is partial
+      mixed stale samples from its previous buffer into the tail of the
+      mix — a ~one-buffer repeat of earlier audio (loud after a jingle
+      ends at full duck gain). Both now zero the stale tail before mixing;
+      covered by `partial_final_buffer_of_a_does_not_repeat_stale_audio`
+      and `partial_final_buffer_of_override_does_not_repeat_stale_audio`.
 - [x] **CLI**: running without `-c` prints help and exits (was: silently
       defaulted to `crabsoup.lua` and looked like a hang).
 - [x] YAML config (`-c crabsoup.yaml`)

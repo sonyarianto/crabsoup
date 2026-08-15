@@ -324,6 +324,15 @@ impl AudioSource for CrossfadeMixer {
                 let n_b = next.next_buffer(&mut self.scratch_b);
 
                 let out_len = n_a.max(n_b);
+                // A source that ended mid-buffer leaves stale samples in
+                // the tail of its scratch buffer; zero them so the fade
+                // cannot mix a ~one-buffer repeat of earlier audio in.
+                if n_a < out_len {
+                    self.scratch_a[n_a..out_len].fill(0.0);
+                }
+                if n_b < out_len {
+                    self.scratch_b[n_b..out_len].fill(0.0);
+                }
                 let chans = self.channels;
                 let frames_out = out_len / chans;
                 let cf = self.fade_frames.max(1) as f64;
@@ -636,6 +645,14 @@ impl AudioSource for PriorityMixer {
         }
 
         let out_len = n_m.max(n_o);
+        // Same stale-tail guard as the crossfade: an override that ended
+        // mid-buffer must not mix a repeat of its previous buffer in.
+        if n_m < out_len {
+            self.scratch_m[n_m..out_len].fill(0.0);
+        }
+        if n_o < out_len {
+            self.scratch_o[n_o..out_len].fill(0.0);
+        }
         for (i, out) in buffer.iter_mut().take(out_len).enumerate() {
             *out = (self.scratch_m[i] as f64 * (1.0 - self.gain)
                 + self.scratch_o[i] as f64 * self.gain) as f32;
@@ -1067,6 +1084,84 @@ mod tests {
         // still be at t=0.25 -> 0.25*0.01 + 0.75*2.0 = 1.5025 here).
         mix.next_buffer(&mut buf);
         assert!((buf[0] - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn partial_final_buffer_of_a_does_not_repeat_stale_audio() {
+        // A is 15 frames: buffer 1 pulls a full 10, buffer 2 pulls the
+        // partial 5-frame tail while B fills the whole 10-frame buffer.
+        // Without the stale-tail guard, the fade would mix A's previous
+        // buffer into frames 5..10 as a repeat.
+        let provider = Box::new(FakeProvider::new(vec![(1.0, 15), (2.0, 1000)]));
+        let cfg = mixer_config(0.2);
+        let mut mix = CrossfadeMixer::new(provider, &cfg, RATE as u32, CHANS);
+
+        let mut buf = vec![0f32; 10 * CHANS];
+        // Buffer 1: preload fires (A has 0.15s <= 0.2s), fade t=0..0.5.
+        mix.next_buffer(&mut buf);
+        assert!((buf[0] - 1.0).abs() < 1e-6);
+        assert!((buf[18] - 1.45).abs() < 1e-6); // t=0.45: 0.55 + 0.90
+
+        // Buffer 2: n_a = 5, n_b = 10, out_len = 10. Frames 5..9 must be
+        // B's fade-in only (2.0 * gain_b) — a stale repeat of A would add
+        // (1 - gain_b) * 1.0, e.g. frame 5: 0.25 + 1.5 = 1.75 instead of 1.5.
+        mix.next_buffer(&mut buf);
+        assert!((buf[0] - 1.5).abs() < 1e-6); // frame 0: t=0.5
+        assert!((buf[8] - 1.7).abs() < 1e-6); // frame 4: t=0.7, A still live
+        assert!((buf[10] - 1.5).abs() < 1e-6); // frame 5: t=0.75 -> B only
+        assert!((buf[19] - 1.9).abs() < 1e-6); // frame 9: t=0.95 -> B only
+
+        // A exhausted, fade complete (20 frames) -> B at full gain.
+        mix.next_buffer(&mut buf);
+        assert!((buf[0] - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn partial_final_buffer_of_override_does_not_repeat_stale_audio() {
+        // The DJ override is 15 frames: full buffer, then a 5-frame tail at
+        // full duck gain. Without the stale-tail guard, the tail's second
+        // half would repeat the override's first buffer at volume 3.0.
+        let (tx, rx) = mpsc::channel();
+        let main = Box::new(FakeSource {
+            value: 1.0,
+            total_frames: 100_000,
+            pos_frames: 0,
+            fades: None,
+        });
+        let cfg = mixer_config(0.2);
+        let cfg = MixerConfig {
+            duck_seconds: 0.1, // duck_frames = 10 -> gain reaches 1.0 in one buffer
+            ..cfg
+        };
+        let spec = symphonia::core::audio::SignalSpec::new(
+            RATE as u32,
+            symphonia::core::audio::Channels::FRONT_LEFT
+                | symphonia::core::audio::Channels::FRONT_RIGHT,
+        );
+        let mut pm = PriorityMixer::new(main, rx, &cfg, spec, 10);
+        let dj = FakeSource {
+            value: 3.0,
+            total_frames: 15,
+            pos_frames: 0,
+            fades: None,
+        };
+        tx.send(MixCommand::SetLive(Box::new(dj))).unwrap();
+
+        let mut buf = vec![0f32; 10 * CHANS];
+        // Buffer 1: gain 0 (stepped after mixing) -> main.
+        pm.next_buffer(&mut buf);
+        assert!((buf[0] - 1.0).abs() < 1e-6);
+        // Buffer 2: gain 1.0; override pulls only 5 frames. Frames 5..9
+        // must be silent (main ducked, override gone) — without the guard
+        // they would repeat the override at 3.0.
+        pm.next_buffer(&mut buf);
+        assert!((buf[0] - 3.0).abs() < 1e-6);
+        assert!((buf[9] - 3.0).abs() < 1e-6);
+        assert!((buf[10] - 0.0).abs() < 1e-6);
+        assert!((buf[19] - 0.0).abs() < 1e-6);
+        // Buffer 3: override ended, gain falls back -> main returns.
+        pm.next_buffer(&mut buf);
+        assert!((buf[0] - 1.0).abs() < 1e-6);
     }
 
     #[test]
