@@ -17,5 +17,5 @@ pub mod testutil;
 pub use encode::{EncodedAu, VideoEncoder};
 pub use ffi::VideoDecoder;
 pub use frame::VideoFrame;
-pub use source::{VideoConfig, VideoSource, VideoSourceHandle, VideoSpec};
+pub use source::{VideoConfig, VideoPlaylistConfig, VideoSource, VideoSourceHandle, VideoSpec};
 pub use tap::VideoTap;

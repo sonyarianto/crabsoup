@@ -23,6 +23,9 @@ live DJ input and one-shot jingles with crossfades, and broadcasts the result
   Liquidsoap-style telnet control port
 - **Output**: MP3 (via LAME), Ogg/Opus (via libopus + a built-in Ogg muxer
   with spec-correct CRC-32), or AAC/ADTS (via fdk-aac)
+- **Video (opt-in, `--features video`)**: file → HLS(video) with
+  `video.video`/`video.single`/`video.playlist` sources and keyframe-aligned
+  MPEG-TS segments plus a master playlist — see the [video guide](/guide/video)
 - **Graceful Ctrl-C shutdown**
 
 ## Building

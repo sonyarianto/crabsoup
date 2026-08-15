@@ -35,6 +35,8 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use symphonia::core::audio::SignalSpec;
 
+#[cfg(feature = "video")]
+use crate::config::collect_video;
 use crate::config::{
     ControlConfig, FileOutputConfig, HlsOutputConfig, LiveConfig, MixerConfig, OutputConfig,
     OutputFormat, OutputProtocol, SoundcardOutputConfig, StreamConfig, collect_audio,
@@ -76,6 +78,10 @@ pub struct ScriptResult {
     /// Video tracks registered via `video.video(path)` (Part H).
     #[cfg(feature = "video")]
     pub video: Vec<crate::video::VideoConfig>,
+    /// Video playlists registered via `video.playlist(...)`/`video.single`
+    /// (Part H7).
+    #[cfg(feature = "video")]
+    pub video_playlists: Vec<crate::video::VideoPlaylistConfig>,
     /// The shared video fan-out tap for the engine's video decode threads.
     #[cfg(feature = "video")]
     pub video_tap: Option<Arc<crate::video::VideoTap>>,
@@ -107,6 +113,10 @@ struct ScriptState {
     /// Video tracks registered via `video.video(path)` (Part H).
     #[cfg(feature = "video")]
     video: Vec<crate::video::VideoConfig>,
+    /// Video playlists registered via `video.playlist(...)`/`video.single`
+    /// (Part H7).
+    #[cfg(feature = "video")]
+    video_playlists: Vec<crate::video::VideoPlaylistConfig>,
     /// The shared video fan-out tap for the engine's video decode threads.
     #[cfg(feature = "video")]
     video_tap: Option<Arc<crate::video::VideoTap>>,
@@ -1497,6 +1507,51 @@ fn playlist_requests(opts: &Table) -> mlua::Result<Vec<RequestUri>> {
     Ok(requests)
 }
 
+/// Collect and validate the video tracks for a `video.playlist` table
+/// (`directory` and/or `files`), sorted and deduped. Every file is probed
+/// at script evaluation; unreadable files are skipped with a warning.
+/// All tracks must share one resolution: video outputs open their encoders
+/// at the first track's spec, and a differently-sized frame would kill the
+/// encode. `frame_rate` may differ (the encoder is PTS-driven).
+#[cfg(feature = "video")]
+fn video_playlist_configs(opts: &Table) -> mlua::Result<Vec<crate::video::VideoConfig>> {
+    let directory: Option<String> = opts.get("directory").ok().flatten();
+    let files: Vec<String> = opts.get("files").ok().unwrap_or_default();
+    let mut paths = Vec::new();
+    if let Some(dir) = &directory {
+        collect_video(&PathBuf::from(dir), &mut paths);
+    }
+    paths.extend(files.iter().map(PathBuf::from));
+    paths.sort();
+    paths.dedup();
+    let mut tracks = Vec::new();
+    for path in paths {
+        match crate::video::VideoSource::validate(&path) {
+            Ok(spec) => tracks.push(crate::video::VideoConfig { path, spec }),
+            Err(e) => log::warn!("video playlist skipping {}: {e}", path.display()),
+        }
+    }
+    if tracks.is_empty() {
+        return Err(mlua::Error::runtime(
+            "video.playlist: no video files found (check `directory`/`files`)",
+        ));
+    }
+    let (w, h) = (tracks[0].spec.width, tracks[0].spec.height);
+    if let Some(bad) = tracks
+        .iter()
+        .find(|t| t.spec.width != w || t.spec.height != h)
+    {
+        return Err(mlua::Error::runtime(format!(
+            "video.playlist: all tracks must share one resolution \
+             ({w}x{h}), got {}x{} in {}",
+            bad.spec.width,
+            bad.spec.height,
+            bad.path.display()
+        )));
+    }
+    Ok(tracks)
+}
+
 /// A playlist whose tracks crossfade into each other, presented as a plain
 /// source so it composes inside fallback/random.
 fn crossfading_playlist(
@@ -1633,7 +1688,9 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         lua.create_function(move |_, opts: Table| {
             let requests = playlist_requests(&opts)?;
             let shuffle: bool = opts.get("shuffle").unwrap_or(false);
-            let loop_playlist: bool = opts.get("loop").unwrap_or(true);
+            // Option-bool: mlua converts a missing key to Ok(false), so a
+            // plain unwrap_or(true) would default to *not* looping.
+            let loop_playlist: bool = opts.get("loop").ok().flatten().unwrap_or(true);
             let src = crossfading_playlist(requests, shuffle, loop_playlist, &pl_state);
             Ok(LuaSource::new(src))
         })?,
@@ -1651,7 +1708,9 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         lua.create_function(move |_, opts: Table| {
             let requests = playlist_requests(&opts)?;
             let shuffle: bool = opts.get("shuffle").unwrap_or(false);
-            let loop_playlist: bool = opts.get("loop").unwrap_or(true);
+            // Option-bool: mlua converts a missing key to Ok(false), so a
+            // plain unwrap_or(true) would default to *not* looping.
+            let loop_playlist: bool = opts.get("loop").ok().flatten().unwrap_or(true);
             let global = smart_state.borrow().mixer.crossfade_seconds;
             let fade_out: f64 = opts.get::<Option<f64>>("fade_out")?.unwrap_or(global);
             let fade_mid: f64 = opts
@@ -2199,7 +2258,10 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
     // script evaluation (fail fast), the audio side plays through the normal
     // audio graph (`single`/playlist), and the engine spawns a dedicated
     // decode thread that publishes PTS-paced frames to the shared video tap.
-    // The return value is an opaque marker for future video outputs.
+    // `video.playlist(opts)`/`video.single(path)` (Part H7) register a
+    // sequence played one file at a time on one decode thread with a
+    // continuous PTS timeline. The return values are opaque markers for
+    // video outputs.
     #[cfg(feature = "video")]
     {
         let video_state = state.clone();
@@ -2219,8 +2281,58 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
             info.set("height", spec.height)?;
             Ok(info)
         })?;
+
+        let pl_state = state.clone();
+        let playlist_fn = lua.create_function(move |lua, opts: Table| {
+            let tracks = video_playlist_configs(&opts)?;
+            let shuffle: bool = opts.get("shuffle").unwrap_or(false);
+            // Option-bool: mlua converts a missing key to Ok(false), so a
+            // plain unwrap_or(true) would never fire.
+            let loop_playlist: bool = opts.get("loop").ok().flatten().unwrap_or(true);
+            let spec = tracks.first().expect("non-empty").spec;
+            let count = tracks.len();
+            let mut s = pl_state.borrow_mut();
+            s.video_tap
+                .get_or_insert_with(|| Arc::new(crate::video::VideoTap::new()));
+            s.video_playlists.push(crate::video::VideoPlaylistConfig {
+                tracks,
+                shuffle,
+                loop_playlist,
+                seed: None,
+            });
+            let info = lua.create_table()?;
+            info.set("count", count)?;
+            info.set("width", spec.width)?;
+            info.set("height", spec.height)?;
+            Ok(info)
+        })?;
+
+        let single_state = state.clone();
+        let single_fn = lua.create_function(move |lua, path: String| {
+            let spec = crate::video::VideoSource::validate(std::path::Path::new(&path))
+                .map_err(mlua::Error::runtime)?;
+            let mut s = single_state.borrow_mut();
+            s.video_tap
+                .get_or_insert_with(|| Arc::new(crate::video::VideoTap::new()));
+            s.video_playlists.push(crate::video::VideoPlaylistConfig {
+                tracks: vec![crate::video::VideoConfig {
+                    path: path.clone().into(),
+                    spec,
+                }],
+                shuffle: false,
+                loop_playlist: false,
+                seed: None,
+            });
+            let info = lua.create_table()?;
+            info.set("path", path)?;
+            info.set("width", spec.width)?;
+            info.set("height", spec.height)?;
+            Ok(info)
+        })?;
         let video = lua.create_table()?;
         video.set("video", video_fn)?;
+        video.set("playlist", playlist_fn)?;
+        video.set("single", single_fn)?;
         globals.set("video", video)?;
     }
 
@@ -2372,14 +2484,16 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
             let video: Option<Table> = opts.get("video")?;
             let has_video = video.is_some();
             if has_video {
-                // `video` must be the marker returned by `video.video(path)`;
-                // that call also created the shared tap the output subscribes
-                // to at startup.
+                // `video` must be a marker returned by `video.video(path)`,
+                // `video.playlist(...)` or `video.single(path)`; that call
+                // also created the shared tap the output subscribes to at
+                // startup.
                 let s = hls_state.borrow();
                 #[cfg(feature = "video")]
-                if s.video_tap.is_none() || s.video.is_empty() {
+                if s.video_tap.is_none() || (s.video.is_empty() && s.video_playlists.is_empty()) {
                     return Err(mlua::Error::runtime(
-                        "output.hls({video = ...}) requires video.video(path) registered first",
+                        "output.hls({video = ...}) requires a video.video/video.playlist \
+                         source registered first",
                     ));
                 }
                 #[cfg(not(feature = "video"))]
@@ -2486,6 +2600,8 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         #[cfg(feature = "video")]
         video: std::mem::take(&mut s.video),
         #[cfg(feature = "video")]
+        video_playlists: std::mem::take(&mut s.video_playlists),
+        #[cfg(feature = "video")]
         video_tap: s.video_tap.take(),
     };
     if result.root.is_none() && result.preview.is_none() {
@@ -2565,6 +2681,89 @@ mod tests {
         assert_eq!(res.video.len(), 1, "one video track registered");
         assert!(res.video_tap.is_some(), "shared video tap created");
         std::fs::remove_file(&path).ok();
+    }
+
+    #[cfg(feature = "video")]
+    #[test]
+    fn video_playlist_and_single_register_sequences() {
+        use crate::video::testutil::render_test_clip;
+        let Some(a) = render_test_clip("pl-script-a") else {
+            return;
+        };
+        let Some(b) = render_test_clip("pl-script-b") else {
+            return;
+        };
+        let (a_str, b_str) = (a.display().to_string(), b.display().to_string());
+        let (_rt, res) = run(&format!(
+            r#"
+            set("sample_rate", 44100)
+            output.preview(sine({{freq = 440, duration = 1}}))
+            local p = video.playlist({{files = {{"{a_str}", "{b_str}"}}}})
+            assert(p.count == 2, "playlist marker count")
+            assert(p.width == 320 and p.height == 240, "playlist marker spec")
+            local s = video.single("{a_str}")
+            assert(s.width == 320, "single marker spec")
+            "#
+        ))
+        .expect("script runs");
+        assert_eq!(res.video_playlists.len(), 2, "two sequences registered");
+        assert_eq!(res.video_playlists[0].tracks.len(), 2);
+        assert!(
+            res.video_playlists[0].loop_playlist,
+            "loop defaults to true"
+        );
+        assert!(!res.video_playlists[1].loop_playlist, "single never loops");
+        assert_eq!(res.video_playlists[1].tracks.len(), 1);
+        assert!(res.video_tap.is_some(), "shared video tap created");
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    #[cfg(feature = "video")]
+    #[test]
+    fn video_playlist_rejects_mixed_resolutions_fast() {
+        use crate::video::testutil::render_test_clip_size;
+        let Some(a) = render_test_clip_size("pl-mix-a", 320, 240) else {
+            return;
+        };
+        let Some(b) = render_test_clip_size("pl-mix-b", 640, 480) else {
+            return;
+        };
+        let (a_str, b_str) = (a.display().to_string(), b.display().to_string());
+        let err = run(&format!(
+            r#"
+            set("sample_rate", 44100)
+            output.preview(sine({{freq = 440, duration = 1}}))
+            video.playlist({{files = {{"{a_str}", "{b_str}"}}}})
+            "#
+        ))
+        .err()
+        .expect("mixed resolutions must fail at evaluation");
+        assert!(
+            err.to_string().contains("must share one resolution"),
+            "{err}"
+        );
+        std::fs::remove_file(&a).ok();
+        std::fs::remove_file(&b).ok();
+    }
+
+    #[cfg(feature = "video")]
+    #[test]
+    fn video_playlist_empty_directory_fails() {
+        let dir = std::env::temp_dir().join(format!("crabsoup-vpl-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let err = run(&format!(
+            r#"
+            set("sample_rate", 44100)
+            output.preview(sine({{freq = 440, duration = 1}}))
+            video.playlist({{directory = "{}"}})
+            "#,
+            dir.display()
+        ))
+        .err()
+        .expect("empty playlist must fail at evaluation");
+        assert!(err.to_string().contains("no video files found"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -3128,13 +3327,16 @@ mod tests {
         // Real media dir; skipped when absent, like the other real-file
         // tests. The operator builds a level-aware crossfading playlist
         // that must produce audio (non-silent) and exhaust with the files.
+        // `loop = false` keeps the drain bounded (playlists default to
+        // looping).
         let media = PathBuf::from("media");
         if !media.exists() {
             return;
         }
         let (_rt, res) = run(r#"
             output.preview(smart_crossfade({directory = "./media",
-                                            fade_out = 1.0, fade_mid = 0.2}))
+                                            fade_out = 1.0, fade_mid = 0.2,
+                                            loop = false}))
             "#)
         .expect("script runs");
         let mut root = res.preview.expect("preview source");

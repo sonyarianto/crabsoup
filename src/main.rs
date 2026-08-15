@@ -199,16 +199,24 @@ fn main() -> crabsoup::Result<()> {
     };
     for cfg in &hls {
         // Part H6: an HLS output marked `video` subscribes to the shared
-        // video tap; the first registered track's spec drives the encoder.
+        // video tap; the first registered track's (or first playlist
+        // track's, Part H7) spec drives the encoder.
         #[cfg(feature = "video")]
         let hls_video = if cfg.video {
             let tap = result.video_tap.clone().ok_or_else(|| {
-                "output.hls({video = ...}) requires video.video(path) in the script".to_string()
+                "output.hls({video = ...}) requires a video source in the script".to_string()
             })?;
             let spec = result
                 .video
                 .first()
                 .map(|v| v.spec)
+                .or_else(|| {
+                    result
+                        .video_playlists
+                        .first()
+                        .and_then(|p| p.tracks.first())
+                        .map(|t| t.spec)
+                })
                 .ok_or_else(|| "output.hls video track has no spec".to_string())?;
             Some((tap.register(), spec))
         } else {
@@ -239,9 +247,10 @@ fn main() -> crabsoup::Result<()> {
         handles.push(std::thread::spawn(move || output.run()));
     }
 
-    // Video decode threads (Part H): one per `video.video(path)` track,
-    // publishing PTS-paced frames to the shared tap; a future video output
-    // subscribes to the same tap. Handles stay alive until process exit.
+    // Video decode threads (Part H): one per `video.video(path)` track and
+    // one per `video.playlist`/`video.single` sequence (Part H7), all
+    // publishing PTS-paced frames to the shared tap; video outputs
+    // subscribe to the same tap. Handles stay alive until process exit.
     #[cfg(feature = "video")]
     let mut video_handles = Vec::new();
     #[cfg(feature = "video")]
@@ -252,6 +261,14 @@ fn main() -> crabsoup::Result<()> {
             match crabsoup::video::VideoSource::spawn(cfg, tap, stop) {
                 Ok(handle) => video_handles.push(handle),
                 Err(e) => return Err(format!("video.video: {e}").into()),
+            }
+        }
+        for cfg in &result.video_playlists {
+            let tap = vtap.clone();
+            let stop = shutdown.clone();
+            match crabsoup::video::VideoSource::spawn_playlist(cfg, tap, stop) {
+                Ok(handle) => video_handles.push(handle),
+                Err(e) => return Err(format!("video.playlist: {e}").into()),
             }
         }
     }

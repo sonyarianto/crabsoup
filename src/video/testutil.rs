@@ -9,6 +9,11 @@ use std::process::Command;
 /// test entirely when no `ffmpeg` is installed. `tag` keeps the path
 /// unique per test so parallel runs never delete each other's clip.
 pub fn render_test_clip(tag: &str) -> Option<PathBuf> {
+    render_test_clip_size(tag, 320, 240)
+}
+
+/// [`render_test_clip`] at an explicit resolution.
+pub fn render_test_clip_size(tag: &str, width: u32, height: u32) -> Option<PathBuf> {
     let path =
         std::env::temp_dir().join(format!("crabsoup-testsrc-{}-{tag}.mp4", std::process::id()));
     if path.exists() {
@@ -20,7 +25,7 @@ pub fn render_test_clip(tag: &str) -> Option<PathBuf> {
             "-f",
             "lavfi",
             "-i",
-            "testsrc=duration=1:size=320x240:rate=25",
+            &format!("testsrc=duration=1:size={width}x{height}:rate=25"),
             "-pix_fmt",
             "yuv420p",
             "-c:v",

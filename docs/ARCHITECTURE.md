@@ -408,6 +408,37 @@ handling — the relay preempts, the local source plays the gap. URLs are
 shape-validated at script evaluation (scheme + non-empty host, no DNS);
 resolution happens per reconnect attempt.
 
+## Video path (Parts H1/H6/H7, `--features video`)
+
+Video is a parallel side-channel to the PCM bus, compiled out by default
+(`video = ["dep:ffmpeg-next"]`; all FFmpeg `unsafe` stays inside
+`ffmpeg-next` — no raw FFI in the tree).
+
+- **Carrier**: `VideoFrame` (YUV420P planes + `pts_us`) rides its own
+  fan-out `VideoTap` (`src/video/tap.rs`, bounded `sync_channel(4)`,
+  `try_send` drop-oldest). The audio hot path never sees it.
+- **Decode**: `src/video/ffi.rs` `VideoDecoder` (ffmpeg-next, swscale to
+  YUV420P, B-frame reorder via a `pending` queue). One decode thread per
+  `video.video(path)` track; a `video.playlist`/`video.single` sequence
+  runs on one thread that plays tracks one at a time and carries an
+  accumulated PTS offset across files (`VideoSource::spawn_playlist`), so
+  the published timeline is continuous — the wall-clock pace is
+  `start + published_pts`, and at track end the offset snaps to elapsed
+  time. `loop` (default true) re-cycles and re-shuffles.
+- **Mux**: `src/output/hls.rs` `VideoTrack` encodes to H.264 (libx264 via
+  ffmpeg-next: baseline/ultrafast/zerolatency, 90 kHz time base, PTS==DTS,
+  `AV_CODEC_FLAG_CLOSED_GOP` + `scenecut=0`) and muxes into the same
+  MPEG-TS segments as the AAC audio. Segment rotation defers to a forced
+  IDR (`frame.pict_type = I` per push — a reused frame must be reset to
+  `None` after each `send_frame`), so every segment starts with
+  SPS/PPS/IDR and is independently joinable; `feed` rotates immediately
+  once the tap is gone or stalled one extra window. The encoder opens at
+  the first registered track's spec; `video.playlist` therefore enforces
+  one resolution per list at script evaluation.
+- **Master playlist**: `index.m3u8` (`#EXT-X-STREAM-INF`, RESOLUTION from
+  the track spec, static CODECS) is written next to `playlist.m3u8` when
+  `output.hls({video = ...})` is configured.
+
 ## Gotchas that have burned previous work
 
 - Ogg CRC is CRC-32/MPEG-2 (MSB-first, init 0, poly 0x04c11db7, no final
@@ -425,7 +456,9 @@ resolution happens per reconnect attempt.
   (nil is falsy), so optional bools with a non-false default must be read
   as `Option<bool>` and `unwrap_or`'d — `blank.detect`'s
   `exhaust_while_blank` defaulted to false and broke fallback handover
-  until read that way.
+  until read that way. `playlist`'s `loop` had the same latent bug
+  (documented default true, actual default false) until it was read the
+  same way; the `video.playlist` marker test caught it.
 - The `on_metadata` closure stays in the Lua registry for the process
   lifetime, keeping its channel `Sender` alive: the event loop can never wait
   for channel disconnection, so it polls `recv_timeout` and exits on the

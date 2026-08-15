@@ -32,6 +32,7 @@ export default defineConfig({
             { text: 'Sources', link: '/guide/sources' },
             { text: 'DSP & metadata operators', link: '/guide/dsp' },
             { text: 'Outputs', link: '/guide/outputs' },
+            { text: 'Video', link: '/guide/video' },
             { text: 'Control port', link: '/guide/control-port' },
           ],
         },

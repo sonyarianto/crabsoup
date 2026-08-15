@@ -20,6 +20,11 @@ Opus) to an Icecast server.
   Liquidsoap-style telnet control port
 - Output: MP3 (via LAME), Ogg/Opus (via libopus + a built-in Ogg muxer with
   spec-correct CRC-32), or AAC/ADTS (via fdk-aac)
+- **Video (Part H, `--features video`)**: file → HLS(video) — `video.video`,
+  `video.single`, `video.playlist` sources feed a decode thread publishing
+  PTS-paced frames to a shared tap; `output.hls({video = ...})` live-encodes
+  them to H.264 and muxes them into keyframe-aligned MPEG-TS segments with a
+  variant master playlist. See `examples/crabsoup.video.lua`
 - Graceful Ctrl-C shutdown
 
 ## Architecture
@@ -88,6 +93,7 @@ Per-format test scripts live in `examples/`:
 ./target/release/crabsoup -c examples/crabsoup.aac.lua     # AAC  -> /crabsoup.aac
 ./target/release/crabsoup -c examples/crabsoup.pipe.lua    # external processor pipeline (preview)
 ./target/release/crabsoup -c examples/crabsoup.preview.lua # no broadcast
+./target/release/crabsoup -c examples/crabsoup.video.lua    # file -> HLS(video)
 ```
 
 With an `output.icecast` call it connects to Icecast as a source. Without one

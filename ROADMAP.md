@@ -594,8 +594,25 @@ ships its inline tests and a `benches/` row.
       End-to-end test: 1 s testsrc + sine audio through `HlsOutput`, every
       segment probed with ffprobe (every segment must be h264+aac — each
       starts on an IDR — plus the master playlist; skips without ffmpeg).
-- [ ] **H7 — video playlist** (`playlist`/`single` over video files) +
+- [x] **H7 — video playlist** (`playlist`/`single` over video files) +
       **H8 — video streaming guide + examples**.
+      **Shipped:** `video.playlist({directory/files, shuffle, loop})` and
+      `video.single(path)` (markers consumed by `output.hls({video = ...})`)
+      register sequences played one file at a time on one decode thread
+      (`VideoSource::spawn_playlist`) with an accumulated PTS offset, so the
+      published timeline never jumps at a track switch; `loop` (default true)
+      re-cycles and re-shuffles, broken tracks are skipped with a warning, and
+      all tracks in a playlist must share one resolution (fail fast — the HLS
+      encoder opens at the first track's spec). The audio side of the files
+      still flows through the normal audio graph. Tests: three new
+      `video::source` tests (two-track continuity, loop restart, broken-track
+      skip) plus script-level tests (registration, mixed-resolution and
+      empty-list errors). **H8:** `website/guide/video.md` (guide page +
+      sidebar), `examples/crabsoup.video.lua`, a Video path section in
+      `docs/ARCHITECTURE.md`, and video notes in `crabsoup.lua.example` +
+      README. Side fix: mlua maps missing bool keys to `false`, so
+      `playlist`/`smart_crossfade`'s documented `loop = true` default was
+      actually `false` — read as `Option<bool>` now (audio + video).
 
 Acceptance: file → RTMP and file → HLS(video) verified end-to-end (live);
 A/V stays in sync across a long clip; slideshow plays; video-path benchmark

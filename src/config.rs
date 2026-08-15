@@ -249,6 +249,10 @@ impl Default for ControlConfig {
 
 const AUDIO_EXTS: &[&str] = &[
     "mp3", "wav", "flac", "ogg", "opus", "oga", "m4a", "aac", "wma",
+    // Media containers whose default track is audio-capable (symphonia
+    // decodes them): lets one directory feed both the audio graph and the
+    // video side of a playlist (Part H7).
+    "mp4", "m4v", "mov", "mkv", "webm",
 ];
 
 /// Recursively collect audio files under `dir`.
@@ -273,6 +277,39 @@ fn is_audio(path: &Path) -> bool {
         .map(|e| {
             let e = e.to_ascii_lowercase();
             AUDIO_EXTS.contains(&e.as_str())
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(feature = "video")]
+const VIDEO_EXTS: &[&str] = &[
+    "mp4", "mov", "mkv", "webm", "m4v", "ts", "m2ts", "avi", "flv", "mpg", "mpeg", "wmv",
+];
+
+/// Recursively collect video files under `dir` (Part H7).
+#[cfg(feature = "video")]
+pub fn collect_video(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        log::warn!("video playlist directory not readable: {}", dir.display());
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_video(&path, out);
+        } else if is_video(&path) {
+            out.push(path);
+        }
+    }
+}
+
+#[cfg(feature = "video")]
+fn is_video(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            let e = e.to_ascii_lowercase();
+            VIDEO_EXTS.contains(&e.as_str())
         })
         .unwrap_or(false)
 }
