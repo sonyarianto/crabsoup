@@ -409,13 +409,13 @@ metadata/dead-air gaps.
 
 ### Part G — remaining product-parity gaps (relay input, clock drift)
 
-**Status: G1/G2 not started — this is the live plan.** Parts A–F above
-(the original Liquidsoap-parity plan) are complete; everything that
-follows comes from auditing crabsoup as a *product* against Liquidsoap —
-"could someone fully replace Liquidsoap with this" — rather than an
-operator-by-operator checklist. Confirmed absent by checking the source,
-not assumed: no relay/pull-stream input exists anywhere, and the
-soundcard work (F2) has no clock-drift story.
+**Status: complete (G1 + G2) — see Done (cont.) for the landing notes.**
+Parts A–F above (the original Liquidsoap-parity plan) are complete;
+everything that follows comes from auditing crabsoup as a *product*
+against Liquidsoap — "could someone fully replace Liquidsoap with this" —
+rather than an operator-by-operator checklist. Confirmed absent by
+checking the source, not assumed: no relay/pull-stream input existed
+anywhere, and the soundcard work (F2) had no clock-drift story.
 
 - [x] **G1 — `input.http`: continuous relay/pull-stream source** — shipped,
       see Done (cont.) for the landing note.
@@ -452,7 +452,7 @@ soundcard work (F2) has no clock-drift story.
       test server for CI) plays continuously; killing the upstream
       triggers reconnect-with-backoff and the composed `fallback` takes
       over in the gap.
-- [ ] **G2 — soundcard clock-drift compensation**
+- [x] **G2 — soundcard clock-drift compensation**
       Narrower, but real now that `input.soundcard`/`output.soundcard`
       (F2) exist: a sound card's hardware sample clock drifts against the
       internal wall-clock pacing over long unattended runs, gradually
@@ -462,13 +462,18 @@ soundcard work (F2) has no clock-drift story.
         continuously by tens of PPM based on the ring's fill level — a
         simple control loop, not a PLL. A lighter linear-interpolation
         resampler may be the better fit for a near-1:1 correction than
-        the full sinc convolution.
+        the full sinc convolution. *(Chosen: adaptive step on the existing
+        `SincResampler` — a mutable `step_mult` nudged by PPM is a ~3-line
+        change; no second resampler needed.)*
       - **Simpler MVP fallback:** periodic single-sample insertion/drop
         based on fill level — cruder (an occasional audible micro-glitch)
         but much less work, and a legitimate first cut if the adaptive
-        version proves too complex initially.
+        version proves too complex initially. *(Not needed — the adaptive
+        loop landed directly.)*
       - **Contained scope:** only `src/source/soundcard.rs` /
-        `src/output/soundcard.rs`, not a systemic engine change.
+        `src/output/soundcard.rs`. *(Held; `src/resample.rs` gained the
+        `step_mult`/`set_ppm`/`ppm` hooks, everything else stayed local.)*
+      - **Done (cont.) — see landing note below.**
       Acceptance: don't require a real multi-hour hardware run in CI —
       simulate clock skew by feeding the bridge at a deliberately
       different rate than it's consumed and assert the ring fill stays
@@ -498,10 +503,9 @@ soundcard work (F2) has no clock-drift story.
 8. Part F (real-deployment gaps) — **done**: F1 (HTTPS via rustls) → F2
    (soundcard I/O via cpal) → F4 (`blank.detect`) → F3 (`map_metadata`),
    per the plan's suggested order (see Done (cont.)).
-9. Part G (remaining product-parity gaps) — **current plan**: G1
-   (`input.http` relay/pull source) — **done** (see Done (cont.)); G2
-   (soundcard clock-drift compensation) remains, with its simulated-skew
-   test to be written before real hardware time.
+9. Part G (remaining product-parity gaps) — **complete**: G1
+   (`input.http` relay/pull source) and G2 (soundcard clock-drift
+   compensation) both shipped (see Done (cont.)).
 
 The original Liquidsoap-parity plan (Parts A–F) is complete; Part G is the
 only open plan section. If effort is constrained, G1 (`input.http`) is the
@@ -549,6 +553,30 @@ practice).
       `fallback({input.http(...), sine})` frequency test proving relay
       preempts when up and the local sine covers the gap when down.
       README + website guide updated.
+- [x] G2 — soundcard clock-drift compensation: `input.soundcard` /
+      `output.soundcard` now adapt their conversion ratio to the device's
+      hardware clock instead of assuming it matches the bus pacing, so
+      long unattended runs no longer drift the ring to under/overrun.
+      `SincResampler` gained a PPM-nudged step (`step_mult` field +
+      `set_ppm`/`ppm` accessors; `pos += ratio * step_mult` in the hot
+      loop). Both soundcard halves run the same proportional control:
+      `ppm = clamp(gain * EWMA(fill - target))` with `gain = 1e-5`,
+      `clamp = ±1 %`, smoothing α = 0.01 (a ~4 s window; the ring fill
+      saws a full pull's worth between pulls, and that deterministic
+      sawtooth must not jerk the ratio). Input pulls `capacity*(D/B)*(1
+      +ppm)` with a fractional pull-debt accumulator (integer pops would
+      bias consumption ~500 PPM at 2048-frame pulls) and passthrough
+      truncates excess instead of buffering it; output `set_ppm` has the
+      opposite sign (fill low → device ahead → smaller step → more
+      output), so the converged output estimate is `-skew`. Inline tests
+      (228 -> 234): `SincResampler` PPM nudge changes output length
+      proportionally, both soundcard halves hold the ring mid-fill under
+      simulated ±1000 PPM skew (wall-clock-anchored device thread feeding
+      at `rate*(1+skew)`, ring pre-filled to the loop's steady state)
+      and converge their PPM estimate to the skew. Resampler ring-copy
+      hardened against odd-length input (trailing partial frame). The
+      real multi-hour hardware soak stays a manual step in
+      `docs/ARCHITECTURE.md` per the plan's acceptance.
 - [x] Structured (JSON) control-port replies: `src/control.rs` — dispatch
       now produces a structured `CommandReply` (success / error / custom /
       status / uptime / queued / list / playing), rendered to either the

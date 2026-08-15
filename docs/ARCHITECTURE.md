@@ -312,8 +312,34 @@ never block or allocate:
   reusable scratch and pushes into a ring the device callback drains
   (silence on underrun). The device and stream open in `connect()` at
   startup, so a missing device fails before the tap pulls. Supported
-  device channel counts are 1/2 (mirroring the bus); f32/i16/u16/i32/f64
-  sample formats are converted with the same scaling cpal/dasp uses.
+   device channel counts are 1/2 (mirroring the bus); f32/i16/u16/i32/f64
+   sample formats are converted with the same scaling cpal/dasp uses.
+
+**Clock-drift compensation** (Part G2): the device's hardware sample clock
+never exactly matches the bus pacing — over a long run a few tens of PPM
+drift fills or drains the ring until under/overrun. Both halves run the
+same proportional control loop on the ring fill:
+
+- `ppm = clamp(gain * EWMA(fill - target))`, with `gain = 1e-5` (fraction
+  per sample; ~2 s control time constant at 44.1 kHz, steady fill offset
+  `drift/gain`), clamp ±1 %, and EWMA α = 0.01 (a ~4 s window). The fill
+  saws a full pull's worth between pulls, and that deterministic sawtooth
+  must be smoothed out before it hits the ratio, or the ratio would jerk
+  every pull.
+- `SincResampler` gained a PPM-nudged step (`set_ppm`/`ppm`); the hot loop
+  advances `pos += ratio * step_mult`.
+- Input (`src/source/soundcard.rs`): pulls `capacity * (D/B) * (1 + ppm)`
+  with a fractional pull-debt accumulator (integer pops would bias
+  consumption by ~1 frame/pull ≈ 500 PPM at 2048-frame pulls); passthrough
+  truncates the excess instead of buffering it. The estimate converges to
+  `+skew` (device fast → fill high → consume more).
+- Output (`src/output/soundcard.rs`): nudges the step so production tracks
+  the drain; the estimate converges to `-skew`. Same loop as the input,
+  opposite sign, because a fast device *drains* the output ring.
+- Real devices run ±20–200 PPM, so the clamp only bites on transients
+  (startup, device hotplug). The loop's job is to hold the fill mid-ring
+  for hours; the drop-oldest cap (input) and underrun silence (output)
+  remain as last-resort guards.
 
 **Manual verification** (hardware is not reliably unit-testable in CI, so
 this is documented rather than automated):
@@ -328,6 +354,13 @@ this is documented rather than automated):
 3. Round-trip: `output.soundcard({}, input.soundcard({}))` with a
    physical (or virtual/loopback) device — the output reproduces the
    input; device-rate mismatch exercises the resampler.
+4. Drift soak (G2 acceptance): run the round-trip (or
+   `input.soundcard` → `output.file`) for at least 2–4 hours and watch the
+   control-port/`status` output — the ring fill must stay mid-ring, not
+   drift toward empty/full (underruns sound like gaps; overruns trip the
+   drop-oldest cap, audible as skips). A short run cannot prove the loop;
+   the simulated-skew unit tests cover the convergence math, the soak
+   covers the real clock.
 
 ## Live harbor (`src/live/harbor.rs`)
 

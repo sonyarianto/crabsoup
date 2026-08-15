@@ -49,6 +49,9 @@ pub struct SincResampler {
     ring: Vec<f32>,
     ring_frames: usize,
     outbuf: Vec<f32>,
+    /// Step multiplier for drift compensation: `1.0` nominal, nudged by a
+    /// few PPM by the soundcard clock-drift control loops (Part G2).
+    step_mult: f64,
 }
 
 impl SincResampler {
@@ -65,7 +68,20 @@ impl SincResampler {
             ring: vec![0.0; TAPS * nch.max(1)],
             ring_frames: 0,
             outbuf: Vec::new(),
+            step_mult: 1.0,
         }
+    }
+
+    /// Nudge the conversion ratio by `ppm` parts per million of the input
+    /// rate: positive yields fewer output samples per input sample (the
+    /// soundcard bridges use it to absorb device-clock drift, Part G2).
+    pub fn set_ppm(&mut self, ppm: f64) {
+        self.step_mult = 1.0 + ppm / 1_000_000.0;
+    }
+
+    /// The current PPM nudge (for tests).
+    pub fn ppm(&self) -> f64 {
+        (self.step_mult - 1.0) * 1_000_000.0
     }
 
     /// Resample interleaved `input` (nch channels) to the output rate.
@@ -110,13 +126,15 @@ impl SincResampler {
                 }
                 self.outbuf.push((acc / norm.max(1e-9)) as f32);
             }
-            self.pos += ratio;
+            self.pos += ratio * self.step_mult;
         }
 
         // Keep the last TAPS frames for the next chunk's left-edge window.
+        // Slice to `frames * nch` so a trailing partial frame (odd input
+        // length) cannot overflow the ring copy.
         let keep = frames.min(TAPS);
         let start = (frames - keep) * nch;
-        self.ring[..keep * nch].copy_from_slice(&input[start..]);
+        self.ring[..keep * nch].copy_from_slice(&input[start..frames * nch]);
         self.ring_frames = keep;
         self.base += frames as f64;
 
@@ -149,6 +167,31 @@ mod tests {
         assert!((out[0] - 0.5).abs() < 1e-3);
         assert!((out[1] - 0.25).abs() < 1e-3);
         assert!((out[2] - 0.125).abs() < 1e-3);
+    }
+
+    #[test]
+    fn ppm_nudge_shifts_output_length_proportionally() {
+        // +1000 ppm must yield ~0.1% fewer output samples per input.
+        let mut r = SincResampler::new(0, 44100, 44100, 1);
+        r.set_ppm(1000.0);
+        let input: Vec<f32> = (0..44100).map(|i| (i % 2) as f32).collect();
+        let out = r.resample(&input);
+        let expected = (44100.0 / 1.001) as usize;
+        assert!(
+            (out.len() as i64 - expected as i64).abs() <= 2,
+            "ppm output {} vs expected {expected}",
+            out.len()
+        );
+        // And a negative nudge yields proportionally more.
+        let mut r = SincResampler::new(0, 44100, 44100, 1);
+        r.set_ppm(-1000.0);
+        let out = r.resample(&input);
+        let expected = (44100.0 / 0.999) as usize;
+        assert!(
+            (out.len() as i64 - expected as i64).abs() <= 2,
+            "negative ppm output {} vs expected {expected}",
+            out.len()
+        );
     }
 
     #[test]
@@ -243,5 +286,30 @@ mod tests {
         let peak = joined.iter().fold(0.0f32, |m, s| m.max(s.abs()));
         assert!(peak < 1.02, "overshoot at chunk seam: {peak}");
         assert!(peak > 0.98, "sine collapsed across chunks: {peak}");
+    }
+
+    #[test]
+    fn ppm_production_math() {
+        // Same-rate passthrough, negative PPM: the step shrinks, so MORE
+        // output samples per input.
+        let mut r = SincResampler::new(0, 44_100, 44_100, 2);
+        r.set_ppm(-8000.0);
+        let mut total_out = 0usize;
+        for _ in 0..848 {
+            total_out += r.resample(&[0.5f32; 52]).len();
+        }
+        // 848 * 26 frames * 2ch / 0.992 ~ 44444.
+        assert!(total_out > 44_300, "expected ~44444, got {total_out}");
+        // Same, but set_ppm every call (the drift loop's pattern).
+        let mut r = SincResampler::new(0, 44_100, 44_100, 2);
+        let mut total2 = 0usize;
+        for _ in 0..848 {
+            r.set_ppm(-8000.0);
+            total2 += r.resample(&[0.5f32; 52]).len();
+        }
+        assert!(
+            total2 > 44_300,
+            "per-call set_ppm: expected ~44444, got {total2}"
+        );
     }
 }
