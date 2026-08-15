@@ -4,6 +4,7 @@
 //! services: gapless playlist, crossfades, live DJ ducking, jingles, and MP3 /
 //! Opus broadcasting to an Icecast server.
 
+pub mod analysis;
 pub mod config;
 pub mod control;
 pub mod engine;

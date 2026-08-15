@@ -238,6 +238,46 @@ fn live_handoff(c: &mut Criterion) {
     });
 }
 
+use crabsoup::analysis;
+
+fn analysis(c: &mut Criterion) {
+    let mut group = c.benchmark_group("analysis");
+
+    // 30 s of click track at 120 BPM, decoded as a script operator would.
+    let wav = analysis::fixtures::click_wav_bytes(120.0, 30.0);
+    let path = std::env::temp_dir().join(format!("crabsoup-bench-bpm-{}", std::process::id()));
+    std::fs::write(&path, &wav).unwrap();
+
+    group.bench_function("bpm_30s", |b| {
+        b.iter(|| {
+            let (samples, rate, chans) =
+                analysis::decode_file(path.to_str().unwrap(), "bench").unwrap();
+            let t = analysis::bpm(&samples, chans, rate).unwrap();
+            black_box(t);
+        });
+    });
+
+    let song = analysis::fixtures::song_wav_bytes(69, 16.0);
+    let path = std::env::temp_dir().join(format!("crabsoup-bench-key-{}", std::process::id()));
+    std::fs::write(&path, &song).unwrap();
+
+    group.bench_function("key_16s", |b| {
+        b.iter(|| {
+            let (samples, rate, chans) =
+                analysis::decode_file(path.to_str().unwrap(), "bench").unwrap();
+            let k = analysis::key(&samples, chans, rate).unwrap();
+            black_box(k);
+        });
+    });
+
+    let _ = std::fs::remove_file(
+        std::env::temp_dir().join(format!("crabsoup-bench-bpm-{}", std::process::id())),
+    );
+    let _ = std::fs::remove_file(
+        std::env::temp_dir().join(format!("crabsoup-bench-key-{}", std::process::id())),
+    );
+}
+
 fn effects(c: &mut Criterion) {
     let mut group = c.benchmark_group("effects");
     group.throughput(Throughput::Elements(BUF as u64));
@@ -549,6 +589,7 @@ criterion::criterion_group!(
     mixers,
     smart_crossfade,
     live_handoff,
+    analysis,
     effects,
     eq,
     reverb,

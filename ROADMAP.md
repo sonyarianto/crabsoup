@@ -175,6 +175,14 @@ Vocal remover row (Part I6, recorded in the session that landed
 |---|---|---|
 | vocalremover/strength1 | 93 µs | 0.10 % |
 
+Analysis rows (Part I7, recorded in the session that landed `bpm`/`key`;
+offline, not real-time — includes symphonia WAV decode):
+
+| benchmark | elapsed |
+|---|---|
+| analysis/bpm_30s | ~34 ms |
+| analysis/key_16s | ~23 ms |
+
 Video-path rows (Part H3, recorded in the session that landed the effects +
 bench group; per 640x360 YUV420P frame, budget = one 25 fps frame = 40 ms):
 
@@ -815,7 +823,7 @@ rows recorded against the baseline convention.
 
 ### Part I — advanced audio & effects (Phase 2, Q1 – Q2 2027)
 
-**Status: I1–I6 shipped** (see their rows below; I7 onwards still planned).
+**Status: I1–I7 shipped** (see their rows below; I8 onwards still planned).
 The product plan's Phase 2. Effects stay inline in the
 pull chain (one thread per output, allocation-free hot paths), each landing
 with inline tests and a bench row; FFI-backed DSP (SoundTouch, aubio) gets
@@ -934,6 +942,27 @@ its own confined module per the Part H convention note.
       (four biquads — half the 4-band EQ chain, as expected).
 - [ ] **I7 — BPM & key detection** (`aubio-rs` or `libvamp`), **I8 — speech
       synthesis** (`espeak-ng` hook), **I9 — MIDI control input**.
+      **Shipped pure-Rust** (`src/analysis.rs`; aubio/libvamp are absent
+      from this machine, so — following the I1 benchmark-first precedent —
+      no FFI). BPM: Hann-windowed spectral-flux onset envelope at 512-hop
+      frames, mean-subtracted autocorrelation over the 60–200 BPM lag
+      range, octave suppression toward the fundamental. Key: 4096-window
+      magnitude spectra folded into a 12-bin chroma (bin centre → pitch
+      class, per-window L1-normalised, 55 Hz–4 kHz band), correlated with
+      all 24 rotations of the Krumhansl–Kessler major/minor profiles.
+      Script surface: `bpm(path)` → BPM number, `key(path)` → `"A major"`
+      style string; both decode the file at native rate via symphonia
+      (shared `decode_file`). Known honest limitation (documented): K–K
+      on a bare triad or a short chord loop is genuinely ambiguous — the
+      relative-minor trap — so tests use synthetic "songs" (I–vi–IV–V +
+      tonic-anchored melody) which the detector resolves deterministically;
+      bare-triad tests were dropped after the initial attempt (C-major
+      triad came back "E minor" on pure profile correlation). Tests: 120
+      and 90 BPM click tracks (within ±2 BPM), too-short input, silence;
+      A-major and C-major songs, silence; script tests via the temp-file
+      pattern (operators return values read back through
+      `ScriptRuntime::global`). Bench: `analysis/bpm_30s` ~34 ms and
+      `analysis/key_16s` ~23 ms incl. WAV decode.
 
 ### Part J — protocols & integrations (Phase 3, Q2 – Q3 2027)
 

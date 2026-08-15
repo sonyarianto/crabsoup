@@ -6,7 +6,8 @@
 -- `reverb` (Part I3, convolution), `eq`/`filter` (Part I4, biquads),
 -- `stereo` (Part I5, pan + mid-side width) and `vocalremover` (Part I6,
 -- karaoke centre-cancel) are shown in the alternate chains below —
--- uncomment to exercise them.
+-- uncomment to exercise them. `bpm()`/`key()` (Part I7) are offline
+-- analysis operators: `tempo = bpm("./media/track.mp3")`, `k = key(...)`.
 --
 -- Run: ./target/release/crabsoup -c examples/crabsoup.dsp.lua --preview
 
@@ -36,6 +37,7 @@ tone = amplify(tone, 0.9)
 -- tone = stereo(tone, {pan = -0.25, width = 1.4})
 -- tone = stereo.widen(tone, 1.4)
 -- tone = vocalremover(tone, {strength = 1, crossover = 150})  -- karaoke
+-- tempo = bpm("./media/track.mp3")   -- offline: tempo of a file
 
 output.icecast({host = "localhost", port = 8000,
                 mount = "/tone-dsp.mp3", format = "mp3", bitrate = 128000,

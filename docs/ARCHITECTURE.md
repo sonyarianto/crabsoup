@@ -35,7 +35,7 @@ One engine thread plus one thread per output:
   `smart_crossfade`, `single`, `blank` (+ `blank.detect`), `sine`,
   `amplify`, `compress`, `normalize`, `replaygain`, `stretch`, `pitch`,
   `echo`, `reverb`, `eq`, `filter`, `stereo` (+ `stereo.pan`, `stereo.widen`),
-  `vocalremover`, `pipe`, `jingles`,
+  `vocalremover`, `bpm`, `key`, `pipe`, `jingles`,
   `fallback`/`sequence`/`random`, `switch`, `rotate`, `mksafe`, `add`,
   `cue_cut`,   `map_metadata`, `request.queue`, `request.dynamic`,
   `input.harbor`, `input.soundcard`, `input.http`, `output.icecast`,
@@ -316,6 +316,30 @@ One engine thread plus one thread per output:
   (~0.022 at 1 kHz with a 150 Hz crossover). Strength validates in
   `[0, 1]`, crossover in `(0, fs/2)`. Reuses `Biquad` from `eq.rs`
   (made `pub`).
+
+## Offline analysis (`src/analysis.rs`)
+
+- `bpm(path)` → tempo and `key(path)` → `"A major"`-style key name are
+  value-returning script operators (no bus involvement). Both decode the
+  file at its native rate via `decode_file` (symphonia, mirror of
+  `reverb::load_ir`'s loop) and analyse a mono downmix.
+- BPM: a spectral-flux onset envelope over Hann-windowed 1024-sample
+  spectra at 512-hop frames; the envelope is autocorrelated
+  (mean-subtracted, normalised) across the lag range that maps to
+  60–200 BPM; the winning lag is the tempo, with octave suppression —
+  exact divisors of the winning lag that score ≥ 0.85× the peak win out,
+  so double-time confusion resolves toward the fundamental. Errors for
+  too-short input and silence ("no steady tempo").
+- Key: 4096-window magnitude spectra fold into a 12-bin chroma (each bin
+  mapped to a pitch class by its centre frequency, band-limited to
+  55 Hz–4 kHz, per-window L1-normalised so quiet passages count equally),
+  correlated against all 24 rotations of the Krumhansl–Kessler profiles;
+  the best rotation names the key.
+- Honest limitation: K–K correlation is ambiguous for bare triads and
+  short static loops (the relative-minor trap — a C-major triad scores
+  "E minor" on pure profile correlation). Real music with a tonic
+  anchor resolves deterministically; the tests use synthetic I–vi–IV–V
+  "songs" with a tonic-emphasising melody for exactly this reason.
 
 ## Mixer control (`src/engine/mixer.rs`)
 

@@ -2383,6 +2383,27 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         })?,
     )?;
 
+    // ---- offline analysis (I7) -------------------------------------------
+    // `bpm(path)` → tempo in BPM, `key(path)` → `"A major"`-style key name.
+    // Both decode the file at its native rate and run FFT-based DSP from
+    // `src/analysis.rs`; they return values (no bus involvement).
+    globals.set(
+        "bpm",
+        lua.create_function(|_, path: String| {
+            let (samples, rate, chans) =
+                crate::analysis::decode_file(&path, "bpm").map_err(mlua::Error::runtime)?;
+            crate::analysis::bpm(&samples, chans, rate).map_err(mlua::Error::runtime)
+        })?,
+    )?;
+    globals.set(
+        "key",
+        lua.create_function(|_, path: String| {
+            let (samples, rate, chans) =
+                crate::analysis::decode_file(&path, "key").map_err(mlua::Error::runtime)?;
+            crate::analysis::key(&samples, chans, rate).map_err(mlua::Error::runtime)
+        })?,
+    )?;
+
     // ---- source composition ---------------------------------------------
     let composer = lua.create_function(|_, (children, kind): (Table, String)| {
         let sources = source_list(&children)?;
@@ -5219,6 +5240,45 @@ mod tests {
             };
             assert!(err.to_string().contains("vocalremover"), "{err}");
         }
+    }
+
+    #[test]
+    fn bpm_operator_returns_the_tempo_of_a_file() {
+        let wav = crate::analysis::fixtures::click_wav_bytes(120.0, 12.0);
+        let path = std::env::temp_dir().join(format!("crabsoup-bpm-{}.wav", std::process::id()));
+        std::fs::write(&path, wav).unwrap();
+        let script = format!(
+            "bpm_result = bpm(\"{}\")\noutput.preview(blank({{duration = 0.01}}))",
+            path.display()
+        );
+        let (_rt, _res) = run(&script).expect("script runs");
+        let b: f64 = _rt.global("bpm_result").expect("bpm_result");
+        let _ = std::fs::remove_file(&path);
+        assert!((b - 120.0).abs() < 2.0, "tempo {b}");
+    }
+
+    #[test]
+    fn key_operator_returns_the_key_of_a_file() {
+        let wav = crate::analysis::fixtures::song_wav_bytes(69, 8.0);
+        let path = std::env::temp_dir().join(format!("crabsoup-key-{}.wav", std::process::id()));
+        std::fs::write(&path, wav).unwrap();
+        let script = format!(
+            "key_result = key(\"{}\")\noutput.preview(blank({{duration = 0.01}}))",
+            path.display()
+        );
+        let (_rt, _res) = run(&script).expect("script runs");
+        let k: String = _rt.global("key_result").expect("key_result");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(k, "A major");
+    }
+
+    #[test]
+    fn bpm_operator_rejects_an_unreadable_file() {
+        let err = match run(r#"bpm("/nonexistent/track.mp3")"#) {
+            Ok(_) => panic!("bpm of a missing file must fail"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("bpm"), "{err}");
     }
 
     // ---- Phase 5: switch / rotate ----------------------------------------
