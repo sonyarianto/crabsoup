@@ -2,7 +2,7 @@ import { defineConfig } from 'vitepress'
 
 export default defineConfig({
   title: 'Crabsoup',
-  description: 'A Liquidsoap-inspired audio & video streaming engine',
+  description: 'Streaming engine for audio, video, live DJ, and automation',
   lang: 'en-US',
   cleanUrls: true,
 
