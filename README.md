@@ -2,6 +2,7 @@
 
 [![Sponsor](https://img.shields.io/badge/Sponsor-GitHub%20Sponsors-ea4aaa.svg)](https://github.com/sponsors/sonyarianto)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
+[![CI](https://github.com/sonyarianto/crabsoup/actions/workflows/ci.yml/badge.svg)](https://github.com/sonyarianto/crabsoup/actions/workflows/ci.yml)
 
 A Liquidsoap-inspired audio streaming engine in Rust: evaluates a `.lua`
 script (Liquidsoap-flavoured Lua) that builds a source graph, mixes in live DJ
