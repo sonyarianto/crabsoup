@@ -276,7 +276,7 @@ phase).
 | `input.harbor(...)` | `input.harbor({...})` | done |
 | `input.soundcard()` | `input.soundcard({device = nil})` — cpal capture bridged into the bus via an SPSC ring | done |
 | `input.http(...)` | `input.http(url, {reconnect_backoff = 500})` — continuous relay/pull source, reconnects on drop, exhausts while disconnected so `fallback({relay, local})` composes | done |
-| `output.icecast(...)` | `output.icecast({...}, src)` | done (single output; multi-mount in Phase 4) |
+| `output.icecast(...)` | `output.icecast({...}, src)` | done (multiple outputs share one source via the tap) |
 | `output.soundcard()` | `output.soundcard({device = nil}, src)` — tap consumer playing through the device | done |
 | `output.file(...)` | `output.file({path, format}, src)` | done |
 | `server.telnet(...)` | `server.telnet({port = 1234})` | done |
