@@ -815,7 +815,7 @@ rows recorded against the baseline convention.
 
 ### Part I — advanced audio & effects (Phase 2, Q1 – Q2 2027)
 
-**Status: I1–I5 shipped** (see their rows below; I6 onwards still planned).
+**Status: I1–I6 shipped** (see their rows below; I7 onwards still planned).
 The product plan's Phase 2. Effects stay inline in the
 pull chain (one thread per output, allocation-free hot paths), each landing
 with inline tests and a bench row; FFI-backed DSP (SoundTouch, aubio) gets
