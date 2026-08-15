@@ -151,64 +151,67 @@ output.icecast({host = "localhost", port = 8000,
 ```
 
 Named options are passed as Lua tables; most have defaults. `format` is
-`"mp3"` or `"opus"`. Composable sources: `playlist`, `single`, `jingles`,
-`fallback`/`sequence`, `random` (non-repeating shuffle), `switch`
- (dayparting), `rotate` (weighted round-robin), `blank`/`sine`
- (test tones, both accept an optional `duration`), `mksafe(src)`
- (never fails outright — silence covers an exhausted or failed child),
- `blank.detect(src, {threshold, duration, restart, exhaust_while_blank,
- on_blank})`
- (dead-air guard: watches the wrapped source's RMS level, and after
- `duration` seconds of sub-`threshold` silence goes blank — by default
- reporting exhausted so a `fallback` around it hands over automatically;
- `on_blank` fires a Lua callback once per episode and the source recovers
- when audio returns), `map_metadata(src, function(m) return {title = ...}
- end)`
- (rewrites each track's title through a Lua callback before it reaches the
- output — the original is kept on nil/error/timeout),
- `add({a, b}, {weights = {...}})`
- (N-source sample-wise sum, optional per-source weights — background bed +
- voice-over), `cue_cut(src, {cue_in, cue_out, fade_in, fade_out})`
- (skip `cue_in` seconds into each track, end it at `cue_out`; a per-track
- `fade_in`/`fade_out` overrides the global `crossfade_seconds` for that
- track's crossfades),
- and
- the DSP operators `amplify(source, gain)`, `compress(source, opts)`,
- `normalize(source, opts)`
- (run inline in the pull chain). `replaygain(source, opts)` applies a
- per-track constant gain from the file's `REPLAYGAIN_TRACK_GAIN` tag
- (`REPLAYGAIN_ALBUM_GAIN` as fallback; MP3 ID3v2 and Ogg Vorbis comments),
- clamped to ±`max_boost`/`max_cut` dB (default 12 each, unity when
- untagged) — compose `normalize(replaygain(src))` to feed AGC the loudness
- baseline. `request.dynamic(function() return uri_or_nil end)` plays the
- requests its Lua callback returns, one ahead of the current track (nil
- ends the source) — a live-programming scheduler without a playlist file.
- `pipe({process = "...", format = "s16le"|"s24le", restart_backoff = 500}, src)`
- runs an external raw-PCM processor (e.g. Thimeo Stereo Tool —
- Liquidsoap's own `pipe`): a writer thread feeds the child source to the
- process's stdin as little-endian PCM and a reader thread decodes stdout
- back into the graph. Not lock-step — a bounded queue decouples the two
- streams and backpressure paces the child at the consumption rate. If the
- process dies it is restarted after `restart_backoff` ms
- (Icecast-reconnect style) while audio bypasses to the unprocessed child,
- so the broadcast never drops; the child is *shared*, not consumed, so
- `mksafe(pipe(...))` composes. A `-k "<LICENSE>"`-style argument is
- visible in `ps aux` — expected for shelling out to a licensed binary.
- `smart_crossfade({directory = ...})` is a `playlist` whose transition
- window is chosen by the outgoing track's measured tail level: a loud tail
- gets a full `fade_out` crossfade, a quiet tail only a short `fade_mid`
- fade (no point dragging a crossfade over silence; per-track
- `annotate:`/`cue_cut` fade overrides still win). `fade_out` defaults to
- `crossfade_seconds`, `fade_mid` to half of it, `threshold` (dBFS, default
- -30) decides "quiet".
- `output.preview(...)` runs without broadcasting.
+`"mp3"` or `"opus"`.
 
-Dayparting with `switch` — slots with a `when` predicate (weekday `days` as
-names or 0-6, `from`/`to` in `"HH:MM"`, overnight windows wrap; `from == to`
-never matches) are checked at each track boundary; the last slot must be a
-default without `when`. `track_sensitive = false` re-checks every buffer and
-cuts mid-track. `rotate({a, b}, {weights = {1, 2}})` holds a child for
-`weights[n]` consecutive tracks.
+**Sources** (composable):
+- `playlist({directory|files, shuffle, loop})` / `single(path)` — media playback
+- `jingles({directory})` — one-shot clips, telnet-triggered
+- `fallback({a, b})` / `sequence({a, b})` — first non-exhausted child / strict order
+- `random({a, b})` — shuffle without repeats
+- `switch({...})` — dayparting: slots with a `when` predicate (weekday `days`
+  as names or 0-6, `from`/`to` in `"HH:MM"`, overnight windows wrap;
+  `from == to` never matches) are checked at each track boundary; the last
+  slot must be a default without `when`. `track_sensitive = false`
+  re-checks every buffer and cuts mid-track.
+- `rotate({a, b}, {weights = {1, 2}})` — weighted round-robin, holding a
+  child for `weights[n]` consecutive tracks
+- `blank({duration})` / `sine({freq, duration})` — test tones
+- `mksafe(src)` — never fails outright: silence covers an exhausted or
+  failed child
+- `blank.detect(src, {threshold, duration, restart, exhaust_while_blank,
+  on_blank})` — dead-air guard: watches the wrapped source's RMS level, and
+  after `duration` seconds of sub-`threshold` silence reports exhausted
+  (so a `fallback` around it hands over automatically); `on_blank` fires a
+  Lua callback once per episode and the source recovers when audio returns
+- `map_metadata(src, function(m) return {title = ...} end)` — rewrites each
+  track's title through a Lua callback before it reaches the output (the
+  original is kept on nil/error/timeout)
+- `add({a, b}, {weights = {...}})` — N-source sample-wise sum with optional
+  per-source weights (background bed + voice-over)
+- `cue_cut(src, {cue_in, cue_out, fade_in, fade_out})` — skips `cue_in`
+  seconds into each track and ends it at `cue_out`; per-track
+  `fade_in`/`fade_out` override the global `crossfade_seconds` for that
+  track's crossfades
+- `request.dynamic(function() return uri_or_nil end)` — plays the requests
+  its Lua callback returns, one ahead of the current track (nil ends the
+  source) — a live-programming scheduler without a playlist file
+- `smart_crossfade({directory, ...})` — a `playlist` whose transition
+  window is chosen by the outgoing track's measured tail level: a loud tail
+  gets a full `fade_out` crossfade, a quiet tail only a short `fade_mid`
+  fade (no point dragging a crossfade over silence; per-track
+  `annotate:`/`cue_cut` fade overrides still win). `fade_out` defaults to
+  `crossfade_seconds`, `fade_mid` to half of it, `threshold` (dBFS, default
+  -30) decides "quiet".
+
+**DSP** (run inline in the pull chain):
+- `amplify(src, gain)`, `compress(src, opts)`, `normalize(src, opts)`
+- `replaygain(src, opts)` — per-track constant gain from the file's
+  `REPLAYGAIN_TRACK_GAIN` tag (`REPLAYGAIN_ALBUM_GAIN` as fallback; MP3
+  ID3v2 and Ogg Vorbis comments), clamped to ±`max_boost`/`max_cut` dB
+  (default 12 each, unity when untagged) — compose `normalize(replaygain(src))`
+  to feed AGC a consistent loudness baseline
+- `pipe({process = "...", format = "s16le"|"s24le", restart_backoff = 500},
+  src)` — runs an external raw-PCM processor (e.g. Thimeo Stereo Tool,
+  Liquidsoap's own `pipe`): a writer thread feeds the child source to the
+  process's stdin as little-endian PCM and a reader thread decodes stdout
+  back into the graph. Not lock-step — a bounded queue decouples the two
+  streams and backpressure paces the child at the consumption rate. If the
+  process dies it is restarted after `restart_backoff` ms
+  (Icecast-reconnect style) while audio bypasses to the unprocessed child,
+  so the broadcast never drops; the child is *shared*, not consumed, so
+  `mksafe(pipe(...))` composes. A `-k "<LICENSE>"`-style argument is
+  visible in `ps aux` — expected for shelling out to a licensed binary.
+- `output.preview(...)` — decode and mix without broadcasting.
 
 ```lua
 daytime = playlist({directory = "./media/day"})

@@ -26,6 +26,7 @@ jobs:
           cd /tmp/fdk-aac
           ./autogen.sh && ./configure --prefix=/usr/local
           make -j$(nproc) && sudo make install
+          sudo ldconfig
 
       - name: Cache cargo
         uses: actions/cache@v4
