@@ -184,11 +184,19 @@ impl IcecastOutput {
                         }
                     }
                     OutputFormat::Mp3 => {
-                        if let Err(e) =
-                            IcecastClient::update_title(&self.config, &title, &self.shutdown)
-                        {
-                            log::warn!("icecast metadata update failed: {e}");
-                        }
+                        // A metadata update is a fresh HTTP round-trip to
+                        // the server; done inline it stalls the output
+                        // thread, the tap channel overflows and frames are
+                        // dropped mid-crossfade. Run it on a background
+                        // thread instead — updates are minutes apart, so
+                        // they cannot overtake each other.
+                        let cfg = self.config.clone();
+                        let shutdown = self.shutdown.clone();
+                        std::thread::spawn(move || {
+                            if let Err(e) = IcecastClient::update_title(&cfg, &title, &shutdown) {
+                                log::warn!("icecast metadata update failed: {e}");
+                            }
+                        });
                     }
                     // ADTS has no in-stream title mechanism; nothing to send.
                     OutputFormat::Aac => {}
@@ -197,11 +205,13 @@ impl IcecastOutput {
                 // updinfo endpoint (the DNAS does not parse in-stream ICY
                 // metadata from sources).
                 OutputProtocol::ShoutcastV1 | OutputProtocol::ShoutcastV2 => {
-                    if let Err(e) =
-                        IcecastClient::update_icy_title(&self.config, &title, &self.shutdown)
-                    {
-                        log::warn!("shoutcast metadata update failed: {e}");
-                    }
+                    let cfg = self.config.clone();
+                    let shutdown = self.shutdown.clone();
+                    std::thread::spawn(move || {
+                        if let Err(e) = IcecastClient::update_icy_title(&cfg, &title, &shutdown) {
+                            log::warn!("shoutcast metadata update failed: {e}");
+                        }
+                    });
                 }
             }
         }

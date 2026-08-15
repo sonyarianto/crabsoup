@@ -18,6 +18,16 @@
       initial-connect loops, RTMP) use the shared `interruptible_sleep`
       (tap.rs). Verified: SIGINT during a stalled handshake exits in
       ~100 ms.
+- [x] **Crossfade stutter fixed (metadata stall)**: the Icecast output
+      thread ran each title update synchronously — a fresh HTTP round-trip
+      to the server at every track change. A slow update (measured live:
+      1.3–1.5 s to caster.fm) stalled the output thread, the tap's 4-frame
+      channel overflowed, and ~1 s of the fade's incoming track was
+      silently dropped (the "drift/repeat" heard at crossfades). Title
+      updates now run on a background thread (updates are minutes apart,
+      so they cannot overtake each other); the output thread never blocks.
+      Confirmed live: `tap: consumer slow, dropping frame` at exactly the
+      metadata-update moments, gone after the fix.
 - [x] **CLI**: running without `-c` prints help and exits (was: silently
       defaulted to `crabsoup.lua` and looked like a hang).
 - [x] YAML config (`-c crabsoup.yaml`)

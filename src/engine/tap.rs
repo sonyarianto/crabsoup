@@ -179,7 +179,9 @@ impl EngineTap {
                 pool: Some(pool.clone()),
             });
             for tx in &self.taps {
-                let _ = tx.try_send(frame.clone());
+                if let Err(e) = tx.try_send(frame.clone()) {
+                    log::debug!("tap: consumer slow, dropping frame ({e:?})");
+                }
             }
         }
         shutdown.store(true, Ordering::SeqCst);
