@@ -278,17 +278,10 @@ fn decode_symphonia(
 }
 
 /// Sleep for `dur`, waking early on shutdown so dropping a source stops its
-/// relay thread promptly (pipe's interruptible-backoff pattern).
+/// relay thread promptly (the shared tap helper; pipe's
+/// interruptible-backoff pattern).
 fn interruptible_sleep(dur: Duration, shutdown: &AtomicBool) {
-    let step = Duration::from_millis(10);
-    let mut elapsed = Duration::ZERO;
-    while elapsed < dur {
-        if shutdown.load(Ordering::SeqCst) {
-            break;
-        }
-        std::thread::sleep(step.min(dur - elapsed));
-        elapsed += step;
-    }
+    crate::engine::tap::interruptible_sleep(dur, shutdown);
 }
 
 #[cfg(test)]

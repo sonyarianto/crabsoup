@@ -22,6 +22,18 @@ pub struct AudioFrame {
     pub(crate) pool: Option<Arc<FramePool>>,
 }
 
+/// Sleep for `dur`, waking early on shutdown (used by reconnect loops so
+/// Ctrl-C is never delayed by a retry backoff).
+pub fn interruptible_sleep(dur: Duration, shutdown: &AtomicBool) {
+    let deadline = Instant::now() + dur;
+    while Instant::now() < deadline {
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Block for the next frame, waking every 100 ms to re-check `shutdown`.
 /// Consumer loops use this so they exit on Ctrl-C instead of blocking
 /// forever in `recv()` once the puller has stopped publishing frames.

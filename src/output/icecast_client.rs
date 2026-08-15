@@ -11,7 +11,8 @@
 //! pacing, so this client is a dumb transport.
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -20,6 +21,11 @@ use crate::Result;
 use crate::config::{OutputConfig, OutputFormat, OutputProtocol};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
+/// Handshake reads loop in short slices so a stalled server cannot delay
+/// Ctrl-C shutdown by the full IO timeout; the whole head still must
+/// complete within [`HEAD_READ_DEADLINE`].
+const READ_CHUNK_TIMEOUT: Duration = Duration::from_millis(250);
+const HEAD_READ_DEADLINE: Duration = Duration::from_secs(30);
 /// SHOUTcast v1 answers with a bare `OK2` line and then waits for audio, so
 /// the response head is bounded by a short read timeout instead of the blank
 /// line that terminates an HTTP head.
@@ -33,17 +39,33 @@ pub struct IcecastClient {
 
 impl IcecastClient {
     /// Establish a source connection using the configured protocol.
-    pub fn connect(config: &OutputConfig, sample_rate: u32, channels: u16) -> Result<Self> {
+    pub fn connect(
+        config: &OutputConfig,
+        sample_rate: u32,
+        channels: u16,
+        shutdown: &AtomicBool,
+    ) -> Result<Self> {
         match config.protocol {
-            OutputProtocol::Icecast => Self::connect_icecast(config, sample_rate, channels),
-            OutputProtocol::ShoutcastV1 => Self::connect_shoutcast(config, sample_rate, false),
-            OutputProtocol::ShoutcastV2 => Self::connect_shoutcast(config, sample_rate, true),
+            OutputProtocol::Icecast => {
+                Self::connect_icecast(config, sample_rate, channels, shutdown)
+            }
+            OutputProtocol::ShoutcastV1 => {
+                Self::connect_shoutcast(config, sample_rate, false, shutdown)
+            }
+            OutputProtocol::ShoutcastV2 => {
+                Self::connect_shoutcast(config, sample_rate, true, shutdown)
+            }
         }
     }
 
     /// Open the mount with a single authenticated `SOURCE` request.
-    fn connect_icecast(config: &OutputConfig, sample_rate: u32, channels: u16) -> Result<Self> {
-        let mut stream = TcpStream::connect((config.host.as_str(), config.port))?;
+    fn connect_icecast(
+        config: &OutputConfig,
+        sample_rate: u32,
+        channels: u16,
+        shutdown: &AtomicBool,
+    ) -> Result<Self> {
+        let mut stream = connect_tcp(&config.host, config.port, shutdown)?;
         stream.set_read_timeout(Some(IO_TIMEOUT))?;
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
 
@@ -73,7 +95,7 @@ impl IcecastClient {
         );
         stream.write_all(request.as_bytes())?;
 
-        let (status, message, _) = read_response_head(&mut stream)?;
+        let (status, message, _) = read_response_head(&mut stream, shutdown)?;
         if !(200..300).contains(&status) {
             return Err(format!(
                 "Icecast rejected source on {}: HTTP {status} {message}",
@@ -90,13 +112,18 @@ impl IcecastClient {
     /// HTTP-style head. When `v2` is set, a mount of `/stream/N` selects that
     /// stream by appending `:#N` to the password (the DNAS's documented way
     /// for ICY sources to target a stream on a v2 DNAS).
-    fn connect_shoutcast(config: &OutputConfig, sample_rate: u32, v2: bool) -> Result<Self> {
+    fn connect_shoutcast(
+        config: &OutputConfig,
+        sample_rate: u32,
+        v2: bool,
+        shutdown: &AtomicBool,
+    ) -> Result<Self> {
         require_shoutcast_format(config, !v2)?;
         let mut password = config.source_password.clone();
         if v2 && let Some(sid) = stream_id_from_mount(&config.mount) {
             password.push_str(&format!(":#{sid}"));
         }
-        let mut stream = TcpStream::connect((config.host.as_str(), config.port))?;
+        let mut stream = connect_tcp(&config.host, config.port, shutdown)?;
         stream.set_read_timeout(Some(IO_TIMEOUT))?;
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
 
@@ -115,7 +142,7 @@ impl IcecastClient {
         );
         stream.write_all(request.as_bytes())?;
 
-        let head = read_icy_head(&mut stream)?;
+        let head = read_icy_head(&mut stream, shutdown)?;
         let text = String::from_utf8_lossy(&head);
         let first_line = text.lines().next().unwrap_or_default();
         if !first_line.contains("OK") {
@@ -134,7 +161,7 @@ impl IcecastClient {
     /// connection (the source connection must stay clean). Icecast replies
     /// HTTP 200 even when it rejects the update, so the response body is
     /// checked for the rejection message.
-    pub fn update_title(config: &OutputConfig, title: &str) -> Result<()> {
+    pub fn update_title(config: &OutputConfig, title: &str, shutdown: &AtomicBool) -> Result<()> {
         let params = format!(
             "mode=updinfo&charset=UTF-8&mount={}&song={}",
             percent_encode(config.mount.as_bytes()),
@@ -150,11 +177,11 @@ impl IcecastClient {
             config.port,
             basic_auth(&config.source_user, &config.source_password),
         );
-        let mut stream = TcpStream::connect((config.host.as_str(), config.port))?;
+        let mut stream = connect_tcp(&config.host, config.port, shutdown)?;
         stream.set_read_timeout(Some(IO_TIMEOUT))?;
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
         stream.write_all(request.as_bytes())?;
-        let (status, _, body) = read_response_head(&mut stream)?;
+        let (status, _, body) = read_response_head(&mut stream, shutdown)?;
         if !(200..300).contains(&status) {
             return Err(format!("Icecast metadata update failed: HTTP {status}").into());
         }
@@ -168,7 +195,7 @@ impl IcecastClient {
     /// Update the "now playing" title via SHOUTcast's `/admin.cgi` endpoint
     /// (the `mode=updinfo` method ICY sources use; the source password rides
     /// in the query string). Verified against DNAS 2.6.1.
-    pub fn update_icy_title(config: &OutputConfig, title: &str) -> Result<()> {
+    pub fn update_icy_title(config: &OutputConfig, title: &str, shutdown: &AtomicBool) -> Result<()> {
         let params = format!(
             "mode=updinfo&pass={}&song={}",
             percent_encode(config.source_password.as_bytes()),
@@ -181,11 +208,11 @@ impl IcecastClient {
              \r\n",
             config.host, config.port,
         );
-        let mut stream = TcpStream::connect((config.host.as_str(), config.port))?;
+        let mut stream = connect_tcp(&config.host, config.port, shutdown)?;
         stream.set_read_timeout(Some(IO_TIMEOUT))?;
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
         stream.write_all(request.as_bytes())?;
-        let (status, message, _) = read_response_head(&mut stream)?;
+        let (status, message, _) = read_response_head(&mut stream, shutdown)?;
         if !(200..300).contains(&status) {
             return Err(
                 format!("SHOUTcast metadata update failed: HTTP {status} {message}").into(),
@@ -222,24 +249,30 @@ fn stream_id_from_mount(mount: &str) -> Option<u32> {
 /// Read a SHOUTcast response head. The DNAS replies with either an HTTP-style
 /// head (terminated by a blank line) or a bare `OK2` line followed by silence
 /// while it waits for audio, so the read is bounded by a short timeout
-/// instead of a terminator.
-fn read_icy_head(stream: &mut TcpStream) -> Result<Vec<u8>> {
-    stream.set_read_timeout(Some(HEAD_TIMEOUT))?;
+/// instead of a terminator. Errors early on `shutdown`.
+fn read_icy_head(stream: &mut TcpStream, shutdown: &AtomicBool) -> Result<Vec<u8>> {
+    stream.set_read_timeout(Some(READ_CHUNK_TIMEOUT))?;
+    let deadline = std::time::Instant::now() + HEAD_TIMEOUT;
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
     loop {
         if head.len() >= 65536 || head.ends_with(b"\r\n\r\n") || head.ends_with(b"\n\n") {
             break;
         }
+        if shutdown.load(Ordering::SeqCst) {
+            return Err("shutdown requested during handshake".into());
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
         match stream.read(&mut byte) {
             Ok(0) => break,
             Ok(_) => head.push(byte[0]),
             Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                break;
-            }
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
             Err(e) => return Err(e.into()),
         }
     }
@@ -247,21 +280,69 @@ fn read_icy_head(stream: &mut TcpStream) -> Result<Vec<u8>> {
     Ok(head)
 }
 
+/// Connect with shutdown-aware slicing: the TCP handshake retries in short
+/// slices (checking `shutdown` between them) instead of blocking on the
+/// system default connect timeout.
+fn connect_tcp(host: &str, port: u16, shutdown: &AtomicBool) -> Result<TcpStream> {
+    let addrs: Vec<SocketAddr> = (host, port).to_socket_addrs()?.collect();
+    let mut last_err: Option<std::io::Error> = None;
+    for addr in addrs {
+        loop {
+            if shutdown.load(Ordering::SeqCst) {
+                return Err("shutdown requested during connect".into());
+            }
+            match TcpStream::connect_timeout(&addr, Duration::from_millis(250)) {
+                Ok(stream) => return Ok(stream),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(e) => {
+                    last_err = Some(e);
+                    break;
+                }
+            }
+        }
+    }
+    Err(last_err
+        .unwrap_or_else(|| std::io::Error::from(std::io::ErrorKind::AddrNotAvailable))
+        .into())
+}
+
 fn basic_auth(user: &str, password: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"))
 }
 
 /// Read the response head (up to `\r\n\r\n`), then drain the body promised by
-/// `Content-Length`. Returns `(status, reason phrase, body)`.
-fn read_response_head(stream: &mut TcpStream) -> Result<(u16, String, Vec<u8>)> {
+/// `Content-Length`. Returns `(status, reason phrase, body)`. The head read
+/// loops in short slices (bounded by [`HEAD_READ_DEADLINE`]) and errors on
+/// `shutdown`, so a stalled server cannot delay Ctrl-C shutdown by the full
+/// IO timeout.
+fn read_response_head(
+    stream: &mut TcpStream,
+    shutdown: &AtomicBool,
+) -> Result<(u16, String, Vec<u8>)> {
+    stream.set_read_timeout(Some(READ_CHUNK_TIMEOUT))?;
+    let deadline = std::time::Instant::now() + HEAD_READ_DEADLINE;
     let mut buf = Vec::new();
     let mut byte = [0u8; 1];
     while !buf.ends_with(b"\r\n\r\n") && buf.len() < 65536 {
-        if stream.read(&mut byte)? == 0 {
-            break;
+        if shutdown.load(Ordering::SeqCst) || std::time::Instant::now() >= deadline {
+            return Err("shutdown requested during handshake".into());
         }
-        buf.push(byte[0]);
+        match stream.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => buf.push(byte[0]),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(e) => return Err(e.into()),
+        }
     }
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
     let head = String::from_utf8_lossy(&buf);
     let status_line = head.lines().next().unwrap_or_default();
     let mut parts = status_line.splitn(3, ' ');
@@ -307,6 +388,8 @@ mod tests {
     use std::io::Read;
     use std::net::{Shutdown, TcpListener};
     use std::thread;
+
+    static NOT_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 
     /// Accept one connection, capture the request head, reply, then read the
     /// request body until the client closes.
@@ -380,7 +463,7 @@ mod tests {
         let capture = thread::spawn(move || {
             server.serve_once("HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n", false)
         });
-        let mut client = IcecastClient::connect(&test_config(port), 44100, 2).expect("connects");
+        let mut client = IcecastClient::connect(&test_config(port), 44100, 2, &NOT_SHUTTING_DOWN).expect("connects");
         client.send(b"encoded-bytes").expect("sends");
         let (head, body) = capture.join().unwrap();
 
@@ -405,7 +488,7 @@ mod tests {
                 false,
             )
         });
-        let err = IcecastClient::connect(&test_config(port), 44100, 2).unwrap_err();
+        let err = IcecastClient::connect(&test_config(port), 44100, 2, &NOT_SHUTTING_DOWN).unwrap_err();
         assert!(err.to_string().contains("401"), "{err}");
         assert!(err.to_string().contains("/test.opus"), "{err}");
     }
@@ -417,7 +500,7 @@ mod tests {
         let capture = thread::spawn(move || {
             server.serve_once("HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n", false)
         });
-        IcecastClient::update_title(&test_config(port), "café & trance").expect("updates");
+        IcecastClient::update_title(&test_config(port), "café & trance", &NOT_SHUTTING_DOWN).expect("updates");
         let (head, _) = capture.join().unwrap();
 
         assert!(
@@ -445,7 +528,7 @@ mod tests {
         let server = FakeIcecast::new();
         let port = server.port();
         thread::spawn(move || server.serve_once(Box::leak(reply.into_boxed_str()), false));
-        let err = IcecastClient::update_title(&test_config(port), "track").unwrap_err();
+        let err = IcecastClient::update_title(&test_config(port), "track", &NOT_SHUTTING_DOWN).unwrap_err();
         assert!(err.to_string().contains("refused"), "{err}");
         assert!(err.to_string().contains("will not accept"), "{err}");
     }
@@ -459,6 +542,7 @@ mod tests {
             &shoutcast_config(port, OutputProtocol::ShoutcastV1),
             44100,
             2,
+            &NOT_SHUTTING_DOWN,
         )
         .expect("connects");
         client.send(b"encoded-bytes").expect("sends");
@@ -482,6 +566,7 @@ mod tests {
             &shoutcast_config(port, OutputProtocol::ShoutcastV1),
             44100,
             2,
+            &NOT_SHUTTING_DOWN,
         )
         .expect("connects");
         client.send(b"audio").expect("sends");
@@ -498,7 +583,7 @@ mod tests {
         let mut cfg = shoutcast_config(port, OutputProtocol::ShoutcastV2);
         // The DNAS's named-stream path selects stream id 2 via password:#2.
         cfg.mount = "/stream/2".into();
-        IcecastClient::connect(&cfg, 44100, 2).expect("connects");
+        IcecastClient::connect(&cfg, 44100, 2, &NOT_SHUTTING_DOWN).expect("connects");
         let (head, _) = capture.join().unwrap();
 
         assert!(head.starts_with("hackme:#2\n"), "{head}");
@@ -513,7 +598,7 @@ mod tests {
         let capture = thread::spawn(move || server.serve_once("OK2\r\nicy-caps:11\r\n\r\n", false));
         let mut cfg = shoutcast_config(port, OutputProtocol::ShoutcastV2);
         cfg.mount = "/".into();
-        IcecastClient::connect(&cfg, 44100, 2).expect("connects");
+        IcecastClient::connect(&cfg, 44100, 2, &NOT_SHUTTING_DOWN).expect("connects");
         let (head, _) = capture.join().unwrap();
         assert!(head.starts_with("hackme\n"), "{head}");
     }
@@ -523,18 +608,18 @@ mod tests {
         // Opus is not a SHOUTcast format for either version.
         let mut cfg = shoutcast_config(0, OutputProtocol::ShoutcastV1);
         cfg.format = OutputFormat::Opus;
-        let err = IcecastClient::connect(&cfg, 44100, 2).unwrap_err();
+        let err = IcecastClient::connect(&cfg, 44100, 2, &NOT_SHUTTING_DOWN).unwrap_err();
         assert!(err.to_string().contains("mp3"), "{err}");
 
         let mut cfg = shoutcast_config(0, OutputProtocol::ShoutcastV2);
         cfg.format = OutputFormat::Opus;
-        let err = IcecastClient::connect(&cfg, 44100, 2).unwrap_err();
+        let err = IcecastClient::connect(&cfg, 44100, 2, &NOT_SHUTTING_DOWN).unwrap_err();
         assert!(err.to_string().contains("mp3"), "{err}");
 
         // v1 predates AAC; only v2 carries it.
         let mut cfg = shoutcast_config(0, OutputProtocol::ShoutcastV1);
         cfg.format = OutputFormat::Aac;
-        let err = IcecastClient::connect(&cfg, 44100, 2).unwrap_err();
+        let err = IcecastClient::connect(&cfg, 44100, 2, &NOT_SHUTTING_DOWN).unwrap_err();
         assert!(err.to_string().contains("mp3"), "{err}");
     }
 
@@ -547,7 +632,7 @@ mod tests {
         });
         let mut cfg = shoutcast_config(port, OutputProtocol::ShoutcastV1);
         cfg.source_password = "hackme".into();
-        IcecastClient::update_icy_title(&cfg, "café & trance").expect("updates");
+        IcecastClient::update_icy_title(&cfg, "café & trance", &NOT_SHUTTING_DOWN).expect("updates");
         let (head, _) = capture.join().unwrap();
 
         assert!(

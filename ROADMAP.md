@@ -8,6 +8,16 @@
       use `recv_frame_or_shutdown` (tap.rs): `recv_timeout(100 ms)` that
       re-checks the shared flag. Verified: SIGINT exits cleanly, encoder
       tails still flush.
+- [x] **Reconnect is shutdown-aware**: a stalled Icecast connection used to
+      delay Ctrl-C by up to 30 s — the handshake (TCP connect + response
+      head read) blocked with a 30 s IO timeout and the flag was only
+      checked between attempts. `icecast_client.rs` now retries the TCP
+      handshake in 250 ms slices (`connect_tcp`, `READ_CHUNK_TIMEOUT`,
+      bounded by the old 30 s deadline) and all handshake/metadata reads
+      error on `shutdown`; reconnect backoffs (icecast output, main's
+      initial-connect loops, RTMP) use the shared `interruptible_sleep`
+      (tap.rs). Verified: SIGINT during a stalled handshake exits in
+      ~100 ms.
 - [x] **CLI**: running without `-c` prints help and exits (was: silently
       defaulted to `crabsoup.lua` and looked like a hang).
 - [x] YAML config (`-c crabsoup.yaml`)

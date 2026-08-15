@@ -7,7 +7,7 @@ use std::time::Duration;
 use clap::{CommandFactory, Parser};
 
 use crabsoup::engine::mixer::{MixCommand, PriorityMixer, StatusHandle};
-use crabsoup::engine::tap::{AudioFrame, EngineTap, recv_frame_or_shutdown};
+use crabsoup::engine::tap::{AudioFrame, EngineTap, interruptible_sleep, recv_frame_or_shutdown};
 use crabsoup::live::harbor::Harbor;
 use crabsoup::output::file::FileOutput;
 use crabsoup::output::hls::HlsOutput;
@@ -178,7 +178,10 @@ fn main() -> crabsoup::Result<()> {
                         if out_shutdown.load(Ordering::SeqCst) {
                             return Ok(());
                         }
-                        std::thread::sleep(Duration::from_secs(output.reconnect_seconds()));
+                        interruptible_sleep(
+                            Duration::from_secs(output.reconnect_seconds()),
+                            &out_shutdown,
+                        );
                     }
                 }
             }
@@ -278,7 +281,10 @@ fn main() -> crabsoup::Result<()> {
                         if out_shutdown.load(Ordering::SeqCst) {
                             return Ok(());
                         }
-                        std::thread::sleep(Duration::from_secs(output.reconnect_seconds()));
+                        interruptible_sleep(
+                            Duration::from_secs(output.reconnect_seconds()),
+                            &out_shutdown,
+                        );
                     }
                 }
             }

@@ -6,7 +6,7 @@ use std::time::Duration;
 use crate::Result;
 use crate::config::{OutputConfig, OutputFormat, OutputProtocol};
 use crate::engine::mixer::StatusHandle;
-use crate::engine::tap::{AudioFrame, recv_frame_or_shutdown};
+use crate::engine::tap::{AudioFrame, interruptible_sleep, recv_frame_or_shutdown};
 use crate::output::encoder::{AacEncoder, Encoder, create_encoder};
 use crate::output::icecast_client::IcecastClient;
 
@@ -90,6 +90,7 @@ impl IcecastOutput {
             &self.config,
             self.sample_rate,
             self.chans as u16,
+            &self.shutdown,
         )?);
         log::info!(
             "connected to {} {}:{} mount {} ({})",
@@ -133,7 +134,10 @@ impl IcecastOutput {
                         "Icecast reconnect failed: {e}; retrying in {}s",
                         self.config.reconnect_seconds
                     );
-                    std::thread::sleep(Duration::from_secs(self.config.reconnect_seconds));
+                    interruptible_sleep(
+                        Duration::from_secs(self.config.reconnect_seconds),
+                        &self.shutdown,
+                    );
                 }
             }
         }
@@ -180,7 +184,9 @@ impl IcecastOutput {
                         }
                     }
                     OutputFormat::Mp3 => {
-                        if let Err(e) = IcecastClient::update_title(&self.config, &title) {
+                        if let Err(e) =
+                            IcecastClient::update_title(&self.config, &title, &self.shutdown)
+                        {
                             log::warn!("icecast metadata update failed: {e}");
                         }
                     }
@@ -191,7 +197,9 @@ impl IcecastOutput {
                 // updinfo endpoint (the DNAS does not parse in-stream ICY
                 // metadata from sources).
                 OutputProtocol::ShoutcastV1 | OutputProtocol::ShoutcastV2 => {
-                    if let Err(e) = IcecastClient::update_icy_title(&self.config, &title) {
+                    if let Err(e) =
+                        IcecastClient::update_icy_title(&self.config, &title, &self.shutdown)
+                    {
                         log::warn!("shoutcast metadata update failed: {e}");
                     }
                 }
