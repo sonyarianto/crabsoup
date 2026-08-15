@@ -3,8 +3,9 @@
 -- Exercises the Phase 2 effect operators end-to-end on a synthetic tone,
 -- no media files needed. Broadcast as `tone-dsp` or preview locally.
 -- `pitch`/`stretch` (Part I1, pure-Rust wsola), `echo` (Part I2),
--- `reverb` (Part I3, convolution) and `eq`/`filter` (Part I4, biquads) are
--- shown in the alternate chains below — uncomment to exercise them.
+-- `reverb` (Part I3, convolution), `eq`/`filter` (Part I4, biquads) and
+-- `stereo` (Part I5, pan + mid-side width) are shown in the alternate
+-- chains below — uncomment to exercise them.
 --
 -- Run: ./target/release/crabsoup -c examples/crabsoup.dsp.lua --preview
 
@@ -31,6 +32,8 @@ tone = amplify(tone, 0.9)
 -- tone = eq(tone, {bands = {{type = "lowpass", freq = 15000},
 --                           {type = "peaking", freq = 1000, gain = 3, q = 1.0}}})
 -- tone = filter(tone, {type = "highpass", freq = 80})
+-- tone = stereo(tone, {pan = -0.25, width = 1.4})
+-- tone = stereo.widen(tone, 1.4)
 
 output.icecast({host = "localhost", port = 8000,
                 mount = "/tone-dsp.mp3", format = "mp3", bitrate = 128000,

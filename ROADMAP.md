@@ -161,6 +161,13 @@ parametric chain — highshelf, two peakings, lowshelf — per channel):
 |---|---|---|
 | eq/4_band_parametric | 203 µs | 0.22 % |
 
+Stereo row (Part I5, recorded in the session that landed `stereo`; pan
+-0.25 + width 1.4 over a sine source):
+
+| benchmark | per 92.9 ms buffer | vs real-time |
+|---|---|---|
+| stereo/pan+width | 59 µs | 0.06 % |
+
 Video-path rows (Part H3, recorded in the session that landed the effects +
 bench group; per 640x360 YUV420P frame, budget = one 25 fps frame = 40 ms):
 
@@ -801,7 +808,7 @@ rows recorded against the baseline convention.
 
 ### Part I — advanced audio & effects (Phase 2, Q1 – Q2 2027)
 
-**Status: I1–I4 shipped** (see their rows below; I5 onwards still planned).
+**Status: I1–I5 shipped** (see their rows below; I6 onwards still planned).
 The product plan's Phase 2. Effects stay inline in the
 pull chain (one thread per output, allocation-free hot paths), each landing
 with inline tests and a bench row; FFI-backed DSP (SoundTouch, aubio) gets
@@ -883,6 +890,24 @@ its own confined module per the Part H convention note.
 - [ ] **I5 — stereo imaging** (`stereo.widen`, `stereo.pan`, mid-side),
 - [ ] **I5 — stereo imaging** (`stereo.widen`, `stereo.pan`, mid-side),
       **I6 — vocal remover** (centre-channel phase cancellation).
+      **Shipped as `stereo(src, {pan, width})` + `stereo.pan(src, pan)` /
+      `stereo.widen(src, width)`** over `src/engine/stereo.rs` — a
+      `Stereo` effect combining balance panning with mid-side width.
+      Pan ∈ [-1, 1] is a *balance*: the channel the image moves toward
+      stays at unity while the far channel fades on a sin/cos quarter
+      wave, so `pan = 0` is an exact passthrough and ±1 hard-cuts to one
+      channel. Width is mid-side — `mid = (L+R)/2`, `side = (L−R)/2`,
+      re-encoded as `mid ± width·side` — so 1 is passthrough, 0 collapses
+      to mono, > 1 widens. `stereo` is a callable table (the `blank`
+      pattern): `stereo.pan` / `stereo.widen` are method forms. Per-frame
+      arithmetic only, no allocation; mono buses pass through untouched.
+      Tests: exact-passthrough centre, hard pans route exactly one
+      channel, the pan-0.5 fade value (sin π/4), mono collapse, doubled
+      side at width 2, validation (pan range, negative/NaN width), mono
+      passthrough, allocation-free pull path; script tests (hard-left pan
+      mutes the right channel, width 0 makes the channels identical,
+      table form == method, out-of-range pan error). Bench:
+      `stereo/pan+width` ~59 µs per 92.9 ms buffer.
 - [ ] **I7 — BPM & key detection** (`aubio-rs` or `libvamp`), **I8 — speech
       synthesis** (`espeak-ng` hook), **I9 — MIDI control input**.
 

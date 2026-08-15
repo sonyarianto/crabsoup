@@ -20,6 +20,7 @@ use crabsoup::engine::eq::{Eq, EqBand, EqType};
 use crabsoup::engine::mixer::{CrossfadeMixer, PriorityMixer, SmartFade};
 use crabsoup::engine::pitch::{PitchMode, PitchSource};
 use crabsoup::engine::reverb::ConvReverb;
+use crabsoup::engine::stereo::Stereo;
 use crabsoup::output::encoder::{AacEncoder, Encoder, Mp3Encoder, OpusEncoder};
 use crabsoup::resample::SincResampler;
 use crabsoup::source::{AudioSource, SineSource, SourceProvider};
@@ -290,6 +291,21 @@ fn effects(c: &mut Criterion) {
     });
 }
 
+fn stereo(c: &mut Criterion) {
+    let mut group = c.benchmark_group("stereo");
+    group.throughput(Throughput::Elements(BUF as u64));
+
+    group.bench_function("pan+width", |b| {
+        let child: Box<dyn AudioSource> = Box::new(SineSource::new(440.0, None, 0.5, RATE, CHANS));
+        let mut chain = EffectSource::new(child, Stereo::new(-0.25, 1.4).unwrap(), CHANS);
+        let mut buf = vec![0.0f32; BUF];
+        b.iter(|| {
+            chain.next_buffer(&mut buf);
+            black_box(&buf);
+        });
+    });
+}
+
 fn eq(c: &mut Criterion) {
     let mut group = c.benchmark_group("eq");
     group.throughput(Throughput::Elements(BUF as u64));
@@ -517,6 +533,7 @@ criterion::criterion_group!(
     effects,
     eq,
     reverb,
+    stereo,
     pitch,
     resampler,
     encode

@@ -3,4 +3,5 @@ pub mod eq;
 pub mod mixer;
 pub mod pitch;
 pub mod reverb;
+pub mod stereo;
 pub mod tap;

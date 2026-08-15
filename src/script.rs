@@ -46,6 +46,7 @@ use crate::engine::eq::{Eq, EqBand, EqType};
 use crate::engine::mixer::{CrossfadeMixer, SmartFade};
 use crate::engine::pitch::{PitchMode, PitchSource};
 use crate::engine::reverb::{ConvReverb, load_ir};
+use crate::engine::stereo::Stereo;
 use crate::request::{RequestConfig, RequestUri, TrackCues, resolve};
 use crate::source::blank_detect::{BlankDetectConfig, BlankDetectSource};
 use crate::source::cue_cut::CueCutSource;
@@ -2314,6 +2315,54 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
             ))))
         })?,
     )?;
+
+    // ---- stereo imaging -------------------------------------------------
+    // `stereo` is a callable table like `blank`: `stereo(src, {pan,
+    // width})` and the `stereo.pan` / `stereo.widen` method forms (I5).
+    let stereo_state = state.clone();
+    let stereo_fn = lua.create_function(
+        move |_, (_self, mut source, opts): (Table, LuaSource, Option<Table>)| {
+            let pan = opt_f64(&opts, "pan", 0.0)?;
+            let width = opt_f64(&opts, "width", 1.0)?;
+            let (spec, _) = bus(&stereo_state);
+            let fx = Stereo::new(pan as f32, width as f32).map_err(mlua::Error::runtime)?;
+            let child = source.take();
+            Ok(LuaSource::new(Box::new(EffectSource::new(
+                child,
+                fx,
+                spec.channels.count(),
+            ))))
+        },
+    )?;
+    let pan_state = state.clone();
+    let pan_fn = lua.create_function(move |_, (mut source, pan): (LuaSource, f64)| {
+        let (spec, _) = bus(&pan_state);
+        let fx = Stereo::new(pan as f32, 1.0).map_err(mlua::Error::runtime)?;
+        let child = source.take();
+        Ok(LuaSource::new(Box::new(EffectSource::new(
+            child,
+            fx,
+            spec.channels.count(),
+        ))))
+    })?;
+    let widen_state = state.clone();
+    let widen_fn = lua.create_function(move |_, (mut source, width): (LuaSource, f64)| {
+        let (spec, _) = bus(&widen_state);
+        let fx = Stereo::new(0.0, width as f32).map_err(mlua::Error::runtime)?;
+        let child = source.take();
+        Ok(LuaSource::new(Box::new(EffectSource::new(
+            child,
+            fx,
+            spec.channels.count(),
+        ))))
+    })?;
+    let stereo = lua.create_table()?;
+    stereo.set("pan", pan_fn)?;
+    stereo.set("widen", widen_fn)?;
+    let stereo_mt = lua.create_table()?;
+    stereo_mt.set("__call", stereo_fn)?;
+    stereo.set_metatable(Some(stereo_mt));
+    globals.set("stereo", stereo)?;
 
     // ---- source composition ---------------------------------------------
     let composer = lua.create_function(|_, (children, kind): (Table, String)| {
@@ -5062,6 +5111,56 @@ mod tests {
             };
             assert!(err.to_string().contains("eq"), "{err}");
         }
+    }
+
+    #[test]
+    fn stereo_pan_hard_left_keeps_only_the_left_channel() {
+        let out =
+            preview_out(r#"output.preview(stereo.pan(sine({freq = 440, duration = 0.2}), -1))"#);
+        let left_rms = mono_rms(&out);
+        let right_rms = {
+            let sig: Vec<f32> = out.iter().skip(1).step_by(2).copied().collect();
+            (sig.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / sig.len() as f64).sqrt()
+        };
+        assert!(left_rms > 0.3, "left channel present: {left_rms}");
+        assert!(right_rms < 1e-4, "right channel muted: {right_rms}");
+    }
+
+    #[test]
+    fn stereo_widen_zero_collapses_to_mono() {
+        let out =
+            preview_out(r#"output.preview(stereo.widen(sine({freq = 440, duration = 0.2}), 0))"#);
+        for pair in out.chunks_exact(2) {
+            assert!(
+                (pair[0] - pair[1]).abs() < 1e-5,
+                "channels identical after mono collapse: {} vs {}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn stereo_callable_table_form_works() {
+        // Table form: stereo(src, {pan = 1}) is hard right, like the method.
+        let out =
+            preview_out(r#"output.preview(stereo(sine({freq = 440, duration = 0.2}), {pan = 1}))"#);
+        let left_rms = mono_rms(&out);
+        let right_rms = {
+            let sig: Vec<f32> = out.iter().skip(1).step_by(2).copied().collect();
+            (sig.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / sig.len() as f64).sqrt()
+        };
+        assert!(left_rms < 1e-4, "left channel muted: {left_rms}");
+        assert!(right_rms > 0.3, "right channel present: {right_rms}");
+    }
+
+    #[test]
+    fn stereo_rejects_out_of_range_pan() {
+        let err = match run(r#"output.preview(stereo.pan(sine({}), -2))"#) {
+            Ok(_) => panic!("pan below -1 must fail"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("stereo"), "{err}");
     }
 
     // ---- Phase 5: switch / rotate ----------------------------------------

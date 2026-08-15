@@ -34,7 +34,8 @@ One engine thread plus one thread per output:
 - Registers the Liquidsoap-flavoured Lua stdlib: `playlist`,
   `smart_crossfade`, `single`, `blank` (+ `blank.detect`), `sine`,
   `amplify`, `compress`, `normalize`, `replaygain`, `stretch`, `pitch`,
-  `echo`, `reverb`, `eq`, `filter`, `pipe`, `jingles`,
+  `echo`, `reverb`, `eq`, `filter`, `stereo` (+ `stereo.pan`, `stereo.widen`),
+  `pipe`, `jingles`,
   `fallback`/`sequence`/`random`, `switch`, `rotate`, `mksafe`, `add`,
   `cue_cut`,   `map_metadata`, `request.queue`, `request.dynamic`,
   `input.harbor`, `input.soundcard`, `input.http`, `output.icecast`,
@@ -285,6 +286,24 @@ One engine thread plus one thread per output:
 - A zero-gain band reduces to an exact passthrough (pinned by a
   sample-exact test); a resonant peaking driven with noise stays bounded
   (stability test) rather than ringing into overflow.
+
+## Stereo imaging (`src/engine/stereo.rs`)
+
+- `stereo` is a callable table (the `blank` pattern): `stereo(src, {pan
+  = 0, width = 1})` plus the `stereo.pan(src, pan)` /
+  `stereo.widen(src, width)` method forms. All wrap the source in a
+  `Stereo` effect.
+- Pan is a *balance*, not a constant-power image shift: the channel the
+  image moves toward stays at unity and the far channel fades on a
+  sin/cos quarter wave (`pan ≤ 0`: right gain `sin((pan+1)·π/2)`;
+  `pan > 0`: left gain `sin((1-pan)·π/2)`). `pan = 0` is therefore an
+  exact passthrough — chaining `stereo` with other effects never changes
+  the level at centre — and ±1 hard-cuts to exactly one channel.
+- Width is mid-side: `mid = (L+R)/2`, `side = (L−R)/2`, re-encoded as
+  `mid ± width·side`. `width = 1` is passthrough, `0` collapses the
+  image to mono, `> 1` widens it. Mono buses pass through untouched
+  (panning and mid-side are meaningless on a mono bus); pan and width
+  validate at operator-call time (pan in `[-1, 1]`, width ≥ 0).
 
 ## Mixer control (`src/engine/mixer.rs`)
 
