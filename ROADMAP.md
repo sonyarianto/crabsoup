@@ -70,19 +70,27 @@ jitter — via real OS threads and allocation-free hot paths, not "Rust alone".
 This section is the plan; the Done sections above stay the source of truth
 for what shipped.
 
+**Status: the original plan (Parts A–F) is fully shipped** — see the Done
+sections for landing notes. The open plan is [Part G](#part-g--remaining-product-parity-gaps-relay-input-clock-drift)
+(`input.http` relay + soundcard clock-drift compensation); the sections
+below that predate it are kept as history and are complete.
+
 ### Performance principles (apply to every phase)
+
+Standing conventions, all shipped and verified (buffer reuse, lock
+discipline, benchmark harness — see Done sections); every future phase is
+held to these:
 
 - No `Vec::new()`/`vec![...]` inside a `next_buffer` hot path. Scratch
   buffers are sized at construction and resized only if the buffer size
   actually changes.
 - Lock once per call, not per method: one `next_buffer` never takes the same
-  child `Mutex` twice (`FallbackSource`/`RandomSource` today; future
-  `EffectSource`/`OnMetadataSource` wrappers must not either).
+  child `Mutex` twice (all wrapper sources follow this today).
 - One thread per output plus one puller thread; nothing finer-grained (DSP
   effects stay inline in the pull chain).
-- `benches/` with criterion covering the mixers, resampler, and encode path
-  once the buffer-reuse + tap work lands; record baseline numbers in
-  ROADMAP.md so later phases check against them, not "seems fine".
+- `benches/` with criterion covering the mixers, resampler, and encode path;
+  record baseline numbers in ROADMAP.md so later phases check against them,
+  not "seems fine".
 - SIMD is a later lever (sinc convolution, effect loops) — only after the
   benchmark harness shows it is the bottleneck.
 
@@ -394,9 +402,78 @@ metadata/dead-air gaps.
       never blocking the audio thread) and falls back to the original
       label on timeout, callback error, or `nil`. `map_metadata(src,
       function(m) return {title = ...} end)` registered next to
-      `on_metadata`. Script tests: rewrite in order across a sequence,
-      `nil` keeps the original, callback error keeps the original, and the
-      bounded wait expires to the raw label when Lua never replies.
+       `on_metadata`. Script tests: rewrite in order across a sequence,
+       `nil` keeps the original, callback error keeps the original, and the
+       bounded wait expires to the raw label when Lua never replies.
+
+### Part G — remaining product-parity gaps (relay input, clock drift)
+
+**Status: G1/G2 not started — this is the live plan.** Parts A–F above
+(the original Liquidsoap-parity plan) are complete; everything that
+follows comes from auditing crabsoup as a *product* against Liquidsoap —
+"could someone fully replace Liquidsoap with this" — rather than an
+operator-by-operator checklist. Confirmed absent by checking the source,
+not assumed: no relay/pull-stream input exists anywhere, and the
+soundcard work (F2) has no clock-drift story.
+
+- [ ] **G1 — `input.http`: continuous relay/pull-stream source**
+      Everything crabsoup takes in is a local file, a request-resolved URI
+      played once as a track, or a DJ *pushing* audio via `input.harbor`.
+      There's no way to **pull a continuous remote stream and use it as a
+      live source** — relaying a syndicated network feed during certain
+      hours, or taking an affiliate line, stays connected indefinitely and
+      reconnects on drop. Closer in spirit to `input.harbor` (continuous,
+      long-lived) than to `request.rs`'s one-shot downloads:
+      - **Streaming GET, not download-then-play.** Add a streaming-read
+        mode to the hand-rolled HTTP client (reuse the rustls wrapping
+        from F1 for `https://` relays) that hands back a live `Read`
+        stream instead of buffering the whole body to a temp file.
+      - **Reuse symphonia's incremental decode path** — `MediaSourceStream`
+        wraps any `Read`, so the probe/decode machinery proven in
+        `FileSource`/`OpusSource` applies, fed from a live socket instead
+        of a finished file.
+      - **Format detection from the response, not just probing** — relays
+        declare `Content-Type` (`audio/mpeg`, `audio/ogg`, ...); use it as
+        a hint alongside symphonia's probing (no seek-back on a live
+        stream).
+      - **Reconnect-with-backoff on drop**, mirroring `IcecastOutput`'s
+        reconnect loop and `pipe()`'s supervisor — same philosophy,
+        applied to an input.
+      - **Jitter buffer between the network thread and `next_buffer`** —
+        the same `ringbuf` bridge pattern used by the harbor and the tap,
+        not a fourth concurrency primitive.
+      - **`is_exhausted() == true` while disconnected/reconnecting**, the
+        same decision already made for `blank.detect` (F4) and `pipe`
+        bypass (Part E), so `fallback({relay, local_playlist})` composes
+        with zero script-side handling.
+      Acceptance: relaying a real Icecast/Shoutcast stream (or a local
+      test server for CI) plays continuously; killing the upstream
+      triggers reconnect-with-backoff and the composed `fallback` takes
+      over in the gap.
+- [ ] **G2 — soundcard clock-drift compensation**
+      Narrower, but real now that `input.soundcard`/`output.soundcard`
+      (F2) exist: a sound card's hardware sample clock drifts against the
+      internal wall-clock pacing over long unattended runs, gradually
+      filling or draining the ring until under/overrun.
+      - **Adaptive resampling, not fixed-ratio.** `SincResampler` does
+        fixed-ratio conversion; drift compensation needs the ratio nudged
+        continuously by tens of PPM based on the ring's fill level — a
+        simple control loop, not a PLL. A lighter linear-interpolation
+        resampler may be the better fit for a near-1:1 correction than
+        the full sinc convolution.
+      - **Simpler MVP fallback:** periodic single-sample insertion/drop
+        based on fill level — cruder (an occasional audible micro-glitch)
+        but much less work, and a legitimate first cut if the adaptive
+        version proves too complex initially.
+      - **Contained scope:** only `src/source/soundcard.rs` /
+        `src/output/soundcard.rs`, not a systemic engine change.
+      Acceptance: don't require a real multi-hour hardware run in CI —
+      simulate clock skew by feeding the bridge at a deliberately
+      different rate than it's consumed and assert the ring fill stays
+      roughly stable instead of drifting to empty/full; reserve a real
+      multi-hour run as a manual verification step in
+      `docs/ARCHITECTURE.md`, same treatment as F2's other hardware
+      checks.
 
 ### Suggested execution order
 
@@ -419,11 +496,15 @@ metadata/dead-air gaps.
 8. Part F (real-deployment gaps) — **done**: F1 (HTTPS via rustls) → F2
    (soundcard I/O via cpal) → F4 (`blank.detect`) → F3 (`map_metadata`),
    per the plan's suggested order (see Done (cont.)).
+9. Part G (remaining product-parity gaps) — **current plan**: G1
+   (`input.http` relay/pull source) → G2 (soundcard clock-drift
+   compensation). G1 first (higher product impact, no dependency on G2);
+   G2's simulated-skew test should be written before real hardware time.
 
-If effort is constrained to one track at a time, prioritize Track C through
-C1/C2 ahead of Track B phases 5–8 — output breadth (file recording, multiple
-mounts, AAC) is the highest-value/lowest-risk next step for a station in
-production. Track B Phase 2 (DSP) is cheap enough to interleave regardless.
+The original Liquidsoap-parity plan (Parts A–F) is complete; Part G is the
+only open plan section. If effort is constrained, G1 (`input.http`) is the
+highest-value remaining item for production stations (syndicated/relay
+feeds), with G2 following once soundcard deployments need it.
 
 Non-goals for now: full `.liq` language compatibility (the Lua stdlib
 approximates the operator surface, not the language); LADSPA plugin hosting
