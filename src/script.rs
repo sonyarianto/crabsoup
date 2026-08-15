@@ -46,7 +46,7 @@ use crate::engine::eq::{Eq, EqBand, EqType};
 use crate::engine::mixer::{CrossfadeMixer, SmartFade};
 use crate::engine::pitch::{PitchMode, PitchSource};
 use crate::engine::reverb::{ConvReverb, load_ir};
-use crate::engine::stereo::Stereo;
+use crate::engine::stereo::{Stereo, VocalRemover};
 use crate::request::{RequestConfig, RequestUri, TrackCues, resolve};
 use crate::source::blank_detect::{BlankDetectConfig, BlankDetectSource};
 use crate::source::cue_cut::CueCutSource;
@@ -2363,6 +2363,25 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
     stereo_mt.set("__call", stereo_fn)?;
     stereo.set_metatable(Some(stereo_mt));
     globals.set("stereo", stereo)?;
+
+    // ---- vocal remover (I6) ----------------------------------------------
+    let vr_state = state.clone();
+    globals.set(
+        "vocalremover",
+        lua.create_function(move |_, (mut source, opts): (LuaSource, Option<Table>)| {
+            let strength = opt_f64(&opts, "strength", 1.0)?;
+            let crossover = opt_f64(&opts, "crossover", 150.0)?;
+            let (spec, _) = bus(&vr_state);
+            let fx = VocalRemover::new(strength as f32, crossover as f32, spec.rate as f32)
+                .map_err(mlua::Error::runtime)?;
+            let child = source.take();
+            Ok(LuaSource::new(Box::new(EffectSource::new(
+                child,
+                fx,
+                spec.channels.count(),
+            ))))
+        })?,
+    )?;
 
     // ---- source composition ---------------------------------------------
     let composer = lua.create_function(|_, (children, kind): (Table, String)| {
@@ -5161,6 +5180,45 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("stereo"), "{err}");
+    }
+
+    #[test]
+    fn vocalremover_kills_a_centred_tone() {
+        // `sine` feeds an identical signal to both channels — the vocal
+        // case. Strength 1 over the 150 Hz crossover must gut the 1 kHz
+        // tone.
+        let out =
+            preview_out(r#"output.preview(vocalremover(sine({freq = 1000, duration = 0.2})))"#);
+        assert!(mono_rms(&out) < 0.02, "centred tone cancelled");
+    }
+
+    #[test]
+    fn vocalremover_keeps_low_frequency_bass() {
+        let out = preview_out(r#"output.preview(vocalremover(sine({freq = 60, duration = 0.2})))"#);
+        assert!(mono_rms(&out) > 0.3, "bass survives: {}", mono_rms(&out));
+    }
+
+    #[test]
+    fn vocalremover_strength_zero_is_a_passthrough() {
+        let out = preview_out(
+            r#"output.preview(vocalremover(sine({freq = 1000, duration = 0.2}), {strength = 0}))"#,
+        );
+        let rms = mono_rms(&out);
+        assert!((rms - 0.354).abs() < 0.02, "passthrough level: {rms}");
+    }
+
+    #[test]
+    fn vocalremover_rejects_bad_options() {
+        for script in [
+            r#"output.preview(vocalremover(sine({}), {strength = 2}))"#,
+            r#"output.preview(vocalremover(sine({}), {crossover = 0}))"#,
+        ] {
+            let err = match run(script) {
+                Ok(_) => panic!("bad vocalremover options must fail: {script}"),
+                Err(e) => e,
+            };
+            assert!(err.to_string().contains("vocalremover"), "{err}");
+        }
     }
 
     // ---- Phase 5: switch / rotate ----------------------------------------

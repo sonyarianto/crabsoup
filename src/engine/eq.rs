@@ -29,7 +29,7 @@ pub struct EqBand {
 /// One second-order section, Direct Form 1:
 /// `y[n] = b0·x[n] + b1·x[n-1] + b2·x[n-2] − a1·y[n-1] − a2·y[n-2]`.
 #[derive(Clone, Debug)]
-struct Biquad {
+pub struct Biquad {
     b0: f32,
     b1: f32,
     b2: f32,
@@ -44,7 +44,7 @@ struct Biquad {
 impl Biquad {
     /// RBJ cookbook coefficients, normalized by `a0`. `freq` must be in
     /// `(0, fs/2)`; `q > 0`; gain only meaningful for peaking/shelves.
-    fn new(kind: EqType, freq: f32, gain_db: f32, q: f32, fs: f32) -> Self {
+    pub fn new(kind: EqType, freq: f32, gain_db: f32, q: f32, fs: f32) -> Self {
         let w0 = 2.0 * std::f32::consts::PI * freq / fs;
         let (sin, cos) = w0.sin_cos();
         let alpha = sin / (2.0 * q);
@@ -113,7 +113,7 @@ impl Biquad {
     }
 
     #[inline]
-    fn tick(&mut self, x: f32) -> f32 {
+    pub fn tick(&mut self, x: f32) -> f32 {
         let y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2
             - self.a1 * self.y1
             - self.a2 * self.y2;

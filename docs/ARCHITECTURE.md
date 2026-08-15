@@ -35,7 +35,7 @@ One engine thread plus one thread per output:
   `smart_crossfade`, `single`, `blank` (+ `blank.detect`), `sine`,
   `amplify`, `compress`, `normalize`, `replaygain`, `stretch`, `pitch`,
   `echo`, `reverb`, `eq`, `filter`, `stereo` (+ `stereo.pan`, `stereo.widen`),
-  `pipe`, `jingles`,
+  `vocalremover`, `pipe`, `jingles`,
   `fallback`/`sequence`/`random`, `switch`, `rotate`, `mksafe`, `add`,
   `cue_cut`,   `map_metadata`, `request.queue`, `request.dynamic`,
   `input.harbor`, `input.soundcard`, `input.http`, `output.icecast`,
@@ -304,6 +304,18 @@ One engine thread plus one thread per output:
   image to mono, `> 1` widens it. Mono buses pass through untouched
   (panning and mid-side are meaningless on a mono bus); pan and width
   validate at operator-call time (pan in `[-1, 1]`, width ≥ 0).
+- `vocalremover(src, {strength = 1, crossover = 150})` is the karaoke
+  trick: cancel the centre channel above the crossover, keep the bass as
+  a mono sum below it. Each channel is split with a lowpass/highpass
+  biquad pair at the crossover (Butterworth Q); above it the output is
+  `l_hi − s·r_hi` (pure side at `s = 1`), below it both channels carry
+  `(l_low + r_low)/2`. Strength 0 is an exact whole-signal passthrough
+  (a `(1−s)·x + s·cancelled` crossfade, so the operator is never a
+  destructive no-op); the cancellation residual for a centred tone above
+  the crossover is exactly the lowpass bleed of a 2nd-order filter
+  (~0.022 at 1 kHz with a 150 Hz crossover). Strength validates in
+  `[0, 1]`, crossover in `(0, fs/2)`. Reuses `Biquad` from `eq.rs`
+  (made `pub`).
 
 ## Mixer control (`src/engine/mixer.rs`)
 

@@ -168,6 +168,13 @@ Stereo row (Part I5, recorded in the session that landed `stereo`; pan
 |---|---|---|
 | stereo/pan+width | 59 µs | 0.06 % |
 
+Vocal remover row (Part I6, recorded in the session that landed
+`vocalremover`; strength 1, 150 Hz crossover over a sine source):
+
+| benchmark | per 92.9 ms buffer | vs real-time |
+|---|---|---|
+| vocalremover/strength1 | 93 µs | 0.10 % |
+
 Video-path rows (Part H3, recorded in the session that landed the effects +
 bench group; per 640x360 YUV420P frame, budget = one 25 fps frame = 40 ms):
 
@@ -888,7 +895,6 @@ its own confined module per the Part H convention note.
       ~203 µs per 92.9 ms buffer — under the compressor chain, as
       expected for four biquads.
 - [ ] **I5 — stereo imaging** (`stereo.widen`, `stereo.pan`, mid-side),
-- [ ] **I5 — stereo imaging** (`stereo.widen`, `stereo.pan`, mid-side),
       **I6 — vocal remover** (centre-channel phase cancellation).
       **Shipped as `stereo(src, {pan, width})` + `stereo.pan(src, pan)` /
       `stereo.widen(src, width)`** over `src/engine/stereo.rs` — a
@@ -908,6 +914,24 @@ its own confined module per the Part H convention note.
       mutes the right channel, width 0 makes the channels identical,
       table form == method, out-of-range pan error). Bench:
       `stereo/pan+width` ~59 µs per 92.9 ms buffer.
+      **`vocalremover` followed in the same session** (`47e599f` was
+      split into `stereo` + `vocalremover`; both in `src/engine/stereo.rs`).
+      `VocalRemover { strength, crossover }` cancels the centre channel
+      above the crossover while preserving the bass as a mono sum below
+      it — the classic karaoke trick. Per channel the high band is
+      `l_hi − s·r_hi` (pure side at s = 1, exact passthrough at s = 0 via
+      a whole-signal crossfade) and the low band feeds `(l_low + r_low)/2`
+      into both channels. Four RBJ biquads (2 lp + 2 hp at the crossover,
+      Butterworth Q) do the split; `Biquad`/`tick` were made `pub` in
+      `src/engine/eq.rs` for reuse. Crossover defaults to 150 Hz,
+      validated in `(0, fs/2)`; strength in `[0, 1]`. Tests: centred 1 kHz
+      gutted (residual ≈ the 2nd-order lowpass bleed, ~0.022), centred
+      60 Hz bass survives (> 0.9), anti-phase content doubles, half
+      strength halves the vocal, strength 0 sample-exact passthrough,
+      validation, mono passthrough; script tests (centred sine gutted,
+      bass kept, strength-0 passthrough level, bad strength/crossover
+      errors). Bench: `vocalremover/strength1` ~93 µs per 92.9 ms buffer
+      (four biquads — half the 4-band EQ chain, as expected).
 - [ ] **I7 — BPM & key detection** (`aubio-rs` or `libvamp`), **I8 — speech
       synthesis** (`espeak-ng` hook), **I9 — MIDI control input**.
 

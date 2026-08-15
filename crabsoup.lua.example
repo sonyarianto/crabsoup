@@ -31,6 +31,7 @@ pl = playlist({directory = "./media", shuffle = false, loop = true})
 --   filter(src, {type = "highpass", freq = 80})   single-band biquad
 --   stereo(src, {pan = -0.25, width = 1.4})  balance pan + mid-side width
 --   stereo.pan(src, -0.25); stereo.widen(src, 1.4)   method forms
+--   vocalremover(src, {strength = 1, crossover = 150})  karaoke centre-cancel
 --   amplify(src, gain); compress(src, opts); normalize(src, opts);
 --   replaygain(src);   -- see examples/crabsoup.dsp.lua for a full chain
 -- pl = normalize(pl, {target = -13, attack = 3, release = 0.5})
