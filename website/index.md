@@ -4,7 +4,7 @@ layout: home
 hero:
   name: Crabsoup
   text: A Liquidsoap-inspired audio & video streaming engine
-  tagline: Gapless playlists, crossfades, live DJ ducking, one-shot jingles — scripted in Lua, broadcast to Icecast.
+  tagline: A scriptable streaming engine for audio and video: gapless playlists, crossfades, live DJ ducking, with support for Icecast, HLS, RTMP, MP4, and more.
   actions:
     - theme: brand
       text: Get started
