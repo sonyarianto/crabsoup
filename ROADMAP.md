@@ -70,11 +70,12 @@ jitter — via real OS threads and allocation-free hot paths, not "Rust alone".
 This section is the plan; the Done sections above stay the source of truth
 for what shipped.
 
-**Status: the original plan (Parts A–F) is fully shipped** — see the Done
-sections for landing notes. Part G1 (`input.http` relay input) is shipped
-(see Done (cont.)); G2 (soundcard clock-drift compensation) is the remaining
-open item. The sections below that predate Part G are kept as history and
-are complete.
+**Status: Parts A–G fully shipped** — see the Done sections for landing
+notes. Part H (video foundation) is the live plan, with Parts I–K queued
+behind it: the 4-phase "Closing the Gap" product plan (Crabsoup →
+Liquidsoap parity, target v1.0 late 2027) folded in below as Parts H–K.
+The sections below that predate Part G are kept as history and are
+complete.
 
 ### Performance principles (apply to every phase)
 
@@ -506,17 +507,121 @@ anywhere, and the soundcard work (F2) had no clock-drift story.
 9. Part G (remaining product-parity gaps) — **complete**: G1
    (`input.http` relay/pull source) and G2 (soundcard clock-drift
    compensation) both shipped (see Done (cont.)).
+10. Parts H–K (the "Closing the Gap" product plan) — **current plan**: H
+    (video foundation, Q4 2026 – Q1 2027) → I (advanced audio & effects)
+    → J (protocols & integrations) → K (ecosystem & maturity, Q3 2027 –
+    v1.0). H lands first because every later phase (RTMP/HLS video
+    outputs, effects on video tracks) builds on the frame carrier it
+    picks.
 
-The original Liquidsoap-parity plan (Parts A–F) is complete; Part G is the
-only open plan section. If effort is constrained, G1 (`input.http`) is the
-highest-value remaining item for production stations (syndicated/relay
-feeds), with G2 following once soundcard deployments need it.
+The original Liquidsoap-parity plan (Parts A–F) is complete; Part G shipped
+with it. Part H (video foundation) is the only open plan section — see
+below.
 
 Non-goals for now: full `.liq` language compatibility (the Lua stdlib
 approximates the operator surface, not the language); LADSPA plugin hosting
 (revisit only if a concrete need appears); clock-synchronized multi-output
 (one puller + fan-out first; revisit only if drift between outputs matters in
 practice).
+
+### Part H — video foundation (Phase 1, Q4 2026 – Q1 2027)
+
+**Status: planned — this is the live plan.** From the "Closing the Gap"
+product plan's Phase 1: take crabsoup from audio-only to file → RTMP and
+file → HLS(video). Today the pipeline carries one frame type (`AudioFrame`),
+so H1's carrier decision gates everything else in this part.
+
+**Convention notes (binding):** video decode/encode goes through
+`ffmpeg-next` (or `gstreamer-rs`) FFI — new `unsafe` surface, so confine it
+to a dedicated `src/video/ffi.rs` (and any encoder FFI next to
+`src/output/encoder.rs`), per the existing no-unsafe-outside-FFI rule. Hot
+paths stay allocation-free per the performance principles; every new module
+ships its inline tests and a `benches/` row.
+
+- [ ] **H1 — video file input + frame carrier.** Decide the pipeline carrier
+      first: a `VideoFrame` side-channel vs. an extended `AudioFrame` — every
+      source and mixer touches `AudioFrame` today, so this is the riskiest
+      call in the part. Then `ffmpeg-next` decode (audio + video), with A/V
+      sync held at the frame level.
+- [ ] **H2 — slideshow / image source** (`slideshow()`): images rendered to
+      frames with optional transitions.
+- [ ] **H3 — basic video effects:** `video.fade` (in/out), `video.scale`.
+- [ ] **H4 — video encoders:** H.264/H.265/VP8/VP9 via FFI, muxed with the
+      existing Opus/AAC/MP3 audio encoders into MPEG-TS/MP4.
+- [ ] **H5 — RTMP output** (`output.rtmp`): `rtmp-rs` or `librtmp` FFI;
+      verified live against a real target (YouTube Live or nginx-rtmp).
+- [ ] **H6 — HLS video:** extend the existing `output.hls`
+      (`src/output/hls.rs`) to video segments + master playlists — audio HLS
+      already exists, so this is an extension, not a new output.
+- [ ] **H7 — video playlist** (`playlist`/`single` over video files) +
+      **H8 — video streaming guide + examples**.
+
+Acceptance: file → RTMP and file → HLS(video) verified end-to-end (live);
+A/V stays in sync across a long clip; slideshow plays; video-path benchmark
+rows recorded against the baseline convention.
+
+### Part I — advanced audio & effects (Phase 2, Q1 – Q2 2027)
+
+**Status: planned.** The product plan's Phase 2. Effects stay inline in the
+pull chain (one thread per output, allocation-free hot paths), each landing
+with inline tests and a bench row; FFI-backed DSP (SoundTouch, aubio) gets
+its own confined module per the Part H convention note.
+
+- [ ] **I1 — SoundTouch pitch/tempo**: `soundtouch-sys` FFI or a pure-Rust
+      alternative, benchmarked on the harness first (per-buffer FFI overhead
+      vs. in-process DSP decides).
+- [ ] **I2 — echo/delay** (multi-tap), **I3 — convolution reverb** (IR
+      files), **I4 — EQ/filters** (low/high-pass, parametric).
+- [ ] **I5 — stereo imaging** (`stereo.widen`, `stereo.pan`, mid-side),
+      **I6 — vocal remover** (centre-channel phase cancellation).
+- [ ] **I7 — BPM & key detection** (`aubio-rs` or `libvamp`), **I8 — speech
+      synthesis** (`espeak-ng` hook), **I9 — MIDI control input**.
+
+### Part J — protocols & integrations (Phase 3, Q2 – Q3 2027)
+
+**Status: planned.** The product plan's Phase 3.
+
+- [ ] **J1 — SRT output** (`srt-sys` or pure-Rust), **J2 — UDP/RTP**
+      (AAC/MP3 over UDP).
+- [ ] **J3 — WebSocket control** channel alongside the telnet/HTTP control
+      ports, **J4 — MQTT** metadata/status publish.
+- [ ] **J5 — JACK / ALSA / PulseAudio** dedicated I/O (cpal covers basics;
+      JACK adds multi-client, Pulse adds system integration).
+- [ ] **J6 — database webhooks** (`sqlx`, PostgreSQL/MySQL metadata logging).
+- [ ] **J7 — MusicBrainz / Last.fm / RadioDNS** enrichment + scrobbling. The
+      webhook plumbing already exists (`on_metadata`, `map_metadata`,
+      `http_post`, harbor `extra_passwords`) — the gap is the provider
+      integrations, not the hooks.
+- [ ] **J8 — SNMP monitoring** agent for enterprise observability.
+
+### Part K — ecosystem & maturity (Phase 4, Q3 2027 – v1.0)
+
+**Status: planned.** The product plan's Phase 4.
+
+- [ ] **K1 — dynamic config reload**: re-evaluate the Lua script without
+      restart (the engine already separates `ScriptResult` from the running
+      engine; the work is hot-swapping outputs/sources over the existing tap
+      fan-out).
+- [ ] **K2 — multi-bitrate from one source graph**: already shipped — the A1
+      tap fans out to N outputs and a second `output.icecast` call is
+      accepted on the same graph (`outputs: Vec<OutputConfig>`). The
+      product plan's "one output per instance" row is stale; remaining work
+      is examples/docs, not plumbing.
+- [ ] **K3 — `.liq` → `.lua` migration tool** + migration guide.
+- [ ] **K4 — VSCode extension** (syntax highlighting, completions).
+- [ ] **K5 — official multi-arch Docker images** with all codecs bundled,
+      **K6 — Helm charts**.
+- [ ] **K7 — continuous fuzzing** (`cargo fuzz`) on parsers/decoders.
+- [ ] **K8 — community launch** (forum, Discord) + third-party script
+      repository.
+- [ ] **K9 — comprehensive docs**: API reference, tutorials, video
+      walkthroughs.
+
+**Success metrics (v1.0, from the product plan):** ≥90 % Liquidsoap 2.x
+feature parity; all core video I/O/effects/outputs; ≥80 % of built-in
+effects; ≥80 % of network protocols; 100 % test pass on supported platforms;
+API reference + 5 tutorials; ≥100 stars and ≥20 contributors; green CI +
+load tests + fuzzing.
 
 ## Done (cont.)
 - [x] Part G1 (`input.http` relay/pull-stream source): a network thread
