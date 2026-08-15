@@ -43,6 +43,13 @@ cpal = "0.15"
 # .liq scripting (Liquidsoap-style config in Lua); vendored Lua 5.4,
 # no `send` feature: sources are Rc-based and stay on the main thread.
 mlua = { version = "0.10", default-features = false, features = ["lua54", "vendored"] }
+# Video decode/mux/encode (Part H1): binds to the system FFmpeg via
+# pkg-config, so plain builds skip libav entirely.
+ffmpeg-next = { version = "7.1", optional = true }
+
+[features]
+# Video support (Part H): off by default so core builds stay libav-free.
+video = ["dep:ffmpeg-next"]
 
 [dev-dependencies]
 criterion = "0.5"

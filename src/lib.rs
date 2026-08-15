@@ -13,6 +13,8 @@ pub mod request;
 pub mod resample;
 pub mod script;
 pub mod source;
+#[cfg(feature = "video")]
+pub mod video;
 
 /// Shorthand for the crate-wide error type.
 pub type Result<T, E = Box<dyn std::error::Error + Send + Sync>> = std::result::Result<T, E>;

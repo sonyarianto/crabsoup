@@ -538,11 +538,25 @@ to a dedicated `src/video/ffi.rs` (and any encoder FFI next to
 paths stay allocation-free per the performance principles; every new module
 ships its inline tests and a `benches/` row.
 
-- [ ] **H1 — video file input + frame carrier.** Decide the pipeline carrier
-      first: a `VideoFrame` side-channel vs. an extended `AudioFrame` — every
-      source and mixer touches `AudioFrame` today, so this is the riskiest
-      call in the part. Then `ffmpeg-next` decode (audio + video), with A/V
-      sync held at the frame level.
+- [ ] **H1 — video file input + frame carrier.** **Decision (locked by
+      PoC): parallel `VideoFrame` side-channel, not an extended
+      `AudioFrame`** — only the tap and the four output consumers touch
+      `AudioFrame` today (the whole pull chain is `&mut [f32]`), but video
+      frames are a different shape (YUV420P planes) at a different cadence
+      (25/30 fps vs 92.9 ms audio buffers), so forcing them through the
+      audio frame would bloat the pool and misalign cadence. Video flows on
+      its own fan-out tap (`VideoTap`, `try_send` drop-oldest like the
+      audio tap) from a dedicated decode thread — a slow decode can never
+      stall the audio pull. A/V sync is held at mux time by PTS, as in
+      real broadcast engines. **PoC shipped (behind the `video` cargo
+      feature):** `src/video/ffi.rs` `VideoDecoder` (ffmpeg-next against
+      system libav, YUV420P via swscale, whole-file and pull-style
+      `read_frame`), `VideoFrame`, `VideoTap`; inline tests decode a
+      locally-rendered testsrc clip (~25 frames, monotonic PTS, correct
+      plane sizes) and exercise the fan-out. Audio decode stays on
+      symphonia — ffmpeg-next is only for video decode and the future
+      mux/encode outputs. Remaining: the `video.video(...)` source wiring
+      (decode thread + `VideoTap`), and A/V interleaving in an output.
 - [ ] **H2 — slideshow / image source** (`slideshow()`): images rendered to
       frames with optional transitions.
 - [ ] **H3 — basic video effects:** `video.fade` (in/out), `video.scale`.

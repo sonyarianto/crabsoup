@@ -1,0 +1,15 @@
+//! Video pipeline (Part H) — behind the `video` cargo feature.
+//!
+//! The carrier decision (H1): video does NOT ride in `AudioFrame`. Frames
+//! are YUV420P pictures with a PTS, published on their own fan-out tap
+//! (`VideoTap`) by a dedicated decode thread; outputs that need video
+//! subscribe to both taps and interleave by PTS at mux time. The audio pull
+//! chain is untouched.
+
+pub mod ffi;
+pub mod frame;
+pub mod tap;
+
+pub use ffi::VideoDecoder;
+pub use frame::VideoFrame;
+pub use tap::VideoTap;
