@@ -11,7 +11,7 @@
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -468,7 +468,10 @@ struct HttpUrl {
     host: String,
     port: u16,
     path: String,
-    addr: SocketAddr,
+    /// Every address the host resolved to; connection attempts try each in
+    /// order — a host can resolve `::1` before `127.0.0.1` and only one
+    /// listener is up.
+    addrs: Vec<std::net::SocketAddr>,
 }
 
 impl HttpUrl {
@@ -494,16 +497,19 @@ impl HttpUrl {
         if host.is_empty() {
             return Err(format!("bad URL (empty host): {url}").into());
         }
-        let addr = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
-            .map_err(|e| format!("cannot resolve {host}: {e}"))?
-            .next()
-            .ok_or_else(|| format!("cannot resolve {host}"))?;
+        let addrs: Vec<std::net::SocketAddr> =
+            std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
+                .map_err(|e| format!("cannot resolve {host}: {e}"))?
+                .collect();
+        if addrs.is_empty() {
+            return Err(format!("cannot resolve {host}").into());
+        }
         Ok(Self {
             scheme,
             host: host.to_string(),
             port,
             path: path.to_string(),
-            addr,
+            addrs,
         })
     }
 
@@ -578,7 +584,20 @@ fn connect_transport(
     timeout: Duration,
     tls_roots: Option<&Arc<rustls::RootCertStore>>,
 ) -> crate::Result<Transport> {
-    let tcp = TcpStream::connect_timeout(&target.addr, timeout)?;
+    let mut last_err = None;
+    let mut tcp = None;
+    for addr in &target.addrs {
+        match TcpStream::connect_timeout(addr, timeout) {
+            Ok(s) => {
+                tcp = Some(s);
+                break;
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    let Some(tcp) = tcp else {
+        return Err(last_err.unwrap().into());
+    };
     tcp.set_read_timeout(Some(timeout))?;
     tcp.set_write_timeout(Some(timeout))?;
     match target.scheme {
