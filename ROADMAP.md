@@ -36,6 +36,20 @@
       ends at full duck gain). Both now zero the stale tail before mixing;
       covered by `partial_final_buffer_of_a_does_not_repeat_stale_audio`
       and `partial_final_buffer_of_override_does_not_repeat_stale_audio`.
+- [x] **`pipe()` verified live with Thimeo Stereo Tool 11.01** (Part E's
+      manual acceptance): the operator's first real-world run broadcasts
+      through the licensed console binary — raw s16 PCM in on stdin,
+      processed out on stdout (`-b 16 -r <rate> -q - -`). Supervised
+      live: tool at ~35% CPU (the DSP, not the pipe), crabsoup at ~4%;
+      ~180 KB/s across the pipes each way; stream connects, titles
+      update, and the A/B toggle (`USE_ST` in `crabsoup.lua`) confirms
+      the processed sound audibly. Crash behaviour re-checked on the
+      live chain. Setup documented in `crabsoup.lua.example`.
+- [x] **Startup/reconnect drops noted**: the Icecast output thread's
+      initial handshake still blocks consumption for ~1–2 s, dropping
+      ~1.3 s of audio once at start/reconnect (observed with the pipe
+      chain live). Transient; queued next to the metadata fix as a
+      follow-up (handshake off the output thread, same pattern).
 - [x] **CLI**: running without `-c` prints help and exits (was: silently
       defaulted to `crabsoup.lua` and looked like a hang).
 - [x] YAML config (`-c crabsoup.yaml`)
