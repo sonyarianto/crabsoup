@@ -2,7 +2,7 @@ import { defineConfig } from 'vitepress'
 
 export default defineConfig({
   title: 'Crabsoup',
-  description: 'A Liquidsoap-inspired audio streaming engine in Rust',
+  description: 'A Liquidsoap-inspired audio & video streaming engine',
   lang: 'en-US',
   cleanUrls: true,
 

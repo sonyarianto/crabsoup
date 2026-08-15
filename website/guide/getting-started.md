@@ -1,9 +1,10 @@
 # Getting started
 
-Crabsoup is a Liquidsoap-inspired audio streaming engine in Rust: it evaluates
+Crabsoup is a Liquidsoap-inspired audio & video streaming engine: it evaluates
 a `.lua` script (Liquidsoap-flavoured Lua) that builds a source graph, mixes in
 live DJ input and one-shot jingles with crossfades, and broadcasts the result
-(MP3, Opus, or AAC) to an Icecast server.
+(MP3, Opus, or AAC, plus H.264 video) to Icecast, HLS, RTMP, MP4, or a
+soundcard.
 
 ## Features
 

@@ -3,7 +3,7 @@ layout: home
 
 hero:
   name: Crabsoup
-  text: A Liquidsoap-inspired audio streaming engine in Rust
+  text: A Liquidsoap-inspired audio & video streaming engine
   tagline: Gapless playlists, crossfades, live DJ ducking, one-shot jingles — scripted in Lua, broadcast to Icecast.
   actions:
     - theme: brand
