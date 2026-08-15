@@ -221,6 +221,23 @@ fn main() -> crabsoup::Result<()> {
         handles.push(std::thread::spawn(move || output.run()));
     }
 
+    // Video decode threads (Part H): one per `video.video(path)` track,
+    // publishing PTS-paced frames to the shared tap; a future video output
+    // subscribes to the same tap. Handles stay alive until process exit.
+    #[cfg(feature = "video")]
+    let mut video_handles = Vec::new();
+    #[cfg(feature = "video")]
+    if let Some(vtap) = &result.video_tap {
+        for cfg in &result.video {
+            let tap = vtap.clone();
+            let stop = shutdown.clone();
+            match crabsoup::video::VideoSource::spawn(cfg, tap, stop) {
+                Ok(handle) => video_handles.push(handle),
+                Err(e) => return Err(format!("video.video: {e}").into()),
+            }
+        }
+    }
+
     // The tap pulls on its own thread; the Lua-owning main thread runs the
     // script event loop.
     let tap_shutdown = shutdown.clone();

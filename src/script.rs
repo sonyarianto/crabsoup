@@ -73,6 +73,12 @@ pub struct ScriptResult {
     pub root: Option<Box<dyn AudioSource>>,
     /// The root source from `output.preview` (used when no icecast output).
     pub preview: Option<Box<dyn AudioSource>>,
+    /// Video tracks registered via `video.video(path)` (Part H).
+    #[cfg(feature = "video")]
+    pub video: Vec<crate::video::VideoConfig>,
+    /// The shared video fan-out tap for the engine's video decode threads.
+    #[cfg(feature = "video")]
+    pub video_tap: Option<Arc<crate::video::VideoTap>>,
 }
 
 /// State mutated by `set()` calls and populated by service constructors.
@@ -98,6 +104,12 @@ struct ScriptState {
     root: Option<Box<dyn AudioSource>>,
     root_arc: Option<Arc<Mutex<Box<dyn AudioSource>>>>,
     preview: Option<Box<dyn AudioSource>>,
+    /// Video tracks registered via `video.video(path)` (Part H).
+    #[cfg(feature = "video")]
+    video: Vec<crate::video::VideoConfig>,
+    /// The shared video fan-out tap for the engine's video decode threads.
+    #[cfg(feature = "video")]
+    video_tap: Option<Arc<crate::video::VideoTap>>,
     /// Lua callbacks registered by `on_metadata`; indexed by hook id, live
     /// on the Lua-owning thread only.
     metadata_hooks: Vec<mlua::Function>,
@@ -2182,6 +2194,36 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
     input.set("http", http_fn)?;
     globals.set("input", input)?;
 
+    // ---- video (Part H) ----------------------------------------------------
+    // `video.video(path)` registers a video track: the path is validated at
+    // script evaluation (fail fast), the audio side plays through the normal
+    // audio graph (`single`/playlist), and the engine spawns a dedicated
+    // decode thread that publishes PTS-paced frames to the shared video tap.
+    // The return value is an opaque marker for future video outputs.
+    #[cfg(feature = "video")]
+    {
+        let video_state = state.clone();
+        let video_fn = lua.create_function(move |lua, path: String| {
+            let spec = crate::video::VideoSource::validate(std::path::Path::new(&path))
+                .map_err(mlua::Error::runtime)?;
+            let mut s = video_state.borrow_mut();
+            s.video_tap
+                .get_or_insert_with(|| Arc::new(crate::video::VideoTap::new()));
+            s.video.push(crate::video::VideoConfig {
+                path: path.clone().into(),
+                spec,
+            });
+            let info = lua.create_table()?;
+            info.set("path", path)?;
+            info.set("width", spec.width)?;
+            info.set("height", spec.height)?;
+            Ok(info)
+        })?;
+        let video = lua.create_table()?;
+        video.set("video", video_fn)?;
+        globals.set("video", video)?;
+    }
+
     let telnet_state = state.clone();
     let telnet_fn = lua.create_function(move |_, opts: Table| {
         let cfg = ControlConfig {
@@ -2419,6 +2461,10 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         custom_commands: s.custom_commands.iter().map(|(n, _)| n.clone()).collect(),
         root: s.root.take(),
         preview: s.preview.take(),
+        #[cfg(feature = "video")]
+        video: std::mem::take(&mut s.video),
+        #[cfg(feature = "video")]
+        video_tap: s.video_tap.take(),
     };
     if result.root.is_none() && result.preview.is_none() {
         return Err(mlua::Error::runtime(
@@ -2474,6 +2520,29 @@ mod tests {
             .err()
             .expect("script fails");
         assert!(err.to_string().contains("no output"));
+    }
+
+    #[cfg(feature = "video")]
+    #[test]
+    fn video_video_registers_a_track_and_tap() {
+        use crate::video::testutil::render_test_clip;
+        let Some(path) = render_test_clip("script") else {
+            return;
+        };
+        let path_str = path.display().to_string();
+        let (_rt, res) = run(&format!(
+            r#"
+            set("sample_rate", 44100)
+            output.preview(sine({{freq = 440, duration = 1}}))
+            local v = video.video("{path_str}")
+            assert(v.width == 320, "marker width")
+            assert(v.height == 240, "marker height")
+            "#
+        ))
+        .expect("script runs");
+        assert_eq!(res.video.len(), 1, "one video track registered");
+        assert!(res.video_tap.is_some(), "shared video tap created");
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

@@ -418,6 +418,7 @@ mod tests {
     /// exercises the tracking regime, not the ~20 s saturation warmup.
     /// Returns the ring fill sampled every 0.5 s after `settle` seconds and
     /// the source's converged PPM estimate (from the resampler's step).
+    #[allow(clippy::too_many_arguments)]
     fn run_drift(
         src: &mut SoundcardInputSource,
         mut producer: HeapProd<f32>,
@@ -551,7 +552,7 @@ mod tests {
         // fed in small chunks at capture pace (a full second pushed at once
         // would trip the drop-oldest latency cap, which is correct live
         // behaviour).
-        let (mut src, mut producer) = parts_source(22_050, 1, 44_100, 2, RING_FRAMES * 2 * 1);
+        let (mut src, mut producer) = parts_source(22_050, 1, 44_100, 2, RING_FRAMES * 2);
         let rate = 22_050.0;
         let mut i = 0usize;
         let mut total = 0usize;

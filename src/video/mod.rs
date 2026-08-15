@@ -8,8 +8,12 @@
 
 pub mod ffi;
 pub mod frame;
+pub mod source;
 pub mod tap;
+#[cfg(test)]
+pub mod testutil;
 
 pub use ffi::VideoDecoder;
 pub use frame::VideoFrame;
+pub use source::{VideoConfig, VideoSource, VideoSourceHandle, VideoSpec};
 pub use tap::VideoTap;

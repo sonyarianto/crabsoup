@@ -4,10 +4,11 @@
 //! `VideoDecoder` and `publish`es each frame to every registered consumer;
 //! a slow consumer drops frames via `try_send` instead of stalling the
 //! decode or the other consumers. A/V sync is held at mux time by PTS, not
-//! by forcing video through the audio frames.
+//! by forcing video through the audio frames. All methods take `&self` so
+//! the tap can be shared between the decode thread and output consumers.
 
-use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::{Arc, Mutex};
 
 use super::frame::VideoFrame;
 
@@ -16,7 +17,7 @@ const TAP_BOUND: usize = 4;
 
 /// Fan-out publisher for decoded video frames.
 pub struct VideoTap {
-    consumers: Vec<SyncSender<Arc<VideoFrame>>>,
+    consumers: Mutex<Vec<SyncSender<Arc<VideoFrame>>>>,
 }
 
 impl Default for VideoTap {
@@ -28,20 +29,20 @@ impl Default for VideoTap {
 impl VideoTap {
     pub fn new() -> Self {
         Self {
-            consumers: Vec::new(),
+            consumers: Mutex::new(Vec::new()),
         }
     }
 
     /// Subscribe a new consumer.
-    pub fn register(&mut self) -> Receiver<Arc<VideoFrame>> {
+    pub fn register(&self) -> Receiver<Arc<VideoFrame>> {
         let (tx, rx) = sync_channel(TAP_BOUND);
-        self.consumers.push(tx);
+        self.consumers.lock().unwrap().push(tx);
         rx
     }
 
     /// Publish one frame to every consumer, dropping for stalled ones.
-    pub fn publish(&mut self, frame: Arc<VideoFrame>) {
-        for tx in &self.consumers {
+    pub fn publish(&self, frame: Arc<VideoFrame>) {
+        for tx in self.consumers.lock().unwrap().iter() {
             let _ = tx.try_send(frame.clone());
         }
     }
@@ -65,7 +66,7 @@ mod tests {
 
     #[test]
     fn two_consumers_see_identical_frames() {
-        let mut tap = VideoTap::new();
+        let tap = VideoTap::new();
         let rx1 = tap.register();
         let rx2 = tap.register();
         // Drain both receivers per publish: each consumer's 4-slot channel
@@ -79,7 +80,7 @@ mod tests {
 
     #[test]
     fn stalled_consumer_drops_without_stalling_others() {
-        let mut tap = VideoTap::new();
+        let tap = VideoTap::new();
         let _stalled = tap.register(); // never read: fills and drops
         let rx2 = tap.register();
         // Drain rx2 per publish so its 4-slot channel never backs up; the

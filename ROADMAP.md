@@ -553,10 +553,16 @@ ships its inline tests and a `benches/` row.
       system libav, YUV420P via swscale, whole-file and pull-style
       `read_frame`), `VideoFrame`, `VideoTap`; inline tests decode a
       locally-rendered testsrc clip (~25 frames, monotonic PTS, correct
-      plane sizes) and exercise the fan-out. Audio decode stays on
+      plane sizes) and exercise the fan-out. **Source wiring shipped:**
+      `video.video(path)` Lua operator (validates the file at script
+      evaluation — fail fast), `src/video/source.rs` `VideoSource`
+      (dedicated decode thread pacing frames to their PTS against a shared
+      `VideoTap` with interior mutability, stop-flag clean shutdown),
+      engine wiring in `main.rs` (one decode thread per registered track,
+      handles alive for the process lifetime). Audio decode stays on
       symphonia — ffmpeg-next is only for video decode and the future
-      mux/encode outputs. Remaining: the `video.video(...)` source wiring
-      (decode thread + `VideoTap`), and A/V interleaving in an output.
+      mux/encode outputs. Remaining for H1/H6: A/V interleaving in an
+      output (a video consumer subscribing to the tap at mux time).
 - [ ] **H2 — slideshow / image source** (`slideshow()`): images rendered to
       frames with optional transitions.
 - [ ] **H3 — basic video effects:** `video.fade` (in/out), `video.scale`.

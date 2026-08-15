@@ -79,6 +79,12 @@ impl VideoDecoder {
         self.decoder.height()
     }
 
+    /// Nominal frame rate of the stream (numerator, denominator).
+    pub fn frame_rate(&self) -> (i32, i32) {
+        let fr = self.decoder.frame_rate().unwrap_or(ffmpeg::Rational(0, 0));
+        (fr.0, fr.1)
+    }
+
     /// Decode the whole file into frames, oldest first.
     pub fn decode_all(&mut self) -> Result<Vec<VideoFrame>> {
         let mut frames = Vec::new();
@@ -211,41 +217,7 @@ fn pts_us(pts: i64, tb_num: i64, tb_den: i64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
-
-    /// Render a 1 s 25 fps testsrc with the local `ffmpeg` binary; skip the
-    /// test entirely when no `ffmpeg` is installed. `tag` keeps the path
-    /// unique per test so parallel runs never delete each other's clip.
-    fn render_test_clip(tag: &str) -> Option<std::path::PathBuf> {
-        let path =
-            std::env::temp_dir().join(format!("crabsoup-testsrc-{}-{tag}.mp4", std::process::id()));
-        if path.exists() {
-            std::fs::remove_file(&path).ok();
-        }
-        let ok = Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-f",
-                "lavfi",
-                "-i",
-                "testsrc=duration=1:size=320x240:rate=25",
-                "-pix_fmt",
-                "yuv420p",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "ultrafast",
-            ])
-            .arg(&path)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !ok {
-            std::fs::remove_file(&path).ok();
-            return None;
-        }
-        Some(path)
-    }
+    use crate::video::testutil::render_test_clip;
 
     #[test]
     fn decodes_testsrc_to_yuv420p_frames() {
