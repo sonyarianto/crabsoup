@@ -24,6 +24,12 @@ use crate::video::{VideoEncoder, VideoFrame, VideoSpec};
 const AAC_FRAME_SAMPLES: u64 = 1024;
 const CLOCK: u64 = 90_000;
 const PLAYLIST: &str = "playlist.m3u8";
+/// Variant master playlist, written when video is enabled so clients can
+/// point at `index.m3u8` and get the A/V stream.
+const MASTER: &str = "index.m3u8";
+/// Peak audio bitrate (128 kb/s AAC) plus video (1.5 Mb/s H.264).
+#[cfg(feature = "video")]
+const VARIANT_BANDWIDTH: u64 = 1_628_000;
 
 /// What the video HLS path needs from the engine: the shared tap's
 /// subscriber plus the track's stream spec. The unit type stands in on
@@ -58,6 +64,9 @@ struct Segment {
     end_pts: u64,
     /// Total ADTS frames muxed into this segment.
     frames: u64,
+    /// The target window has elapsed, but rotation waits for a video
+    /// keyframe so the next segment starts with an IDR.
+    window_reached: bool,
 }
 
 impl Segment {
@@ -74,6 +83,7 @@ impl Segment {
             start_pts,
             end_pts: start_pts,
             frames: 0,
+            window_reached: false,
         }
     }
 }
@@ -113,9 +123,16 @@ impl HlsOutput {
         {
             let Ok(entry) = entry else { continue };
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name == PLAYLIST || (name.starts_with("seg-") && name.ends_with(".ts")) {
+            if name == PLAYLIST
+                || name == MASTER
+                || (name.starts_with("seg-") && name.ends_with(".ts"))
+            {
                 let _ = fs::remove_file(entry.path());
             }
+        }
+        #[cfg(feature = "video")]
+        if let Some((_, spec)) = &self.video {
+            write_master_playlist(&self.config.directory, spec)?;
         }
         log::info!("hls: segments to {}", self.config.directory.display());
         Ok(())
@@ -149,18 +166,23 @@ impl HlsOutput {
             #[cfg(feature = "video")]
             let audio_pts = frames_total.wrapping_mul(frame_dur);
             #[cfg(feature = "video")]
+            let defer = video.as_ref().is_some_and(|v| v.alive());
+            #[cfg(not(feature = "video"))]
+            let defer = false;
+            #[cfg(feature = "video")]
             if let Some(v) = &mut video {
-                v.flush_up_to(audio_pts, &mut seg)?;
+                v.flush_up_to(audio_pts, &mut seg, &mut |s, pts| self.rotate(s, pts))?;
             }
             let adts = encoder.encode(&frame.pcm);
-            frames_total = self.feed(&adts, &mut seg, frames_total)?;
+            frames_total = self.feed(&adts, &mut seg, frames_total, defer)?;
         }
         #[cfg(feature = "video")]
         if let Some(v) = &mut video {
             v.flush_remaining(&mut seg)?;
         }
         let tail = encoder.finish();
-        frames_total = self.feed(&tail, &mut seg, frames_total)?;
+        // The stream is ending; no more rotations can be deferred.
+        frames_total = self.feed(&tail, &mut seg, frames_total, false)?;
         let _ = frames_total;
 
         self.close_segment(&mut seg)?;
@@ -185,20 +207,37 @@ impl HlsOutput {
     }
 
     /// Route ADTS frames into segments, closing a segment once its window
-    /// crosses `segment_seconds`.
-    fn feed(&mut self, adts: &[u8], seg: &mut Segment, frames_total: u64) -> Result<u64> {
+    /// crosses `segment_seconds`. When `defer` is set (video is live), a
+    /// window crossing only marks `window_reached` — the actual rotation
+    /// waits for the video track to mux a keyframe into the next segment.
+    fn feed(
+        &mut self,
+        adts: &[u8],
+        seg: &mut Segment,
+        frames_total: u64,
+        defer: bool,
+    ) -> Result<u64> {
         if adts.is_empty() {
             return Ok(frames_total);
         }
         let mut count = frames_total;
         let frame_dur = (AAC_FRAME_SAMPLES * CLOCK) / self.sample_rate as u64;
         let window = (self.config.segment_seconds * CLOCK as f64) as u64;
-        let has_video = seg.mux.has_video();
         for frame in split_adts(adts) {
             let pts = count.wrapping_mul(frame_dur);
             if seg.frames > 0 && pts.wrapping_sub(seg.start_pts) >= window {
-                self.close_segment(seg)?;
-                *seg = Segment::new(seg.seq + 1, pts, has_video);
+                if !seg.window_reached {
+                    if defer {
+                        seg.window_reached = true;
+                    } else {
+                        self.rotate(seg, pts)?;
+                    }
+                } else if !defer || pts.wrapping_sub(seg.start_pts) >= 2 * window {
+                    // No keyframe came: the video tap died (defer off) or is
+                    // stalled past one whole extra window. Rotate anyway
+                    // rather than grow the segment forever.
+                    self.rotate(seg, pts)?;
+                }
             }
             seg.mux.push_audio(frame, pts, &mut seg.bytes);
             seg.end_pts = pts + frame_dur;
@@ -206,6 +245,16 @@ impl HlsOutput {
             count += 1;
         }
         Ok(count)
+    }
+
+    /// Close `seg` and open the next one at `next_start_pts`. Called from
+    /// both the audio feed (immediate rotation) and the video track (once
+    /// it holds a keyframe to start the next segment).
+    fn rotate(&mut self, seg: &mut Segment, next_start_pts: u64) -> Result<()> {
+        let has_video = seg.mux.has_video();
+        self.close_segment(seg)?;
+        *seg = Segment::new(seg.seq + 1, next_start_pts, has_video);
+        Ok(())
     }
 
     /// Write the finished segment to disk, trim the window to `retention`
@@ -269,6 +318,23 @@ fn segment_name(seq: u64) -> String {
     format!("seg-{seq:06}.ts")
 }
 
+/// Write `index.m3u8` pointing at the media playlist, describing the video
+/// variant. CODECS is static for the fixed encoder settings (H.264
+/// constrained baseline, AAC-LC).
+#[cfg(feature = "video")]
+fn write_master_playlist(dir: &std::path::Path, spec: &VideoSpec) -> Result<()> {
+    let out = format!(
+        "#EXTM3U\n\
+         #EXT-X-VERSION:3\n\
+         #EXT-X-STREAM-INF:BANDWIDTH={VARIANT_BANDWIDTH},RESOLUTION={}x{},CODECS=\"avc1.42401f,mp4a.40.2\"\n\
+         {PLAYLIST}\n",
+        spec.width, spec.height
+    );
+    let path = dir.join(MASTER);
+    fs::write(&path, out).map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(())
+}
+
 /// The H.264 half of the HLS pipeline (Part H6): drains the video tap,
 /// encodes frames, and hands access units to the segment muxer in PTS
 /// order. One-frame lookahead keeps a frame whose PTS is ahead of the
@@ -284,6 +350,8 @@ struct VideoTrack {
     next: Option<Arc<VideoFrame>>,
     /// Encoded access units awaiting their PTS.
     pending: Vec<crate::video::EncodedAu>,
+    /// The tap's sender is gone and the channel drained.
+    eof: bool,
 }
 
 #[cfg(feature = "video")]
@@ -303,18 +371,36 @@ impl VideoTrack {
             frame_dur_90k: (CLOCK as f64 / fps) as u64,
             next: None,
             pending: Vec::new(),
+            eof: false,
         })
     }
 
+    fn alive(&self) -> bool {
+        !self.eof
+    }
+
     /// Encode and mux every frame/AU whose PTS is at or before `up_to_pts`
-    /// (the current audio PTS), keeping later material buffered.
-    fn flush_up_to(&mut self, up_to_pts: u64, seg: &mut Segment) -> Result<()> {
+    /// (the current audio PTS), keeping later material buffered. Once the
+    /// segment's window is reached, the next picture is forced to a
+    /// keyframe so the rotation that follows starts the new segment with
+    /// an IDR.
+    fn flush_up_to(
+        &mut self,
+        up_to_pts: u64,
+        seg: &mut Segment,
+        rotate: &mut dyn FnMut(&mut Segment, u64) -> Result<()>,
+    ) -> Result<()> {
         loop {
             let frame = match self.next.take() {
                 Some(f) => f,
                 None => match self.rx.try_recv() {
                     Ok(f) => f,
-                    Err(_) => break,
+                    Err(e) => {
+                        if e == std::sync::mpsc::TryRecvError::Disconnected {
+                            self.eof = true;
+                        }
+                        break;
+                    }
                 },
             };
             let pts = frame.pts_us * CLOCK / 1_000_000;
@@ -322,12 +408,20 @@ impl VideoTrack {
                 self.next = Some(frame);
                 break;
             }
+            // While the window is pending, every picture is forced to a
+            // keyframe; the first one muxed rotates the segment. Keeping
+            // the force on until the rotation lands makes a stalled tap
+            // self-heal: the moment frames resume, the next picture is an
+            // IDR and the cut happens there.
+            if seg.window_reached {
+                self.encoder.force_keyframe();
+            }
             for au in self.encoder.push(&frame)? {
                 self.pending.push(au);
             }
-            self.mux_pending(up_to_pts, seg)?;
+            self.mux_pending(up_to_pts, seg, rotate)?;
         }
-        self.mux_pending(up_to_pts, seg)
+        self.mux_pending(up_to_pts, seg, rotate)
     }
 
     /// End of stream: drain the tap (the decode thread has ended), encode
@@ -338,7 +432,12 @@ impl VideoTrack {
                 Some(f) => f,
                 None => match self.rx.try_recv() {
                     Ok(f) => f,
-                    Err(_) => break,
+                    Err(e) => {
+                        if e == std::sync::mpsc::TryRecvError::Disconnected {
+                            self.eof = true;
+                        }
+                        break;
+                    }
                 },
             };
             for au in self.encoder.push(&frame)? {
@@ -350,12 +449,17 @@ impl VideoTrack {
         }
         let mut taken = std::mem::take(&mut self.pending);
         for au in taken.drain(..) {
-            self.mux_au(&au, seg)?;
+            self.mux_au(&au, seg, &mut |_, _| Ok(()))?;
         }
         Ok(())
     }
 
-    fn mux_pending(&mut self, up_to_pts: u64, seg: &mut Segment) -> Result<()> {
+    fn mux_pending(
+        &mut self,
+        up_to_pts: u64,
+        seg: &mut Segment,
+        rotate: &mut dyn FnMut(&mut Segment, u64) -> Result<()>,
+    ) -> Result<()> {
         let mut ready = Vec::new();
         self.pending.retain(|au| {
             if au.pts_90k <= up_to_pts {
@@ -369,12 +473,22 @@ impl VideoTrack {
             }
         });
         for au in ready {
-            self.mux_au(&au, seg)?;
+            self.mux_au(&au, seg, rotate)?;
         }
         Ok(())
     }
 
-    fn mux_au(&mut self, au: &crate::video::EncodedAu, seg: &mut Segment) -> Result<()> {
+    fn mux_au(
+        &mut self,
+        au: &crate::video::EncodedAu,
+        seg: &mut Segment,
+        rotate: &mut dyn FnMut(&mut Segment, u64) -> Result<()>,
+    ) -> Result<()> {
+        // A keyframe is the one safe place to cut: rotate here so the new
+        // segment starts with SPS/PPS/IDR and players can join mid-stream.
+        if seg.window_reached && au.is_idr() {
+            rotate(seg, au.pts_90k)?;
+        }
         seg.mux.push_video(&au.data, au.pts_90k, &mut seg.bytes);
         seg.end_pts = seg.end_pts.max(au.pts_90k + self.frame_dur_90k);
         Ok(())
@@ -559,11 +673,9 @@ mod tests {
         producer.join().expect("video producer");
         handle.join().expect("hls thread").expect("clean finish");
 
-        // The first segment starts with the IDR picture, so ffprobe tags it
-        // h264+aac. Later segments may start mid-GOP (no SPS in the AU) and
-        // ffprobe then fails to identify the video PID — fine for players
-        // that join at the playlist head; keyframe-aligned segments are a
-        // known follow-up.
+        // Every segment starts with an IDR picture (rotation waits for a
+        // forced keyframe), so ffprobe tags them all h264+aac and players
+        // can join mid-stream.
         let mut segments: Vec<_> = fs::read_dir(&dir)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -586,18 +698,17 @@ mod tests {
                 .expect("run ffprobe");
             String::from_utf8_lossy(&out.stdout).to_string()
         };
-        let first = probe(&segments[0].path());
-        assert!(
-            first.contains("h264,video") && first.contains("aac,audio"),
-            "first segment not A/V: {first}"
-        );
         for seg in &segments {
+            let out = probe(&seg.path());
             assert!(
-                probe(&seg.path()).contains("aac"),
-                "segment {} lost audio",
+                out.contains("h264,video") && out.contains("aac,audio"),
+                "segment {} not keyframe-aligned A/V: {out}",
                 seg.file_name().to_string_lossy()
             );
         }
+        let master = fs::read_to_string(dir.join(MASTER)).unwrap();
+        assert!(master.contains("#EXT-X-STREAM-INF:BANDWIDTH=1628000,RESOLUTION=320x240"));
+        assert!(master.trim_end().ends_with(PLAYLIST));
         let _ = fs::remove_dir_all(&dir);
     }
 }

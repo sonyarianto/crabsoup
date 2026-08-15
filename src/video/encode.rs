@@ -19,11 +19,33 @@ pub struct EncodedAu {
     pub data: Vec<u8>,
 }
 
+impl EncodedAu {
+    /// True if the access unit contains an IDR slice (NAL type 5), i.e. it
+    /// is a safe place for a player to join mid-stream.
+    pub fn is_idr(&self) -> bool {
+        let d = &self.data;
+        let mut i = 0;
+        while i + 3 < d.len() {
+            if d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1 {
+                if d[i + 3] & 0x1f == 5 {
+                    return true;
+                }
+                i += 4;
+            } else {
+                i += 1;
+            }
+        }
+        false
+    }
+}
+
 pub struct VideoEncoder {
     encoder: ffmpeg::codec::encoder::Video,
     frame: ffmpeg::frame::Video,
     width: u32,
     height: u32,
+    /// Next frame is forced to encode as an IDR (closed-GOP keyframe).
+    force_idr: bool,
 }
 
 impl VideoEncoder {
@@ -46,6 +68,12 @@ impl VideoEncoder {
         opts.set("profile", "baseline");
         opts.set("preset", "ultrafast");
         opts.set("tune", "zerolatency");
+        // Closed GOP: any forced keyframe is a true IDR, not a non-IDR
+        // I-frame — what HLS needs for mid-stream joins. Scenecut off:
+        // live HLS wants a regular keyframe cadence, not content-triggered
+        // surprises.
+        video.set_flags(ffmpeg::codec::Flags::CLOSED_GOP);
+        opts.set("scenecut", "0");
         let encoder: ffmpeg::codec::encoder::Video = video
             .open_with(opts)
             .map_err(|e| format!("h264 open: {e}"))?;
@@ -63,6 +91,7 @@ impl VideoEncoder {
             frame,
             width,
             height,
+            force_idr: false,
         })
     }
 
@@ -91,9 +120,18 @@ impl VideoEncoder {
         )?;
         let pts = (video.pts_us * PTS_90K as u64 / 1_000_000) as i64;
         self.frame.set_pts(Some(pts));
+        if self.force_idr {
+            // libx264 treats AV_PICTURE_TYPE_I as a forced keyframe; with
+            // CLOSED_GOP set above it comes out as a true IDR.
+            self.frame.set_kind(ffmpeg::picture::Type::I);
+            self.force_idr = false;
+        }
         self.encoder
             .send_frame(&self.frame)
             .map_err(|e| format!("h264 send frame: {e}"))?;
+        // The frame is reused across pushes, so clear the forced type or
+        // every following picture would come out as a keyframe.
+        self.frame.set_kind(ffmpeg::picture::Type::None);
         self.drain()
     }
 
@@ -103,6 +141,12 @@ impl VideoEncoder {
             .send_eof()
             .map_err(|e| format!("h264 eof: {e}"))?;
         self.drain()
+    }
+
+    /// Force the next encoded picture to be an IDR, so a segment can start
+    /// on a keyframe. The kind is stamped on the frame at push time.
+    pub fn force_keyframe(&mut self) {
+        self.force_idr = true;
     }
 
     fn drain(&mut self) -> Result<Vec<EncodedAu>> {
@@ -222,5 +266,42 @@ mod tests {
         }
         // Test clip is 1 s @ 25 fps → pts span ~0.96 s on the 90 kHz clock.
         assert!(aus.last().unwrap().pts_90k >= 80_000);
+    }
+
+    #[test]
+    fn force_keyframe_yields_idr_and_mid_gop_aus_do_not() {
+        let Some(path) = render_test_clip("force-idr") else {
+            return;
+        };
+        let mut decoder = VideoDecoder::open(&path).expect("decode testsrc");
+        let frames = decoder.decode_all().expect("decode all frames");
+        let (fps_num, fps_den) = decoder.frame_rate();
+        let mut encoder = VideoEncoder::h264(
+            decoder.width(),
+            decoder.height(),
+            fps_num,
+            fps_den,
+            1_500_000,
+        )
+        .expect("open h264 encoder");
+
+        // First AU of the stream is SPS/PPS/IDR.
+        let mut aus = encoder.push(&frames[0]).expect("encode frame");
+        assert!(aus.iter().any(EncodedAu::is_idr), "stream start is an IDR");
+
+        // Mid-GOP frames encode as non-IDR P-frames.
+        aus = encoder.push(&frames[1]).expect("encode frame");
+        assert!(!aus.iter().any(EncodedAu::is_idr));
+
+        // After a forced keyframe the next picture is an IDR again.
+        encoder.force_keyframe();
+        aus = encoder.push(&frames[2]).expect("encode frame");
+        assert!(
+            aus.iter().any(EncodedAu::is_idr),
+            "frame after force_keyframe must be an IDR"
+        );
+
+        aus = encoder.push(&frames[3]).expect("encode frame");
+        assert!(!aus.iter().any(EncodedAu::is_idr));
     }
 }

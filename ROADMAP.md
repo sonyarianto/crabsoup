@@ -583,12 +583,17 @@ ships its inline tests and a `benches/` row.
       mux thread with one-frame lookahead plus a PTS-ordered pending queue,
       `flush_up_to(audio_pts)` before each audio frame and
       `flush_remaining` at EOF, and segment rotation carries `has_video`.
+      **Keyframe-aligned rotation shipped:** rotation defers until the video
+      track muxes an IDR into the next segment — every frame encoded while
+      the segment window is pending is forced to a keyframe (x264 via
+      `frame.pict_type` + `AV_CODEC_FLAG_CLOSED_GOP`, scenecut off), and
+      `feed` rotates immediately once the tap is gone or stalled past one
+      extra window. A variant master playlist `index.m3u8`
+      (`#EXT-X-STREAM-INF` with RESOLUTION from the track spec, static
+      CODECS) is written next to `playlist.m3u8` whenever video is enabled.
       End-to-end test: 1 s testsrc + sine audio through `HlsOutput`, every
-      segment probed with ffprobe (first segment must be h264+aac; audio
-      must survive every segment; skips without ffmpeg). **Known follow-up:**
-      segments currently start mid-GOP (no IDR on rotation) — players
-      joining at the playlist head are fine; keyframe-aligned segment
-      starts are a later improvement.
+      segment probed with ffprobe (every segment must be h264+aac — each
+      starts on an IDR — plus the master playlist; skips without ffmpeg).
 - [ ] **H7 — video playlist** (`playlist`/`single` over video files) +
       **H8 — video streaming guide + examples**.
 
