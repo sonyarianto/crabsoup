@@ -5,8 +5,8 @@
 
 A Liquidsoap-inspired audio streaming engine in Rust: evaluates a `.lua`
 script (Liquidsoap-flavoured Lua) that builds a source graph, mixes in live DJ
-input and one-shot jingles with crossfades, and broadcasts the result (MP3 or
-Opus) to an Icecast server.
+input and one-shot jingles with crossfades, and broadcasts the result (MP3,
+Opus, or AAC) to an Icecast server.
 
 - `.lua` scripting: real Lua with Liquidsoap-style functions — `playlist`,
   `smart_crossfade`, `single`, `blank`, `sine`, `amplify`, `compress`,
@@ -151,7 +151,7 @@ output.icecast({host = "localhost", port = 8000,
 ```
 
 Named options are passed as Lua tables; most have defaults. `format` is
-`"mp3"` or `"opus"`.
+`"mp3"`, `"opus"`, or `"aac"`.
 
 **Sources** (composable):
 - `playlist({directory|files, shuffle, loop})` / `single(path)` — media playback
@@ -316,4 +316,4 @@ See [ROADMAP.md](ROADMAP.md).
 
 ## License
 
-MIT
+AGPL-3.0
