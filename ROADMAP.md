@@ -154,6 +154,13 @@ K = 11 / 33 partitions). Convolution dominates as expected — the 1 s IR is
 | reverb/partitioned_1s_ir | 670 µs | 0.72 % |
 | reverb/partitioned_3s_ir | 1.72 ms | 1.85 % |
 
+EQ row (Part I4, recorded in the session that landed `eq`; a 4-band
+parametric chain — highshelf, two peakings, lowshelf — per channel):
+
+| benchmark | per 92.9 ms buffer | vs real-time |
+|---|---|---|
+| eq/4_band_parametric | 203 µs | 0.22 % |
+
 Video-path rows (Part H3, recorded in the session that landed the effects +
 bench group; per 640x360 YUV420P frame, budget = one 25 fps frame = 40 ms):
 
@@ -794,7 +801,7 @@ rows recorded against the baseline convention.
 
 ### Part I — advanced audio & effects (Phase 2, Q1 – Q2 2027)
 
-**Status: I1–I3 shipped** (see their rows below; I4 onwards still planned).
+**Status: I1–I4 shipped** (see their rows below; I5 onwards still planned).
 The product plan's Phase 2. Effects stay inline in the
 pull chain (one thread per output, allocation-free hot paths), each landing
 with inline tests and a bench row; FFI-backed DSP (SoundTouch, aubio) gets
@@ -855,6 +862,25 @@ its own confined module per the Part H convention note.
       missing-file errors). Bench: `partitioned_1s_ir` ~670 µs /
       `partitioned_3s_ir` ~1.72 ms per 92.9 ms buffer.
 - [ ] **I4 — EQ/filters** (low/high-pass, parametric).
+      **Shipped as `eq(src, {bands = {...}})` + `filter(src, {type, freq,
+      q, gain})`** over `src/engine/eq.rs` — a biquad bank from the RBJ
+      Audio EQ Cookbook in Direct Form 1. Bands (lowpass/highpass/
+      bandpass/notch/peaking/lowshelf/highshelf) chain in series per
+      channel; each `Biquad` keeps its own `x1,x2,y1,y2` state, so the hot
+      path is a per-sample coefficient multiply, allocation-free. All
+      coefficients are normalized by `a0` (the cookbook leaves them
+      unnormalized); `freq` must be in `(0, fs/2)` and `q > 0`, validated
+      at operator-call time. Tests: lowpass/highpass stop-band blocking
+      with passband transparency, peaking boost ≈ its dB setting at the
+      centre, zero-gain peaking is sample-exact passthrough, shelf
+      independence across stereo channels, stability under resonant noise
+      drive, and the allocation-free pull path; script tests (10 kHz
+      through a 500 Hz lowpass and 100 Hz through a 1 kHz highpass both
+      vanish, +6 dB peaking doubles a 1 kHz tone's RMS, bad-type /
+      above-Nyquist / empty-bands errors). Bench: `4_band_parametric`
+      ~203 µs per 92.9 ms buffer — under the compressor chain, as
+      expected for four biquads.
+- [ ] **I5 — stereo imaging** (`stereo.widen`, `stereo.pan`, mid-side),
 - [ ] **I5 — stereo imaging** (`stereo.widen`, `stereo.pan`, mid-side),
       **I6 — vocal remover** (centre-channel phase cancellation).
 - [ ] **I7 — BPM & key detection** (`aubio-rs` or `libvamp`), **I8 — speech

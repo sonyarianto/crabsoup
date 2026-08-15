@@ -34,7 +34,7 @@ One engine thread plus one thread per output:
 - Registers the Liquidsoap-flavoured Lua stdlib: `playlist`,
   `smart_crossfade`, `single`, `blank` (+ `blank.detect`), `sine`,
   `amplify`, `compress`, `normalize`, `replaygain`, `stretch`, `pitch`,
-  `echo`, `reverb`, `pipe`, `jingles`,
+  `echo`, `reverb`, `eq`, `filter`, `pipe`, `jingles`,
   `fallback`/`sequence`/`random`, `switch`, `rotate`, `mksafe`, `add`,
   `cue_cut`,   `map_metadata`, `request.queue`, `request.dynamic`,
   `input.harbor`, `input.soundcard`, `input.http`, `output.icecast`,
@@ -266,6 +266,25 @@ One engine thread plus one thread per output:
   The multi-partition direct-convolution test and the partition-boundary
   delta tests (1023/1024/2047/2048) pin the block alignment; rustfft's
   inverse FFT is unnormalized, so the IFFT output is scaled by `1/N`.
+
+## EQ / filters (`src/engine/eq.rs`)
+
+- `eq(src, {bands = {{type, freq, gain, q}, ...}})` and
+  `filter(src, {type, freq, q, gain})` wrap the source in an `Eq` — a
+  bank of RBJ Audio EQ Cookbook biquads in Direct Form 1
+  (`y[n] = b0·x + b1·x1 + b2·x2 − a1·y1 − a2·y2`). Bands
+  (lowpass/highpass/bandpass/notch/peaking/lowshelf/highshelf) run in
+  series inside each channel; `filters[c][band]` keeps per-channel,
+  per-band state.
+- The cookbook formulas are normalized by `a0` (they are usually quoted
+  unnormalized) and every coefficient is baked into the `Biquad` at
+  construction — the hot path is one `tick()` per sample per band, no
+  trig, no allocation. Validation at operator-call time: `freq ∈ (0,
+  fs/2)` and `q > 0` (the module returns `eq: ...` errors); gain is
+  peaking/shelf-only and defaults to 0.
+- A zero-gain band reduces to an exact passthrough (pinned by a
+  sample-exact test); a resonant peaking driven with noise stays bounded
+  (stability test) rather than ringing into overflow.
 
 ## Mixer control (`src/engine/mixer.rs`)
 

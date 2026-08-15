@@ -26,6 +26,9 @@ pl = playlist({directory = "./media", shuffle = false, loop = true})
 --   echo(src, {delay = 0.25, ping = 0.5, feedback = 0.5,
 --              delay2 = 0.5, ping2 = 0.25})   multi-tap echo
 --   reverb(src, {ir = "./media/hall.wav", wet = 0.3, dry = 0.7})  convolution
+--   eq(src, {bands = {{type = "lowpass", freq = 15000},
+--                     {type = "peaking", freq = 1000, gain = 3, q = 1.0}}})
+--   filter(src, {type = "highpass", freq = 80})   single-band biquad
 --   amplify(src, gain); compress(src, opts); normalize(src, opts);
 --   replaygain(src);   -- see examples/crabsoup.dsp.lua for a full chain
 -- pl = normalize(pl, {target = -13, attack = 3, release = 0.5})

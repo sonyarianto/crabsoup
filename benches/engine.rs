@@ -16,6 +16,7 @@ use symphonia::core::audio::{Channels, SignalSpec};
 
 use crabsoup::config::MixerConfig;
 use crabsoup::engine::effects::{Agc, Amplify, Compressor, Echo, EffectSource};
+use crabsoup::engine::eq::{Eq, EqBand, EqType};
 use crabsoup::engine::mixer::{CrossfadeMixer, PriorityMixer, SmartFade};
 use crabsoup::engine::pitch::{PitchMode, PitchSource};
 use crabsoup::engine::reverb::ConvReverb;
@@ -289,6 +290,48 @@ fn effects(c: &mut Criterion) {
     });
 }
 
+fn eq(c: &mut Criterion) {
+    let mut group = c.benchmark_group("eq");
+    group.throughput(Throughput::Elements(BUF as u64));
+
+    group.bench_function("4_band_parametric", |b| {
+        let bands = [
+            EqBand {
+                kind: EqType::HighShelf,
+                freq: 12_000.0,
+                gain_db: -3.0,
+                q: 0.707,
+            },
+            EqBand {
+                kind: EqType::Peaking,
+                freq: 4_000.0,
+                gain_db: 2.0,
+                q: 1.0,
+            },
+            EqBand {
+                kind: EqType::Peaking,
+                freq: 1_000.0,
+                gain_db: -2.0,
+                q: 1.0,
+            },
+            EqBand {
+                kind: EqType::LowShelf,
+                freq: 120.0,
+                gain_db: 3.0,
+                q: 0.707,
+            },
+        ];
+        let child: Box<dyn AudioSource> = Box::new(SineSource::new(440.0, None, 0.5, RATE, CHANS));
+        let mut chain =
+            EffectSource::new(child, Eq::new(&bands, CHANS, RATE as f32).unwrap(), CHANS);
+        let mut buf = vec![0.0f32; BUF];
+        b.iter(|| {
+            chain.next_buffer(&mut buf);
+            black_box(&buf);
+        });
+    });
+}
+
 fn reverb(c: &mut Criterion) {
     let mut group = c.benchmark_group("reverb");
     group.throughput(Throughput::Elements(BUF as u64));
@@ -472,6 +515,7 @@ criterion::criterion_group!(
     smart_crossfade,
     live_handoff,
     effects,
+    eq,
     reverb,
     pitch,
     resampler,

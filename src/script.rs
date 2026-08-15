@@ -42,6 +42,7 @@ use crate::config::{
 #[cfg(feature = "video")]
 use crate::config::{collect_images, collect_video};
 use crate::engine::effects::{Agc, Amplify, Compressor, Echo, EffectSource};
+use crate::engine::eq::{Eq, EqBand, EqType};
 use crate::engine::mixer::{CrossfadeMixer, SmartFade};
 use crate::engine::pitch::{PitchMode, PitchSource};
 use crate::engine::reverb::{ConvReverb, load_ir};
@@ -2227,6 +2228,88 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
             Ok(LuaSource::new(Box::new(EffectSource::new(
                 child,
                 fx,
+                spec.channels.count(),
+            ))))
+        })?,
+    )?;
+
+    // ---- EQ / filters (biquad bank) ---------------------------------------
+    /// Parse one band table into an [`EqBand`].
+    fn band_from_table(t: &Table) -> mlua::Result<EqBand> {
+        let kind = match t.get::<String>("type")?.as_str() {
+            "lowpass" => EqType::LowPass,
+            "highpass" => EqType::HighPass,
+            "bandpass" => EqType::BandPass,
+            "notch" => EqType::Notch,
+            "peaking" => EqType::Peaking,
+            "lowshelf" => EqType::LowShelf,
+            "highshelf" => EqType::HighShelf,
+            other => {
+                return Err(mlua::Error::runtime(format!(
+                    "eq: unknown filter type {other}"
+                )));
+            }
+        };
+        let freq = t.get::<f64>("freq")?;
+        let gain = t.get::<f64>("gain").unwrap_or(0.0);
+        let q = t.get::<f64>("q").unwrap_or(0.707);
+        Ok(EqBand {
+            kind,
+            freq: freq as f32,
+            gain_db: gain as f32,
+            q: q as f32,
+        })
+    }
+
+    let eq_state = state.clone();
+    globals.set(
+        "eq",
+        lua.create_function(move |_, (mut source, opts): (LuaSource, Option<Table>)| {
+            let bands_table: Vec<Table> = match &opts {
+                Some(t) => t.get("bands").unwrap_or_default(),
+                None => return Err(mlua::Error::runtime("eq: `bands` is required")),
+            };
+            if bands_table.is_empty() {
+                return Err(mlua::Error::runtime(
+                    "eq: `bands` must list at least one band",
+                ));
+            }
+            let mut bands = Vec::with_capacity(bands_table.len());
+            for b in &bands_table {
+                bands.push(band_from_table(b)?);
+            }
+            let (spec, _) = bus(&eq_state);
+            let eq = Eq::new(&bands, spec.channels.count(), spec.rate as f32)
+                .map_err(mlua::Error::runtime)?;
+            let child = source.take();
+            Ok(LuaSource::new(Box::new(EffectSource::new(
+                child,
+                eq,
+                spec.channels.count(),
+            ))))
+        })?,
+    )?;
+
+    let filter_state = state.clone();
+    globals.set(
+        "filter",
+        lua.create_function(move |_, (mut source, opts): (LuaSource, Option<Table>)| {
+            let opts = match opts {
+                Some(t) => t,
+                None => {
+                    return Err(mlua::Error::runtime(
+                        "filter: `type` and `freq` are required",
+                    ));
+                }
+            };
+            let band = band_from_table(&opts)?;
+            let (spec, _) = bus(&filter_state);
+            let eq = Eq::new(&[band], spec.channels.count(), spec.rate as f32)
+                .map_err(mlua::Error::runtime)?;
+            let child = source.take();
+            Ok(LuaSource::new(Box::new(EffectSource::new(
+                child,
+                eq,
                 spec.channels.count(),
             ))))
         })?,
@@ -4916,6 +4999,69 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("reverb"), "{err}");
+    }
+
+    /// Evaluate a preview script and collect the interleaved output.
+    fn preview_out(script: &str) -> Vec<f32> {
+        let (_rt, res) = run(script).expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        let mut out = Vec::new();
+        while !root.is_exhausted() {
+            let n = root.next_buffer(&mut buf);
+            out.extend_from_slice(&buf[..n]);
+        }
+        out
+    }
+
+    fn mono_rms(out: &[f32]) -> f64 {
+        let sig: Vec<f32> = out.iter().step_by(2).copied().collect();
+        (sig.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / sig.len() as f64).sqrt()
+    }
+
+    #[test]
+    fn eq_lowpass_attenuates_high_frequencies() {
+        let out = preview_out(
+            r#"output.preview(eq(sine({freq = 10000, duration = 0.2}),
+                                 {bands = {{type = "lowpass", freq = 500, q = 0.707}}}))"#,
+        );
+        assert!(mono_rms(&out) < 0.03, "10 kHz blocked: {}", mono_rms(&out));
+    }
+
+    #[test]
+    fn filter_highpass_blocks_low_frequencies() {
+        let out = preview_out(
+            r#"output.preview(filter(sine({freq = 100, duration = 0.2}),
+                                     {type = "highpass", freq = 1000, q = 0.707}))"#,
+        );
+        assert!(mono_rms(&out) < 0.03, "100 Hz blocked: {}", mono_rms(&out));
+    }
+
+    #[test]
+    fn eq_peaking_boosts_its_centre_frequency() {
+        // sine() defaults to 0.5 amplitude → RMS 0.354; a +6 dB peaking at
+        // the tone's own frequency doubles the amplitude (RMS 0.707).
+        let out = preview_out(
+            r#"output.preview(eq(sine({freq = 1000, duration = 0.2}),
+                                 {bands = {{type = "peaking", freq = 1000, gain = 6, q = 2}}}))"#,
+        );
+        let rms = mono_rms(&out);
+        assert!((0.55..0.95).contains(&rms), "boosted RMS {rms}");
+    }
+
+    #[test]
+    fn eq_rejects_bad_bands() {
+        for script in [
+            r#"output.preview(eq(sine({}), {bands = {{type = "phaser", freq = 1000}}}))"#,
+            r#"output.preview(eq(sine({}), {bands = {{type = "lowpass", freq = 30000}}}))"#,
+            r#"output.preview(eq(sine({}), {}))"#,
+        ] {
+            let err = match run(script) {
+                Ok(_) => panic!("eq with a bad band must fail: {script}"),
+                Err(e) => e,
+            };
+            assert!(err.to_string().contains("eq"), "{err}");
+        }
     }
 
     // ---- Phase 5: switch / rotate ----------------------------------------
