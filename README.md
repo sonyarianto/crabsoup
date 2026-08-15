@@ -26,6 +26,10 @@ Opus) to an Icecast server.
   frames to a shared tap; `output.hls({video = ...})` live-encodes them to
   H.264 and muxes them into keyframe-aligned MPEG-TS segments with a
   variant master playlist. See `examples/crabsoup.video.lua`
+- **RTMP (Part H5, `--features rtmp`)**: `output.rtmp` publishes the stream
+  as FLV (raw AAC, optional H.264 video with `video = marker`) to any RTMP
+  server such as nginx-rtmp or YouTube Live, with the Icecast-style
+  reconnect loop. Audio-only with just `rtmp`; add `video` for h264+aac.
 - Graceful Ctrl-C shutdown
 
 ## Architecture
@@ -77,6 +81,21 @@ sudo apt install libmp3lame-dev libopus-dev   # Debian/Ubuntu
 cargo build --release
 ```
 
+Video (HLS + RTMP) adds the FFmpeg dev packages and the `video` feature:
+
+```sh
+sudo apt install libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
+cargo build --release --features video
+```
+
+RTMP publishing adds `librtmp-dev` and the `rtmp` feature:
+
+```sh
+sudo apt install librtmp-dev
+cargo build --release --features rtmp          # audio-only RTMP
+cargo build --release --features rtmp,video    # h264 + aac RTMP (and HLS)
+```
+
 Lua 5.4 is vendored and compiled at build time (needs a C compiler).
 
 ## Running
@@ -95,6 +114,7 @@ Per-format test scripts live in `examples/`:
 ./target/release/crabsoup -c examples/crabsoup.pipe.lua    # external processor pipeline (preview)
 ./target/release/crabsoup -c examples/crabsoup.preview.lua # no broadcast
 ./target/release/crabsoup -c examples/crabsoup.video.lua    # file -> HLS(video)
+./target/release/crabsoup -c examples/crabsoup.rtmp.lua     # file -> RTMP (nginx-rtmp)
 ```
 
 With an `output.icecast` call it connects to Icecast as a source. Without one

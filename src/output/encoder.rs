@@ -343,6 +343,9 @@ const AOT_AAC_HE: c_uint = 5; // MPEG-4 HE-AAC (AAC-LC core + SBR, "AAC+")
 const MODE_1: c_uint = 1; // mono
 const MODE_2: c_uint = 2; // stereo
 const TT_MP4_ADTS: c_uint = 2;
+/// Raw access units (no framing): FLV/RTMP carry raw AAC plus the
+/// AudioSpecificConfig in a separate sequence header (Part H5).
+const TT_MP4_RAW: c_uint = 0;
 // Buffer identifiers (AACENC_BufferIdentifier).
 const IN_AUDIO_DATA: c_int = 0;
 const OUT_BITSTREAM_DATA: c_int = 3;
@@ -401,6 +404,11 @@ unsafe extern "C" {
 pub struct AacEncoder {
     handle: *mut AacEncoderRaw,
     out_buf_size: usize,
+    /// Samples per encoded frame per channel (1024 for AAC-LC).
+    pub frame_size: u32,
+    /// AudioSpecificConfig reported by `aacEncInfo` (2 bytes for LC) —
+    /// sent as the FLV AAC sequence header (Part H5).
+    pub asc: Vec<u8>,
 }
 
 unsafe impl Send for AacEncoder {}
@@ -408,16 +416,27 @@ unsafe impl Send for AacEncoder {}
 impl AacEncoder {
     /// AAC-LC — the profile used for Icecast and HLS.
     pub fn new(sample_rate: u32, channels: u16, bitrate: u32) -> Result<Self> {
-        Self::new_with_aot(sample_rate, channels, bitrate, AOT_AAC_LC)
+        Self::new_with(sample_rate, channels, bitrate, AOT_AAC_LC, TT_MP4_ADTS)
     }
 
     /// HE-AAC ("AAC+", SBR) — the profile SHOUTcast v2 expects from
     /// `audio/aacp` sources.
     pub fn new_he_aac(sample_rate: u32, channels: u16, bitrate: u32) -> Result<Self> {
-        Self::new_with_aot(sample_rate, channels, bitrate, AOT_AAC_HE)
+        Self::new_with(sample_rate, channels, bitrate, AOT_AAC_HE, TT_MP4_ADTS)
     }
 
-    fn new_with_aot(sample_rate: u32, channels: u16, bitrate: u32, aot: c_uint) -> Result<Self> {
+    /// AAC-LC with raw transport (no ADTS framing): FLV/RTMP publishing.
+    pub fn new_raw(sample_rate: u32, channels: u16, bitrate: u32) -> Result<Self> {
+        Self::new_with(sample_rate, channels, bitrate, AOT_AAC_LC, TT_MP4_RAW)
+    }
+
+    fn new_with(
+        sample_rate: u32,
+        channels: u16,
+        bitrate: u32,
+        aot: c_uint,
+        transport: c_uint,
+    ) -> Result<Self> {
         let mut handle = ptr::null_mut();
         let status = unsafe { aacEncOpen(&mut handle, 0, channels.max(1) as c_uint) };
         if status != AACENC_OK || handle.is_null() {
@@ -435,7 +454,7 @@ impl AacEncoder {
                 | aacEncoder_SetParam(handle, AACENC_SAMPLERATE, sample_rate)
                 | aacEncoder_SetParam(handle, AACENC_CHANNELMODE, ch_mode)
                 | aacEncoder_SetParam(handle, AACENC_BITRATE, bitrate)
-                | aacEncoder_SetParam(handle, AACENC_TRANSMUX, TT_MP4_ADTS)
+                | aacEncoder_SetParam(handle, AACENC_TRANSMUX, transport)
         };
         if ok != AACENC_OK {
             unsafe { aacEncClose(&mut handle) };
@@ -466,7 +485,15 @@ impl AacEncoder {
         Ok(Self {
             handle,
             out_buf_size,
+            frame_size: info.frame_size.max(1),
+            asc: info.conf_buf[..info.conf_size as usize].to_vec(),
         })
+    }
+
+    /// The AudioSpecificConfig for the configured stream — the payload of
+    /// the FLV/RTMP AAC sequence header.
+    pub fn audio_specific_config(&self) -> &[u8] {
+        &self.asc
     }
 
     /// Run one `aacEncEncode` call. FDK consumes at most one frame's worth of
@@ -526,14 +553,9 @@ impl AacEncoder {
         out.truncate(out_args.num_out_bytes.max(0) as usize);
         (out, status, out_args.num_in_samples.max(0))
     }
-}
-
-impl Encoder for AacEncoder {
-    fn content_type(&self) -> &'static str {
-        "audio/aac"
-    }
-
-    fn encode(&mut self, pcm: &[f32]) -> Vec<u8> {
+    /// Encode `pcm`, returning one chunk per `aacEncEncode` call (each is
+    /// one access unit on the raw transport, one ADTS frame on ADTS).
+    pub fn encode_aus(&mut self, pcm: &[f32]) -> Vec<Vec<u8>> {
         let mut i16buf = Vec::with_capacity(pcm.len());
         for &s in pcm {
             i16buf.push(clamp_i16(s));
@@ -543,7 +565,9 @@ impl Encoder for AacEncoder {
         let mut guard = 0;
         while !remaining.is_empty() {
             let (chunk, status, consumed) = self.encode_call(remaining, false);
-            out.extend_from_slice(&chunk);
+            if !chunk.is_empty() {
+                out.push(chunk);
+            }
             if status != AACENC_OK {
                 break;
             }
@@ -559,6 +583,16 @@ impl Encoder for AacEncoder {
             }
         }
         out
+    }
+}
+
+impl Encoder for AacEncoder {
+    fn content_type(&self) -> &'static str {
+        "audio/aac"
+    }
+
+    fn encode(&mut self, pcm: &[f32]) -> Vec<u8> {
+        self.encode_aus(pcm).concat()
     }
 
     fn finish(&mut self) -> Vec<u8> {

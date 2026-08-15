@@ -1,8 +1,11 @@
 pub mod encoder;
 pub mod file;
+pub mod flv;
 pub mod hls;
 pub mod icecast;
 pub mod icecast_client;
 pub mod mpegts;
 pub mod ogg_mux;
+#[cfg(feature = "rtmp")]
+pub mod rtmp;
 pub mod soundcard;

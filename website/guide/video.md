@@ -1,11 +1,14 @@
 # Video
 
-Video support turns a Crabsoup install into a file → HLS(video) engine: a
-video source feeds a decode thread that paces frames to their PTS on a
-shared fan-out tap, and `output.hls({video = ...})` muxes those frames —
-encoded live to H.264 — into the same MPEG-TS segments as the audio. The
-result is a master playlist (`index.m3u8`) plus the usual per-segment
-media playlist, all keyframe-aligned so players can join mid-stream.
+Video support turns a Crabsoup install into a file → HLS(video) and file →
+RTMP engine: a video source feeds a decode thread that paces frames to
+their PTS on a shared fan-out tap, and `output.hls({video = ...})` muxes
+those frames — encoded live to H.264 — into the same MPEG-TS segments as
+the audio. The result is a master playlist (`index.m3u8`) plus the usual
+per-segment media playlist, all keyframe-aligned so players can join
+mid-stream. `output.rtmp({video = ...})` muxes the same frames into an
+FLV stream (H.264 + raw AAC) and publishes it to an RTMP server such as
+nginx-rtmp.
 
 Video is compiled in with the `video` cargo feature and needs the FFmpeg
 dev packages at build time (they are pulled via pkg-config):
@@ -13,6 +16,13 @@ dev packages at build time (they are pulled via pkg-config):
 ```sh
 sudo apt install libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
 cargo build --release --features video
+```
+
+RTMP additionally needs the `rtmp` feature and `librtmp-dev`:
+
+```sh
+sudo apt install librtmp-dev
+cargo build --release --features rtmp,video    # or just --features rtmp for audio-only
 ```
 
 Everything else (audio decode, mixing, Icecast) is unchanged and works in
@@ -85,6 +95,50 @@ output.hls({directory = "/var/www/hls", video = vpl, segment_seconds = 4}, root)
 - The H.264 encoder is H.264/AVC baseline profile, `ultrafast`,
   zero-latency, closed-GOP with scene-cut detection off — a regular
   keyframe cadence driven only by segment rotation.
+
+## `output.rtmp` (H.264 + AAC over RTMP)
+
+Pass any video source's marker to `output.rtmp` to publish an FLV stream —
+video optional, audio is always AAC-LC:
+
+```lua
+-- audio-only
+output.rtmp({url = "rtmp://localhost/live/stream", bitrate = 128000}, root)
+
+-- h264 + aac
+output.rtmp({url = "rtmp://localhost/live/stream", video = vpl,
+             bitrate = 128000}, root)
+```
+
+- `url` is required (`rtmp://host/app/stream`); `format` accepts only
+  `"aac"` (raw AAC in the FLV AAC container — no ADTS).
+- `reconnect` (default 5 s) is the retry interval if the server is down
+  or drops the connection; the output waits in a loop like `output.icecast`.
+- The video side is identical to HLS: subscribed to the shared `VideoTap`,
+  encoded to H.264 baseline, held until the audio clock catches up, and
+  muxed with a FLV AVCDecoderConfigurationRecord + 4-byte-length NALs.
+- A sequence header (AAC config / AVCDCR) is sent once at stream start so
+  players can join mid-stream.
+- Live streams end abruptly (no FLV tail) — that is the RTMP live model.
+
+A minimal nginx-rtmp server for local testing (`/etc/nginx/rtmp.conf`,
+included after the modules-enabled include in `nginx.conf`):
+
+```nginx
+rtmp {
+    server {
+        listen 1935;
+        application live { live on; record off; }
+    }
+}
+```
+
+Verify a running stream with `rtmpdump` (the `librtmp` CLI):
+
+```sh
+timeout 10 rtmpdump -r rtmp://localhost/live/stream -o /tmp/cap.flv
+ffprobe -show_entries stream=codec_name,width,height /tmp/cap.flv
+```
 
 ## Example
 

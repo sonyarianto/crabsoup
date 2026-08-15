@@ -114,6 +114,22 @@ pub struct HlsOutputConfig {
     pub video: bool,
 }
 
+/// Config for `output.rtmp` (Part H5): publish the tap to an RTMP server
+/// as FLV (AAC audio, optional H.264 video).
+#[cfg(feature = "rtmp")]
+#[derive(Debug, Clone)]
+pub struct RtmpOutputConfig {
+    /// The full `rtmp://` publish URL, including the stream key.
+    pub url: String,
+    /// AAC encoder bitrate in bits per second.
+    pub bitrate: u32,
+    /// Seconds to wait between failed reconnect attempts.
+    pub reconnect_seconds: u64,
+    /// Mux the shared video tap into the FLV (Part H): requires a video
+    /// source registered in the same script.
+    pub video: bool,
+}
+
 impl Default for HlsOutputConfig {
     fn default() -> Self {
         Self {

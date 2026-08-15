@@ -50,6 +50,9 @@ ffmpeg-next = { version = "7.1", optional = true }
 [features]
 # Video support (Part H): off by default so core builds stay libav-free.
 video = ["dep:ffmpeg-next"]
+# RTMP publishing (Part H5): links the system librtmp (rtmp:// URLs). Off
+# by default so core builds don't need librtmp-dev.
+rtmp = []
 
 [dev-dependencies]
 criterion = "0.5"

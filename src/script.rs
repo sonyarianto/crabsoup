@@ -63,6 +63,8 @@ pub struct ScriptResult {
     pub outputs: Vec<OutputConfig>,
     pub file_outputs: Vec<FileOutputConfig>,
     pub hls_outputs: Vec<HlsOutputConfig>,
+    #[cfg(feature = "rtmp")]
+    pub rtmp_outputs: Vec<crate::config::RtmpOutputConfig>,
     pub soundcard_outputs: Vec<SoundcardOutputConfig>,
     /// Shared state of the `request.queue` source, handed to the telnet
     /// server for `queue.push`/`queue.list`/`queue.clear`/`queue.skip`.
@@ -103,6 +105,8 @@ struct ScriptState {
     outputs: Vec<OutputConfig>,
     file_outputs: Vec<FileOutputConfig>,
     hls_outputs: Vec<HlsOutputConfig>,
+    #[cfg(feature = "rtmp")]
+    rtmp_outputs: Vec<crate::config::RtmpOutputConfig>,
     soundcard_outputs: Vec<SoundcardOutputConfig>,
     request_queue: Option<Arc<RequestQueue>>,
     /// Named telnet commands registered by `server.register(name, fn)`;
@@ -2631,6 +2635,65 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
             Ok(())
         })?,
     )?;
+    // `output.rtmp({url = ..., format, bitrate, video = marker}, root)`
+    // (Part H5): publish the tap as FLV to an RTMP server. Video, when
+    // given a video-source marker, subscribes to the shared tap exactly
+    // like `output.hls({video = ...})`.
+    #[cfg(feature = "rtmp")]
+    {
+        let rtmp_state = state.clone();
+        output.set(
+            "rtmp",
+            lua.create_function(move |_, (opts, mut source): (Table, LuaSource)| {
+                let url: String = opts.get("url").map_err(|_| {
+                    mlua::Error::runtime("output.rtmp: url is required (rtmp://...)")
+                })?;
+                let format: String = opts.get("format").unwrap_or_else(|_| "aac".into());
+                if format != "aac" {
+                    return Err(mlua::Error::runtime(format!(
+                        "output.rtmp: unsupported format {format:?} (only \"aac\")"
+                    )));
+                }
+                let video: Option<Table> = opts.get("video")?;
+                let has_video = video.is_some();
+                if has_video {
+                    // `video` must be a marker returned by the
+                    // `video.*` operators; that call also created the
+                    // shared tap the output subscribes to at startup.
+                    let s = rtmp_state.borrow();
+                    #[cfg(feature = "video")]
+                    if s.video_tap.is_none()
+                        || (s.video.is_empty()
+                            && s.video_playlists.is_empty()
+                            && s.video_slideshows.is_empty())
+                    {
+                        return Err(mlua::Error::runtime(
+                            "output.rtmp({video = ...}) requires a video.video/\
+                                 video.playlist/video.slideshow source registered first",
+                        ));
+                    }
+                    #[cfg(not(feature = "video"))]
+                    {
+                        let _ = s;
+                        return Err(mlua::Error::runtime(
+                            "output.rtmp({video = ...}) needs a video build \
+                                 (--features video)",
+                        ));
+                    }
+                }
+                let cfg = crate::config::RtmpOutputConfig {
+                    url,
+                    bitrate: opts.get("bitrate").unwrap_or(128_000),
+                    reconnect_seconds: opts.get("reconnect").unwrap_or(5),
+                    video: has_video,
+                };
+                let mut s = rtmp_state.borrow_mut();
+                claim_root(&mut s, &mut source)?;
+                s.rtmp_outputs.push(cfg);
+                Ok(())
+            })?,
+        )?;
+    }
     globals.set("output", output)?;
 
     // ---- metadata hooks (Liquidsoap `on_metadata`, `on_track`) ---------------
@@ -2696,6 +2759,8 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         outputs: std::mem::take(&mut s.outputs),
         file_outputs: std::mem::take(&mut s.file_outputs),
         hls_outputs: std::mem::take(&mut s.hls_outputs),
+        #[cfg(feature = "rtmp")]
+        rtmp_outputs: std::mem::take(&mut s.rtmp_outputs),
         soundcard_outputs: std::mem::take(&mut s.soundcard_outputs),
         request_queue: s.request_queue.take(),
         custom_commands: s.custom_commands.iter().map(|(n, _)| n.clone()).collect(),

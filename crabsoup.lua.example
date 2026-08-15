@@ -78,3 +78,12 @@ output.icecast({host = "localhost", port = 8000,
 -- -- output.hls({directory = "/var/www/hls", video = ss,
 -- --             segment_seconds = 4, retention = 12},
 -- --            fallback({j, live, pl}))
+
+-- RTMP broadcast (rtmp build only: `cargo build --release --features rtmp`;
+-- add `video` for h264+aac). Publishes FLV (raw AAC, optional H.264) to any
+-- RTMP server, e.g. nginx-rtmp on localhost:1935. `url` is required; drop
+-- `video = vpl` (and the vpl line) for audio-only.
+-- -- vpl = video.playlist({directory = "./media/video", loop = true})
+-- -- output.rtmp({url = "rtmp://localhost/live/stream", bitrate = 128000,
+-- --              video = vpl},
+-- --             fallback({j, live, pl}))

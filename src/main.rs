@@ -12,6 +12,8 @@ use crabsoup::live::harbor::Harbor;
 use crabsoup::output::file::FileOutput;
 use crabsoup::output::hls::HlsOutput;
 use crabsoup::output::icecast::IcecastOutput;
+#[cfg(feature = "rtmp")]
+use crabsoup::output::rtmp::RtmpOutput;
 use crabsoup::output::soundcard::SoundcardOutput;
 use crabsoup::script::{self, ScriptResult};
 use crabsoup::source::AudioSource;
@@ -35,10 +37,28 @@ struct Cli {
     preview: bool,
 }
 
+/// The first registered video track's spec — `video.video` first, then the
+/// first `video.playlist`/`video.single` track, then the first
+/// `video.slideshow` — shared by the video-enabled outputs (HLS and RTMP).
+#[cfg(feature = "video")]
+fn first_video_spec(result: &ScriptResult) -> Option<crabsoup::video::VideoSpec> {
+    result
+        .video
+        .first()
+        .map(|v| v.spec)
+        .or_else(|| {
+            result
+                .video_playlists
+                .first()
+                .and_then(|p| p.tracks.first())
+                .map(|t| t.spec)
+        })
+        .or_else(|| result.video_slideshows.first().map(|s| s.spec))
+}
+
 fn main() -> crabsoup::Result<()> {
     env_logger::init();
     let cli = Cli::parse();
-
     let src = std::fs::read_to_string(&cli.config)
         .map_err(|e| format!("failed to read script {}: {e}", cli.config.display()))?;
     let (runtime, mut result) = script::run(&src).map_err(|e| format!("script error: {e}"))?;
@@ -206,18 +226,7 @@ fn main() -> crabsoup::Result<()> {
             let tap = result.video_tap.clone().ok_or_else(|| {
                 "output.hls({video = ...}) requires a video source in the script".to_string()
             })?;
-            let spec = result
-                .video
-                .first()
-                .map(|v| v.spec)
-                .or_else(|| {
-                    result
-                        .video_playlists
-                        .first()
-                        .and_then(|p| p.tracks.first())
-                        .map(|t| t.spec)
-                })
-                .or_else(|| result.video_slideshows.first().map(|s| s.spec))
+            let spec = first_video_spec(&result)
                 .ok_or_else(|| "output.hls video track has no spec".to_string())?;
             Some((tap.register(), spec))
         } else {
@@ -229,6 +238,53 @@ fn main() -> crabsoup::Result<()> {
         output.set_shutdown(shutdown.clone());
         output.connect().map_err(|e| format!("output.hls: {e}"))?;
         handles.push(std::thread::spawn(move || output.run()));
+    }
+
+    // RTMP outputs (Part H5): publish FLV (AAC audio, optional H.264 video)
+    // to an RTMP server. Connection is lazy with retries — an unreachable
+    // server does not fail startup, the output just waits.
+    #[cfg(feature = "rtmp")]
+    let rtmp = if cli.preview {
+        Vec::new()
+    } else {
+        result.rtmp_outputs.clone()
+    };
+    #[cfg(feature = "rtmp")]
+    for cfg in &rtmp {
+        // Part H6 model: an RTMP output marked `video` subscribes to the
+        // shared video tap; the first registered track's spec drives the
+        // H.264 encoder.
+        #[cfg(feature = "video")]
+        let rtmp_video = if cfg.video {
+            let tap = result.video_tap.clone().ok_or_else(|| {
+                "output.rtmp({video = ...}) requires a video source in the script".to_string()
+            })?;
+            let spec = first_video_spec(&result)
+                .ok_or_else(|| "output.rtmp video track has no spec".to_string())?;
+            Some((tap.register(), spec))
+        } else {
+            None
+        };
+        #[cfg(not(feature = "video"))]
+        let rtmp_video = ();
+        let mut output = RtmpOutput::new(cfg.clone(), tap.register(), spec.rate, chans, rtmp_video);
+        let out_shutdown = shutdown.clone();
+        output.set_shutdown(out_shutdown.clone());
+        handles.push(std::thread::spawn(move || {
+            loop {
+                match output.connect() {
+                    Ok(()) => break,
+                    Err(e) => {
+                        log::error!("cannot connect to RTMP: {e}");
+                        if out_shutdown.load(Ordering::SeqCst) {
+                            return Ok(());
+                        }
+                        std::thread::sleep(Duration::from_secs(output.reconnect_seconds()));
+                    }
+                }
+            }
+            output.run()
+        }));
     }
 
     // Soundcard outputs: the device and stream are opened up front so a

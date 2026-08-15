@@ -589,8 +589,49 @@ ships its inline tests and a `benches/` row.
 - [ ] **H3 — basic video effects:** `video.fade` (in/out), `video.scale`.
 - [ ] **H4 — video encoders:** H.264/H.265/VP8/VP9 via FFI, muxed with the
       existing Opus/AAC/MP3 audio encoders into MPEG-TS/MP4.
-- [ ] **H5 — RTMP output** (`output.rtmp`): `rtmp-rs` or `librtmp` FFI;
-      verified live against a real target (YouTube Live or nginx-rtmp).
+- [x] **H5 — RTMP output** (`output.rtmp`): `librtmp` FFI; verified live
+      against nginx-rtmp (below, Part H5 landing note).
+      **Shipped (behind the `rtmp` cargo feature):** `output.rtmp({url,
+      bitrate, reconnect, video = marker, format = "aac"}, source)` in
+      script.rs — url required, only raw AAC is accepted (fdk-aac
+      `TT_MP4_RAW` transport), `bitrate` default 128 kbps, `reconnect`
+      default 5 s (the Icecast retry-loop shape in main.rs), and an
+      optional `video` marker (a `video.video`/`video.playlist`/
+      `video.slideshow` result) that subscribes the output to the shared
+      `VideoTap` like HLS (`first_video_spec` picks the first registered
+      track's spec). `src/output/rtmp.rs` pumps the audio tap, encodes raw
+      AAC, and interleaves H.264 access units gated on the audio clock
+      (`pts_90k/90 <= audio_ts_ms`, the H6 hold model); the FLV is muxed
+      in pure Rust (`src/output/flv.rs` — `@setDataFrame` onMetaData with
+      an ECMA array, AAC sequence header carrying the ASC from
+      `aacEncInfo`, AVCC sequence header + 4-byte-length NAL repack for
+      H.264, 24-bit+ext timestamps, `CRABSOUP_DUMP` env var persists the
+      captured FLV for ffprobe) and written via a thin `unsafe extern "C"`
+      librtmp FFI (`RtmpSession`, the only new `unsafe` surface, confined
+      to this module; `RtmpSink` trait so tests inject a byte-collecting
+      `CaptureSink` through `connect_to`). **librtmp gotchas learned
+      live:** `RTMP_EnableWrite` must be called *before*
+      `RTMP_ConnectStream` or librtmp never sends the `publish` command
+      (nginx logs `play:` but never `publish:` and subscribers get 0
+      bytes); `RTMP_ConnectStream` returns FALSE (0), not negative, on
+      failure; `RTMP_Write` parses the FLV stream itself (skips a leading
+      13-byte "FLV" header write entirely, skips 4-byte PreviousTagSize
+      per tag, prepends `@setDataFrame` to INFO messages, uses channel
+      0x04/msid = stream id), so tags must include their 4-byte trailer
+      or the size returns `size-4`. Inline tests (242 -> 267 with
+      `rtmp,video`): byte-exact FLV muxer tests (header, onMetaData ECMA
+      count, 24-bit ts layout, Annex-B split preferring 4-byte start
+      codes) plus two `rtmp::publishes_*` tests covering audio-only and
+      h264-interleaved streams (ASC, AVCDCR, NAL repack, monotonic ts).
+      **Verified live:** audio-only and h264+aac runs published to
+      `nginx-rtmp` (`application live`) on localhost; `rtmpdump`
+      subscribers captured 130 kB (AAC 44.1 kHz stereo, ffprobe-clean)
+      and 1.6 MB (H.264 640x360 @ 25 fps + AAC 44.1 kHz, ~11 ms median
+      A/V offset) respectively. The nginx metadata log line
+      `codec: error parsing data frame` is benign (nginx-rtmp's codec
+      module only warns while extracting metadata it will re-publish;
+      it does not affect relaying). Requires `librtmp-dev` and the
+      `rtmp` cargo feature; docs in `website/guide/video.md`.
 - [ ] **H6 — HLS video:** extend the existing `output.hls`
       (`src/output/hls.rs`) to video segments + master playlists — audio HLS
       already exists, so this is an extension, not a new output.

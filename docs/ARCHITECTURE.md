@@ -408,7 +408,7 @@ handling — the relay preempts, the local source plays the gap. URLs are
 shape-validated at script evaluation (scheme + non-empty host, no DNS);
 resolution happens per reconnect attempt.
 
-## Video path (Parts H1/H2/H6/H7, `--features video`)
+## Video path (Parts H1/H2/H5/H6/H7, `--features video`)
 
 Video is a parallel side-channel to the PCM bus, compiled out by default
 (`video = ["dep:ffmpeg-next"]`; all FFmpeg `unsafe` stays inside
@@ -445,6 +445,22 @@ Video is a parallel side-channel to the PCM bus, compiled out by default
   the first registered track's spec; `video.playlist` and
   `video.slideshow` therefore enforce one resolution per list at script
   evaluation.
+- **RTMP (Part H5, `--features rtmp`, optional `video`)**: `output.rtmp`
+  (`src/output/rtmp.rs`) consumes the audio tap, encodes raw AAC (fdk-aac
+  `TT_MP4_RAW` transport — the ASC from `aacEncInfo` becomes the FLV AAC
+  sequence header) and, with `video = marker`, subscribes to the `VideoTap`
+  like HLS: a `RtmpVideoTrack` encodes H.264 (the H6 encoder) and holds
+  access units in a PTS-ordered `pending` queue until the audio clock
+  catches up (`pts_90k/90 <= audio_ts_ms`), emitting IDR-first.
+  `src/output/flv.rs` is the pure-Rust FLV muxer: `@setDataFrame`
+  onMetaData as an ECMA array, 24-bit+ext-byte timestamps, AVCC sequence
+  header from SPS/PPS + 4-byte-length NAL repack (`avcc_nalus`). Bytes are
+  pushed through a thin `unsafe extern "C"` librtmp FFI (`RtmpSession` in
+  `rtmp.rs` — the only new `unsafe` surface, next to the encoder FFI; a
+  `RtmpSink` trait lets tests inject a byte-collecting `CaptureSink` via
+  `connect_to`). The FLV includes the 4-byte PreviousTagSize trailer per
+  tag. Reconnect mirrors Icecast (main.rs spawn loop). `CRABSOUP_DUMP`
+  persists the captured FLV for ffprobe in the inline tests.
 - **Master playlist**: `index.m3u8` (`#EXT-X-STREAM-INF`, RESOLUTION from
   the track spec, static CODECS) is written next to `playlist.m3u8` when
   `output.hls({video = ...})` is configured.
@@ -456,6 +472,19 @@ Video is a parallel side-channel to the PCM bus, compiled out by default
   (`idx = ((crc >> 24) ^ b) & 0xff`), not into the result. A previous bug
   corrupted every page silently; `crc_matches_external_reference` guards it.
 - Opus requires 48 kHz sample rate — never feed it the bus rate directly.
+- librtmp publish gotchas (Part H5): `RTMP_EnableWrite` must run *before*
+  `RTMP_ConnectStream` — otherwise librtmp never sends ReleaseStream/
+  FCPublish/`publish`, and a server like nginx-rtmp logs `play:` but never
+  `publish:`, relaying 0 bytes to subscribers. `RTMP_ConnectStream` returns
+  FALSE (0), not negative, on failure. `RTMP_Write` parses the FLV stream
+  itself: it skips a leading 13-byte "FLV" header write, reads one message
+  header per tag (so each tag must be a full message, not a chunk),
+  skips 4-byte PreviousTagSize after each tag, prepends `@setDataFrame` +
+  16 bytes to INFO messages, uses channel 0x04 and msid = stream id, and
+  returns `size-4` when a trailing PreviousTagSize is missing — our tags
+  always carry it so the size matches. The nginx-rtmp `codec: error
+  parsing data frame` line is benign (its codec module warns while
+  extracting metadata; relaying is unaffected).
 - `FallbackSource::label()` reports the *next* child's label the moment the
   current child exhausts (even on the current track's last pull), because
   it follows `active()`. Harmless for `on_metadata` (an event fires one
