@@ -51,7 +51,8 @@ fn first_video_spec(result: &ScriptResult) -> Option<crabsoup::video::VideoSpec>
 }
 
 fn main() -> crabsoup::Result<()> {
-    env_logger::init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("crabsoup=info"))
+        .init();
     let cli = Cli::parse();
     let Some(config_path) = &cli.config else {
         Cli::command().print_help()?;
