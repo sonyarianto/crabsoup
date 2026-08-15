@@ -25,6 +25,9 @@ j = jingles({directory = "./jingles"})
 
 -- Live DJ harbor (Icecast source protocol): DJs PUT to this mount and the
 -- playlist is ducked while they are live. The value composes as a marker.
+-- `extra_passwords = {"alice", "bob"}` adds per-streamer (DJ) passwords
+-- that all authenticate on the same mount alongside `password`; the control
+-- port's `status` reports `live: true|false` while a DJ is on air.
 live = input.harbor({host = "0.0.0.0", port = 8005,
                      mount = "/live", password = "dj"})
 

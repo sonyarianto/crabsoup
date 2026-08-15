@@ -201,11 +201,13 @@ value is sent back; a Lua error becomes an `ERROR: ...` reply.
 
 Prefix any command with `json ` for a machine-readable reply: a single line
 of JSON, `{"ok": true, ...}` on success and `{"ok": false, "error":
-"..."}` on failure (`json status` → `{"ok":true,"playing":"...","uptime_seconds":N}`,
+"..."}` on failure (`json status` →
+`{"ok":true,"playing":"...","uptime_seconds":N,"harbor_connected":bool}`,
 `json queue.list` → `{"ok":true,"queue":["...", ...]}`). The name
 `json` is reserved. Machine clients should also pass `banner = false` to
 `server.telnet` so the connection starts with replies, not the prose
-welcome line.
+welcome line. Plain-text `status` also shows live-DJ state as a
+`live: true|false` line (`harbor_connected` in JSON).
 
 `server.telnet({http_port = N})` serves the same command surface over
 HTTP on the same host: `GET /status`, `GET /uptime`, `GET /queue`,
@@ -243,7 +245,7 @@ phase).
 | one-shot jingles (`switch` + request scheduling) | `jingles({directory})` + telnet `jingles.play` | done |
 | `request.queue` + telnet `queue.push` | done |
 | `switch` (dayparting), `rotate` | `switch({ {when = {days, from, to}, src = ...}, {src = default} })`, `rotate({...}, {weights = ...})` | done |
-| `on_metadata` / `on_track` | `on_metadata(fn, src)` (title table), `on_track(fn, src)` (boundary, no args) | done |
+| `on_metadata` / `on_track` | `on_metadata(src, fn)` (title table), `on_track(src, fn)` (boundary, no args) | done |
 | `http://` / `https://` request resolution | `single("http(s)://...")`, `playlist(entries)`, `queue.push <url>` — download-then-play with retry/timeout, temp files auto-removed; HTTPS via rustls (redirects may cross scheme) | done |
 | `server.register` custom telnet commands | `server.register("name", function(args) return reply end)` | done |
 | `mksafe(src)` (never fails outright; silence fallback) | `mksafe(src)` — composes `fallback({src, blank()})` | done |

@@ -92,13 +92,20 @@ The live DJ harbor — an Icecast source-protocol listener:
 
 ```lua
 live = input.harbor({host = "0.0.0.0", port = 8005,
-                     mount = "/live", password = "dj"})
+                     mount = "/live", password = "dj",
+                     extra_passwords = {"alice", "bob"}})
 ```
 
 DJs `PUT` their stream to this mount; the playlist ducks out while they are
 live and fades back in on disconnect. MP3/Vorbis/AAC uploads decode via
 symphonia; Opus takes the native decode path. The value composes as a marker
 in `fallback`.
+
+`extra_passwords` (optional) adds per-streamer accounts: any password in
+the list authenticates on the shared mount alongside `password`, so each DJ
+can have their own credentials. The on-air state is visible on the [control
+port](/guide/control-port) — `status` shows `live: true|false` and
+`json status` adds `"harbor_connected"`.
 
 ## `input.soundcard({device})`
 

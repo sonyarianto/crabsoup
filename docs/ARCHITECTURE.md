@@ -33,11 +33,12 @@ One engine thread plus one thread per output:
 
 - Registers the Liquidsoap-flavoured Lua stdlib: `playlist`,
   `smart_crossfade`, `single`, `blank` (+ `blank.detect`), `sine`,
-  `amplify`, `compress`, `normalize`, `pipe`, `jingles`,
+  `amplify`, `compress`, `normalize`, `replaygain`, `pipe`, `jingles`,
   `fallback`/`sequence`/`random`, `switch`, `rotate`, `mksafe`, `add`,
-  `cue_cut`, `map_metadata`, `input.harbor`, `input.soundcard`,
-  `output.icecast`, `output.file`, `output.preview`, `output.soundcard`,
-  `server.telnet`, `on_metadata`, `on_track`, `set`, `log`.
+  `cue_cut`, `map_metadata`, `request.queue`, `request.dynamic`,
+  `input.harbor`, `input.soundcard`, `output.icecast`, `output.file`,
+  `output.preview`, `output.soundcard`, `output.hls`, `server.telnet`,
+  `server.register`, `on_metadata`, `on_track`, `http_post`, `set`, `log`.
 - `blank` is a *callable table* (a `__call` metamethod) so it can carry
   `blank.detect`; Lua calls a table's `__call` as `f(self, args...)`, so
   the closure takes a leading `_self` parameter.
@@ -226,7 +227,8 @@ One engine thread plus one thread per output:
   (trait default no-op; `CrossfadeMixer` advances); `Shutdown` makes
   `PriorityMixer` return 0/exhausted so every pump loop exits.
 - `StatusHandle` is the shared label/uptime cell the tap consumers update and
-  the telnet `status`/`uptime` read.
+  the telnet `status`/`uptime` read; it also owns the harbor's occupied
+  `Arc<AtomicBool>`, so `status`/`json status` report live-DJ on-air state.
 - `PriorityMixer` crossfades between `main` and an override with a gain ramp
   over `duck_seconds`; the override audio is `m*(1-gain) + o*gain`.
 - Both mixers keep reusable scratch `Vec<f32>` fields (sized on buffer-size
@@ -330,7 +332,12 @@ this is documented rather than automated):
 
 Decodes DJ uploads to target-spec PCM: MP3/Vorbis/AAC via symphonia, Opus via
 the native `OpusSource` path (symphonia 0.5 has no Opus codec) after
-sniffing the first Ogg page. The PCM crosses to the audio thread through a
+sniffing the first Ogg page. Auth is source-protocol Basic auth against the
+mount `password` or any per-streamer `extra_passwords` (all share the same
+mount). The harbor's `occupied` flag is a shared `Arc<AtomicBool>` owned by
+the `StatusHandle`, so the control port reports live-DJ state: telnet
+`status` prints a `live:` line and `json status` carries
+`harbor_connected`. The PCM crosses to the audio thread through a
 lock-free SPSC ring (`ringbuf::HeapRb`, sized at `2 * MAX_LIVE_FRAMES`):
 `LiveSink` (the decode thread) pushes with `push_slice`, `LiveSource` (the
 mixer) pops with `pop_slice` and enforces the 5 s drop-oldest latency cap by

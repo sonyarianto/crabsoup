@@ -465,8 +465,36 @@ practice).
       (216 -> 219): request-line parsing, case-insensitive Content-Length,
       and `http_route` (GETs, POST success/error, malformed bodies, 404/
       405, `exit` ack). `examples/control_api.py` is a worked
-      Crabcast-style backend (stdlib only) consuming both transports;
-      README + website control-port guide updated.
+       Crabcast-style backend (stdlib only) consuming both transports;
+       README + website control-port guide updated.
+- [x] C7 (outbound `http_post` webhook): `src/script.rs` — a global
+      `http_post(url, payload_table)` operator that POSTs the payload as
+      JSON to a fixed backend URL (Crabcast track-change events), fired
+      from an `on_metadata` callback. Fire-and-forget: the call spawns a
+      thread so the Lua event loop never blocks on the network; the payload
+      is a Lua table converted to JSON (`table_to_json`/`value_to_json` —
+      string/integer keys, string/number/boolean/table values, array-shaped
+      tables become JSON arrays; unsupported value types error), nested
+      tables included. `src/request.rs` — `http_post_json`: one-shot `POST`
+      of the JSON body reusing the `http_get` transport (http/https),
+      no redirects followed (a webhook target is a fixed URL), response
+      body discarded; non-2xx surfaces as an error. Failures log
+      (`http_post to {url} failed: ...`) rather than erroring the script.
+      Inline tests (219 -> 222): flat + nested + array table conversion,
+      unsupported-value rejection, POST body + 2xx accepted, non-2xx
+      reported. Signature fix: `on_metadata`/`on_track` take `(source,
+      callback)` — README + website updated.
+- [x] C8 (harbor per-streamer passwords + on-air status): `input.harbor`
+      gains `extra_passwords = {"dj2", ...}` — per-streamer (DJ) source
+      passwords that all authenticate on the shared mount alongside the
+      main `password` (Basic auth matches the mount password or any extra).
+      The harbor's occupied flag is now a shared `Arc<AtomicBool>` owned by
+      the status handle, so the control port can report live-DJ state:
+      telnet `status` adds a `live: true|false` line and `json status`
+      adds `"harbor_connected": true|false` for a control consumer to show
+      when a DJ is on air. Inline tests (222 -> 224): extra passwords
+      accepted for auth alongside the mount password. README + website
+      control-port guide updated.
 - [x] Part F3 (`map_metadata`): `src/script.rs` — `MapMetadataSource` wraps
       a child and rewrites its label through a Lua callback (Liquidsoap
       `map_metadata`). On a label change (even to none, so scripts can add
