@@ -1,5 +1,8 @@
 # Crabsoup
 
+[![Sponsor](https://img.shields.io/badge/Sponsor-GitHub%20Sponsors-ea4aaa.svg)](https://github.com/sponsors/sonyarianto)
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
+
 A Liquidsoap-inspired audio streaming engine in Rust: evaluates a `.lua`
 script (Liquidsoap-flavoured Lua) that builds a source graph, mixes in live DJ
 input and one-shot jingles with crossfades, and broadcasts the result (MP3 or
