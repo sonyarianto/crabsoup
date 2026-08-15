@@ -33,7 +33,8 @@ One engine thread plus one thread per output:
 
 - Registers the Liquidsoap-flavoured Lua stdlib: `playlist`,
   `smart_crossfade`, `single`, `blank` (+ `blank.detect`), `sine`,
-  `amplify`, `compress`, `normalize`, `replaygain`, `pipe`, `jingles`,
+  `amplify`, `compress`, `normalize`, `replaygain`, `stretch`, `pitch`,
+  `pipe`, `jingles`,
   `fallback`/`sequence`/`random`, `switch`, `rotate`, `mksafe`, `add`,
   `cue_cut`,   `map_metadata`, `request.queue`, `request.dynamic`,
   `input.harbor`, `input.soundcard`, `input.http`, `output.icecast`,
@@ -198,6 +199,29 @@ One engine thread plus one thread per output:
   `normalize(replaygain(src))` feeds AGC the RG baseline; `replaygain`
   logs `replaygain: track gain {raw:.1} dB (applying {gain:.1} dB)` on
   change.
+
+## Pitch / tempo (`src/engine/pitch.rs`)
+
+- `stretch({ratio = 1.0}, src)` and `pitch({semitones = 0.0}, src)` wrap the
+  child in a `PitchSource` over pure-Rust `wsola` 0.1.0 (no C, no system
+  dependency; Part I1's bench decided it over a `soundtouch-sys` FFI path —
+  the per-buffer FFI proxy row is ~0.2 µs vs ~17–29 ms of WSOLA DSP). `ratio`
+  must be a positive finite number; `semitones` finite.
+- Tempo is a straight WSOLA stretch (`set_tempo(ratio)`), preserving pitch.
+- Pitch composes two legs to preserve duration: a WSOLA stretch by
+  `1 / 2^(s/12)` (slower to raise, faster to lower), then a `SincResampler`
+  step of `2^(s/12)` restoring the length. The resample step is derived from
+  the *read-back* clamped tempo (`1 / stretch.tempo()`), so the legs undo
+  each other exactly even at the WSOLA clamp limits.
+- `TimeStretch::pull` allocates a fresh `Vec` per call; `PitchSource` reuses
+  it via the `pending` buffer so the pull chain stays allocation-free in
+  steady state. Child buffers are pre-folded into `feedbuf` to be
+  frame-aligned for `push`; a `carry` keeps a trailing partial frame.
+- `remaining_seconds()` scales the child's by `1 / tempo` (the read-back
+  value), so crossfade preload timing stays correct for stretched tracks;
+  `label`, `replaygain_db`, `crossfade_overrides`, and `skip` forward to the
+  child. At child EOF the stretch flush tail is drained before `is_exhausted`
+  reports true.
 
 ## Mixer control (`src/engine/mixer.rs`)
 
@@ -541,6 +565,11 @@ Video is a parallel side-channel to the PCM bus, compiled out by default
   until read that way. `playlist`'s `loop` had the same latent bug
   (documented default true, actual default false) until it was read the
   same way; the `video.playlist` marker test caught it.
+- Pitch/tempo (Part I1): the pitch leg is a *two-stage* composition — WSOLA
+  stretch by `1/p` then resample step `p` (both restore the duration; either
+  leg alone inverts the effect). The resample step must come from the
+  read-back clamped tempo, not the requested factor, or clamped semitones
+  drift off the ideal pitch/duration; the octave-up/down unit tests guard it.
 - The `on_metadata` closure stays in the Lua registry for the process
   lifetime, keeping its channel `Sender` alive: the event loop can never wait
   for channel disconnection, so it polls `recv_timeout` and exits on the

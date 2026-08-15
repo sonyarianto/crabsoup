@@ -2,6 +2,8 @@
 --
 -- Exercises the Phase 2 effect operators end-to-end on a synthetic tone,
 -- no media files needed. Broadcast as `tone-dsp` or preview locally.
+-- `pitch`/`stretch` (Part I1, pure-Rust wsola) are shown in the alternate
+-- chains below — uncomment to exercise them.
 --
 -- Run: ./target/release/crabsoup -c examples/crabsoup.dsp.lua --preview
 
@@ -19,6 +21,9 @@ tone = sine({freq = 440, duration = 60, amplitude = 1.0})
 tone = compress(tone, {threshold = -12, ratio = 3, attack = 0.005, release = 0.1})
 tone = normalize(tone, {target = -6, attack = 3, release = 0.5})
 tone = amplify(tone, 0.9)
+
+-- tone = pitch(tone, {semitones = -2})   -- key down a whole tone
+-- tone = stretch(tone, {ratio = 1.25})   -- 25 % faster, pitch intact
 
 output.icecast({host = "localhost", port = 8000,
                 mount = "/tone-dsp.mp3", format = "mp3", bitrate = 128000,

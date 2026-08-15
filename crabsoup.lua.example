@@ -20,6 +20,13 @@ set("duck_seconds", 1.5)         -- fade time into/out of a live DJ
 -- Local media playback: recursively scanned directory and/or explicit files.
 pl = playlist({directory = "./media", shuffle = false, loop = true})
 
+-- DSP effects chain (each wraps the previous stage):
+--   stretch({ratio = 1.5}, src)     tempo change, pitch preserved
+--   pitch({semitones = 7}, src)     key shift, duration preserved
+--   amplify(src, gain); compress(src, opts); normalize(src, opts);
+--   replaygain(src);   -- see examples/crabsoup.dsp.lua for a full chain
+-- pl = normalize(pl, {target = -13, attack = 3, release = 0.5})
+
 -- One-shot jingles, playable from the telnet control port (`jingles.play`).
 j = jingles({directory = "./jingles"})
 

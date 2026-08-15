@@ -17,6 +17,7 @@ use symphonia::core::audio::{Channels, SignalSpec};
 use crabsoup::config::MixerConfig;
 use crabsoup::engine::effects::{Agc, Amplify, Compressor, EffectSource};
 use crabsoup::engine::mixer::{CrossfadeMixer, PriorityMixer, SmartFade};
+use crabsoup::engine::pitch::{PitchMode, PitchSource};
 use crabsoup::output::encoder::{AacEncoder, Encoder, Mp3Encoder, OpusEncoder};
 use crabsoup::resample::SincResampler;
 use crabsoup::source::{AudioSource, SineSource, SourceProvider};
@@ -259,6 +260,53 @@ fn effects(c: &mut Criterion) {
     });
 }
 
+/// One foreign call per 4096-frame buffer — the per-buffer boundary cost the
+/// SoundTouch-via-FFI option (Part I1) would pay, measured with a no-op.
+mod ffi_noop {
+    #[cfg(unix)]
+    unsafe extern "C" {
+        #[link_name = "getpid"]
+        fn getpid() -> i32;
+    }
+    pub fn call() -> i32 {
+        #[cfg(unix)]
+        unsafe {
+            getpid()
+        }
+        #[cfg(not(unix))]
+        {
+            0
+        }
+    }
+}
+
+fn pitch(c: &mut Criterion) {
+    let mut group = c.benchmark_group("pitch");
+    group.throughput(Throughput::Elements(BUF as u64));
+
+    group.bench_function("ffi/noop_per_buffer", |b| {
+        b.iter(|| {
+            black_box(ffi_noop::call());
+        });
+    });
+
+    for (name, mode) in [
+        ("stretch/tempo_1.0", PitchMode::Tempo(1.0)),
+        ("stretch/tempo_1.5", PitchMode::Tempo(1.5)),
+        ("pitch/+7_semitones", PitchMode::Semitones(7.0)),
+    ] {
+        group.bench_function(name, |b| {
+            let child: Box<dyn AudioSource> = Box::new(ConstSource::new(0.2, None));
+            let mut src = PitchSource::new(child, mode, RATE, CHANS).unwrap();
+            let mut buf = vec![0.0f32; BUF];
+            b.iter(|| {
+                src.next_buffer(&mut buf);
+                black_box(&buf);
+            });
+        });
+    }
+}
+
 fn resampler(c: &mut Criterion) {
     let mut group = c.benchmark_group("resampler");
     group.throughput(Throughput::Elements(BUF as u64));
@@ -370,6 +418,7 @@ criterion::criterion_group!(
     smart_crossfade,
     live_handoff,
     effects,
+    pitch,
     resampler,
     encode
 );

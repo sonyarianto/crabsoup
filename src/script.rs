@@ -43,6 +43,7 @@ use crate::config::{
 use crate::config::{collect_images, collect_video};
 use crate::engine::effects::{Agc, Amplify, Compressor, EffectSource};
 use crate::engine::mixer::{CrossfadeMixer, SmartFade};
+use crate::engine::pitch::{PitchMode, PitchSource};
 use crate::request::{RequestConfig, RequestUri, TrackCues, resolve};
 use crate::source::blank_detect::{BlankDetectConfig, BlankDetectSource};
 use crate::source::cue_cut::CueCutSource;
@@ -2101,6 +2102,52 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
                 fx,
                 spec.channels.count(),
             ))))
+        })?,
+    )?;
+
+    let pitch_state = state.clone();
+    globals.set(
+        "stretch",
+        lua.create_function(move |_, (mut source, opts): (LuaSource, Option<Table>)| {
+            let ratio = opt_f64(&opts, "ratio", 1.0)?;
+            if !ratio.is_finite() || ratio <= 0.0 {
+                return Err(mlua::Error::runtime(
+                    "stretch: ratio must be a positive finite number",
+                ));
+            }
+            let (spec, _) = bus(&pitch_state);
+            let child = source.take();
+            let src = PitchSource::new(
+                child,
+                PitchMode::Tempo(ratio as f32),
+                spec.rate,
+                spec.channels.count(),
+            )
+            .map_err(mlua::Error::runtime)?;
+            Ok(LuaSource::new(Box::new(src)))
+        })?,
+    )?;
+
+    let pitch2_state = state.clone();
+    globals.set(
+        "pitch",
+        lua.create_function(move |_, (mut source, opts): (LuaSource, Option<Table>)| {
+            let semitones = opt_f64(&opts, "semitones", 0.0)?;
+            if !semitones.is_finite() {
+                return Err(mlua::Error::runtime(
+                    "pitch: semitones must be a finite number",
+                ));
+            }
+            let (spec, _) = bus(&pitch2_state);
+            let child = source.take();
+            let src = PitchSource::new(
+                child,
+                PitchMode::Semitones(semitones as f32),
+                spec.rate,
+                spec.channels.count(),
+            )
+            .map_err(mlua::Error::runtime)?;
+            Ok(LuaSource::new(Box::new(src)))
         })?,
     )?;
 
@@ -4586,6 +4633,72 @@ mod tests {
         // 0.02 is -34 dB; reaching -6 needs +28 dB, clamped to the 20 dB
         // max boost: 0.02 * 10 = 0.2.
         assert!((peak - 0.2).abs() < 0.01, "normalized peak {peak}");
+    }
+
+    #[test]
+    fn stretch_speeds_up_a_tone_without_changing_pitch() {
+        let (_rt, res) = run(r#"
+            output.preview(stretch(sine({freq = 440, duration = 1}), {ratio = 2}))
+            "#)
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        let mut total = 0usize;
+        let mut crossings = 0usize;
+        let mut prev = 0.0f32;
+        while !root.is_exhausted() {
+            let n = root.next_buffer(&mut buf);
+            for &s in &buf[..n] {
+                if (prev >= 0.0) != (s >= 0.0) {
+                    crossings += 1;
+                }
+                prev = s;
+            }
+            total += n;
+        }
+        // 1 s in at 2x -> ~0.5 s out (stereo samples).
+        let secs = total as f64 / 44_100.0 / 2.0;
+        assert!(secs > 0.4 && secs < 0.6, "stretched duration {secs}");
+        // Pitch preserved: 440 Hz over the compressed span.
+        let hz = crossings as f64 / 2.0 / secs;
+        assert!((hz - 440.0).abs() < 20.0, "measured {hz} Hz");
+    }
+
+    #[test]
+    fn pitch_shifts_up_without_changing_duration() {
+        let (_rt, res) = run(r#"
+            output.preview(pitch(sine({freq = 440, duration = 1}), {semitones = 12}))
+            "#)
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        let mut total = 0usize;
+        let mut crossings = 0usize;
+        let mut prev = 0.0f32;
+        while !root.is_exhausted() {
+            let n = root.next_buffer(&mut buf);
+            for &s in &buf[..n] {
+                if (prev >= 0.0) != (s >= 0.0) {
+                    crossings += 1;
+                }
+                prev = s;
+            }
+            total += n;
+        }
+        let secs = total as f64 / 44_100.0 / 2.0;
+        assert!((secs - 1.0).abs() < 0.2, "duration {secs}");
+        // +12 semitones = one octave up.
+        let hz = crossings as f64 / 2.0 / secs;
+        assert!((hz - 880.0).abs() < 40.0, "measured {hz} Hz");
+    }
+
+    #[test]
+    fn stretch_rejects_nonpositive_ratio() {
+        let err = match run(r#"output.preview(stretch(sine({}), {ratio = 0}))"#) {
+            Ok(_) => panic!("stretch ratio 0 must fail"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("ratio must be a positive"));
     }
 
     // ---- Phase 5: switch / rotate ----------------------------------------

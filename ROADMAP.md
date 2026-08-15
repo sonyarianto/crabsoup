@@ -127,6 +127,21 @@ rolling tail-level accumulation (sum of squares + VecDeque eviction) costs
 is statistically identical to the plain mixing row (107 µs) because the
 measurement pauses while a fade is in progress.
 
+Pitch/tempo rows (Part I1, recorded in the session that landed `stretch`/`pitch`):
+the `ffi/noop_per_buffer` row is one foreign call per 4096-frame buffer — the
+per-buffer boundary cost the SoundTouch-via-FFI option would pay — and it
+decides the Part I1 approach: ~0.2 µs is negligible next to the DSP itself, so
+pure-Rust `wsola` was chosen (no `libsoundtouch-dev` system dependency). WSOLA
+dominates: ~17 ms per 92.9 ms buffer at tempo 1.0/1.5, ~29 ms with the
+resample leg (+7 semitones).
+
+| benchmark | per 92.9 ms buffer | vs real-time |
+|---|---|---|
+| pitch/ffi/noop_per_buffer | 0.18 µs | 0.0002 % |
+| pitch/stretch/tempo_1.0 | 16.6 ms | 17.9 % |
+| pitch/stretch/tempo_1.5 | 17.0 ms | 18.3 % |
+| pitch/pitch/+7_semitones | 28.9 ms | 31.1 % |
+
 Video-path rows (Part H3, recorded in the session that landed the effects +
 bench group; per 640x360 YUV420P frame, budget = one 25 fps frame = 40 ms):
 
@@ -772,9 +787,19 @@ pull chain (one thread per output, allocation-free hot paths), each landing
 with inline tests and a bench row; FFI-backed DSP (SoundTouch, aubio) gets
 its own confined module per the Part H convention note.
 
-- [ ] **I1 — SoundTouch pitch/tempo**: `soundtouch-sys` FFI or a pure-Rust
+- [x] **I1 — SoundTouch pitch/tempo**: `soundtouch-sys` FFI or a pure-Rust
       alternative, benchmarked on the harness first (per-buffer FFI overhead
-      vs. in-process DSP decides).
+      vs. in-process DSP decides). Landed as `stretch({ratio})` and
+      `pitch({semitones})` script operators over a pure-Rust `wsola` 0.1.0
+      source (`src/engine/pitch.rs`): tempo is a straight WSOLA stretch;
+      pitch composes a WSOLA stretch by `1/2^(s/12)` with a `SincResampler`
+      step of `2^(s/12)` to restore the duration. Bench decided the
+      approach — the FFI proxy row is ~0.2 µs per buffer vs ~17–29 ms of
+      WSOLA DSP, so in-process pure-Rust won (no `libsoundtouch-dev` dep).
+      Inline tests (tempo 1.5 keeps ~440 Hz; ±12 semitones shifts to ~880 /
+      ~220 Hz at constant duration; finite sources exhaust cleanly; remaining
+      seconds scale with tempo) and script tests (stretch, pitch, ratio
+      validation) all green.
 - [ ] **I2 — echo/delay** (multi-tap), **I3 — convolution reverb** (IR
       files), **I4 — EQ/filters** (low/high-pass, parametric).
 - [ ] **I5 — stereo imaging** (`stereo.widen`, `stereo.pan`, mid-side),

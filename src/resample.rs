@@ -76,7 +76,15 @@ impl SincResampler {
     /// rate: positive yields fewer output samples per input sample (the
     /// soundcard bridges use it to absorb device-clock drift, Part G2).
     pub fn set_ppm(&mut self, ppm: f64) {
-        self.step_mult = 1.0 + ppm / 1_000_000.0;
+        self.set_step(1.0 + ppm / 1_000_000.0);
+    }
+
+    /// Set the resample step directly, as input frames per output frame:
+    /// `1.0` is same-rate, `> 1` downsamples, `< 1` upsamples. The `pitch`
+    /// leg of the `stretch`/`pitch` effects (Part I1) uses it for
+    /// fractional semitone factors, which no integer rate pair expresses.
+    pub fn set_step(&mut self, step: f64) {
+        self.step_mult = step;
     }
 
     /// The current PPM nudge (for tests).

@@ -46,6 +46,9 @@ mlua = { version = "0.10", default-features = false, features = ["lua54", "vendo
 # Video decode/mux/encode (Part H1): binds to the system FFmpeg via
 # pkg-config, so plain builds skip libav entirely.
 ffmpeg-next = { version = "7.1", optional = true }
+# Pitch-preserved time-stretch (WSOLA), pure Rust, no C — the Part I1
+# `stretch`/`pitch` effects (in-process DSP, no system dependency).
+wsola = "0.1"
 
 [features]
 # Video support (Part H): off by default so core builds stay libav-free.
