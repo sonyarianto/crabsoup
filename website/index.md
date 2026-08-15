@@ -4,7 +4,7 @@ layout: home
 hero:
   name: Crabsoup
   text: Streaming engine for audio, video, live DJ, and automation
-  tagline: "A scriptable streaming engine for audio and video: gapless playlists, crossfades, live DJ ducking, with support for Icecast, HLS, RTMP, MP4, and more."
+  tagline: "Scriptable using Lua, gapless playlists, crossfades, live DJ ducking, with support for Icecast, HLS, RTMP, MP4, and more."
   actions:
     - theme: brand
       text: Get started
