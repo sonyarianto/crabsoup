@@ -6,11 +6,13 @@ lives in `docs/ARCHITECTURE.md` in the repo.
 ## Pipeline
 
 ```
-Playlist -> CrossfadeMixer -> PriorityMixer -> EngineTap -> [Encoder -> Icecast]*
+root source (script graph, crossfades inside) -> PriorityMixer -> EngineTap -> [outputs]*
 ```
 
 via the native source-protocol client. The `.lua` script's root source (e.g.
-`fallback({j, live, pl})`) is that Playlist input; all sources are normalised
+`fallback({j, live, pl})`) is that root input; playlists/jingles carry their
+own `CrossfadeMixer` inside the script graph, and the engine wraps the root
+in a `PriorityMixer` for live/jingle ducking. All sources are normalised
 to the PCM bus (`set("sample_rate", ...)`, `set("channels", ...)`,
 `frames_per_buffer`).
 

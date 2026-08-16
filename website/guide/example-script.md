@@ -35,10 +35,10 @@ Named options are passed as Lua tables; most have defaults. `format` is
 4. `server.telnet` exposes the control port on 1234.
 5. The engine's **root source** is `fallback({j, live, pl})`: it switches to
    the first child that still has audio — jingles first, then a live DJ, then
-   the playlist. The root feeds a chain of `CrossfadeMixer -> PriorityMixer ->
-   Encoder -> Icecast`.
+   the playlist. The engine wraps it in a `PriorityMixer` and feeds a shared
+   tap that every output consumes.
 
-The script's root source becomes the crossfade+priority chain's input.
+The script's root source becomes the engine's input.
 `PriorityMixer` fades from the main source to an override (live DJ or jingle)
 over `duck_seconds`; a live DJ always wins over a jingle.
 
