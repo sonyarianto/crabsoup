@@ -20,10 +20,14 @@ features:
     details: Track-to-track overlap with configurable window and fade curve, plus a level-aware smart_crossfade that picks the window from the outgoing track's tail.
   - title: Live DJ ducking
     details: An Icecast source-protocol harbor (PUT /live). While a DJ is live the playlist ducks out, then fades back in on disconnect.
-  - title: One-shot jingles
-    details: Clips played over the music, triggered from a Liquidsoap-style telnet control port (jingles.play, jingles.list).
-  - title: Broadcast to Icecast
-    details: MP3 (LAME), Ogg/Opus (libopus + a built-in spec-correct Ogg muxer), and AAC/ADTS (fdk-aac) via a native source-protocol client.
+  - title: Jingles & control
+    details: One-shot clips over the music and a Liquidsoap-style control port — telnet or HTTP — for jingles.play, skip, status, queues and custom commands.
+  - title: Broadcast anywhere
+    details: Icecast, SHOUTcast, HLS, RTMP, MP4, file, or soundcard — one source graph, every output at once, fed from a shared tap.
+  - title: Video built in
+    details: video.video, video.playlist and video.slideshow sources with video.scale/video.fade effects, muxed as H.264 + AAC in the same script.
+  - title: Studio DSP
+    details: External processors via pipe (Stereo Tool, etc.), plus reverb, EQ, filters, vocalremover, replaygain, and pitch/stretch — all in the pull chain.
   - title: Dead-air safe
     details: blank.detect silence guarding with fallback handover, mksafe never-fails sources, and request queues with retry and timeout.
 ---
