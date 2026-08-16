@@ -106,6 +106,61 @@ Run both lists in the same order and the two sides stay in sync; a/v sync
 is held per-file by PTS at mux time, exactly as with a single `video.video`
 track.
 
+## Multi-rendition ABR (`renditions`)
+
+Fan the one tap into several encodes, each in its own subdirectory, tied
+together by a variant master playlist — the 64/128/320 set a live station
+serves so clients pick the rendition their bandwidth can carry. Audio
+renditions get their own AAC encode; add `video_bitrate` (and optionally
+`width`/`height`) for a rendition with its own H.264 encode, so one
+output serves the full resolution ladder:
+
+```lua
+vpl = video.playlist({directory = "./internal/media/video", loop = true})
+output.hls({
+    directory = "/var/www/hls",
+    video = vpl,
+    segment_seconds = 5,
+    renditions = {
+        {bitrate = 64000,  name = "64k"},
+        {bitrate = 128000, name = "128k"},
+        {bitrate = 320000, name = "320k"},
+        -- video ladder: rescale down for the low tier, keep source res
+        {bitrate = 64000,  video_bitrate = 500000,  width = 640,  height = 360},
+        {bitrate = 128000, video_bitrate = 1500000, width = 1280, height = 720},
+        {bitrate = 320000, video_bitrate = 3000000},
+    },
+}, root)
+```
+
+- Each rendition gets `<directory>/<name>/` with its own `playlist.m3u8`
+  and segments; `index.m3u8` lists one `#EXT-X-STREAM-INF` per rendition
+  (BANDWIDTH = bitrate + 10 % — audio+video combined when the rendition
+  has video — CODECS `mp4a.40.2` or `avc1.42401f,mp4a.40.2`, RESOLUTION
+  when video, NAME = the rendition name). Point clients at `index.m3u8`.
+  A rendition without an explicit `name` defaults to `<kbps>k`.
+- Video renditions need a video track in the source (a `video.video`
+  track, or a `video.playlist` feeding the same tap). A rendition with
+  `width`/`height` rescales the frames to that size (pure-Rust bilinear,
+  the same scaler the `scale` effect uses); one without them encodes at
+  the source resolution. `video_bitrate` defaults to 1.5 Mb/s.
+- Audio renditions work with or without a video track — the classic
+  `video = true` HLS stream (no `renditions`) keeps its single-variant
+  master as before.
+- `segment_name = "seg-{n}.ts"` (default) is a template — `{n}` is the
+  zero-padded sequence number, `{t}` the unix seconds of the segment's
+  start. Timestamped names: `segment_name = "seg-{t}-{n}.ts"`.
+- `persist_at = "/var/lib/crabsoup/hls-state.json"` makes runs resumable:
+  the next segment counter and retained window are written on every
+  rotation, so killing crabsoup mid-segment and restarting continues the
+  playlist (no renumbering, no gap/drift) instead of clearing the
+  directory. Delete the state file to force a fresh start.
+- `fallible = true` keeps the engine alive with silence when the source
+  exhausts (the root is wrapped in `fallback([root, blank()])`), so the
+  playlist stays live instead of ending with `#EXT-X-ENDLIST` — the
+  "station never goes off air" switch. Applies to every output sharing
+  the root.
+
 ## `output.hls` with video
 
 Pass any video source's marker to `output.hls` and the output becomes a

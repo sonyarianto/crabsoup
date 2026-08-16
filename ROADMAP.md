@@ -784,8 +784,8 @@ is a 5x rate but a small perceptual step), yet still the standard way to
 cover weak networks without degrading good ones.
 
 Backlog candidates (acceptance sketched, sized for the Phase 2/3
-window of Parts I–K). G3.1–G3.8 are resolved (done or cancelled — see
-Done section); **G3.3 is the only remaining candidate.**
+window of Parts I–K). **G3.1–G3.8 are all resolved** (done or cancelled
+— see Done section).
 - [x] **G3.1 — playlist source watch-reload (file *and* directory).**
       The playlist's list of tracks is read once at script start; a
       running station cannot pick up changes without a restart. Two
@@ -819,15 +819,17 @@ Done section); **G3.3 is the only remaining candidate.**
       both crossfade and queue paths. — **done**: `AudioSource::next_label`
       (crossfade preload and the next queued request), `on_next_metadata`
       registering a wrapper that fires on label change (see Done section).
-- [ ] **G3.3 — multi-rendition HLS + variant master playlist** (the last
+- [x] **G3.3 — multi-rendition HLS + variant master playlist** (the last
       open G3 candidate).
       `output.hls({renditions = {{bitrate = 64000, ...}, ...}, ...})`
       fanning one tap into N AAC encodes and emitting a master `m3u8`
       (EXT-X-MEDIA / EXT-X-STREAM-INF) alongside the per-rendition
       playlists; optionally custom `segment_name` and `persist_at`
-      (segment counters + unfinished-segment list, so a restart resumes
+      (segment counters + retained-window list, so a restart resumes
       cleanly) and `fallible = true` (silence while the source is
-      exhausted instead of failing the output). Acceptance: ffprobe reads
+      exhausted instead of failing the output). — **done**: see the Done
+      (cont.) landing note below.
+      Acceptance: ffprobe reads
       the master playlist and decodes a window of each rendition; killing
       crabsoup mid-segment and restarting produces a playlist without
       gap/drift.
@@ -1350,6 +1352,58 @@ API reference + 5 tutorials; ≥100 stars and ≥20 contributors; green CI +
 load tests + fuzzing.
 
 ## Done (cont.)
+- [x] G3.3 (multi-rendition HLS + variant master playlist): the last open
+      G3 backlog candidate. `output.hls` now accepts
+      `renditions = {{bitrate = 64000, name = "64k"}, ...}` — one AAC
+      encoder + segment window per entry, each in its own subdirectory
+      (`<directory>/<name>/playlist.m3u8` + segments), tied together by a
+      variant master playlist `index.m3u8` (one `#EXT-X-STREAM-INF` per
+      rendition: BANDWIDTH = bitrate + 10 % container overhead,
+      CODECS = `mp4a.40.2`, NAME = the rendition name). `segment_name` is
+      now a template — `{n}` = zero-padded sequence, `{t}` = unix seconds
+      of the segment's start (default `seg-{n}.ts`, byte-identical to the
+      old names); validated at script evaluation (must contain `{n}` and
+      end in `.ts`). `persist_at = path` writes a JSON state file (per-
+      rendition next segment counter + retained window, temp-file + rename
+      so a kill never leaves a partial state) on every segment rotation;
+      connect() resumes from it instead of clearing the directory —
+      numbering continues at last+1 and the on-disk window is preserved,
+      so a kill mid-segment and restart produces a playlist without
+      renumbering/gap/drift (orphan segment files outside the retained
+      window are pruned, live playlists rebuilt). `fallible = true` wraps
+      the shared root in `fallback([root, blank()])` at script assembly
+      (the mksafe shape), so when the source exhausts the engine keeps
+      running and the HLS output keeps writing silence segments instead of
+      finalizing with `#EXT-X-ENDLIST` — the "station never goes off air"
+      semantic, applied to every output sharing the root.
+      Renditions support video: each rendition can set `video_bitrate`
+      and `width`/`height` (e.g. `{bitrate = 128000, video_bitrate =
+      1500000, width = 1280, height = 720}`) for its own H.264 encode —
+      the master playlist then carries per-rendition `RESOLUTION` and
+      `CODECS="avc1.42401f,mp4a.40.2"` with BANDWIDTH = (audio +
+      video bitrate) + 10 %. A rendition with `width`/`height` rescales
+      the tap frames with the pure-Rust bilinear `scale_frame` (also
+      used by the `scale` effect); one leaving them unset encodes at the
+      source resolution. The HLS output was restructured around a
+      per-rendition `Rendition` (own encoder, own PTS timeline, window,
+      playlist, optional scaled `VideoTrack`) with the rotation/
+      playlist/persist logic as free functions; the classic single
+      stream is one rendition with an empty subdir, and the video
+      output subscribes to the tap once per rendition. Acceptance met: inline
+      tests (multi-rendition playlists + master with ffprobe resolving
+      the master and decoding a window of each rendition, custom
+      `{t}`-template segment names referenced by the playlist, persist
+      resume — run 1's last segment survives, numbering continues at
+      last+1, no duplicate names, media sequence = window start) and
+      script tests (renditions/`segment_name`/`persist_at`/`fallible`
+      parsing + defaults, bitrate/duplicate-name/template validation
+      errors, fallible keeps the finite root alive past exhaustion while
+      a non-fallible root exhausts normally; video renditions: master
+      RESOLUTION/CODECS + combined bandwidth, each rendition's segments
+      decode h264+aac (the scaled one at its target resolution, the
+      passthrough at source), script parses `video_bitrate`/`width`/
+      `height` with defaults). 361 tests pass, clippy clean, release
+      build green; 400 with the `video` feature.
 - [x] Part G1 (`input.http` relay/pull-stream source): a network thread
       `GET`s the relay URL and decodes the live body into an SPSC ring
       (the harbor's ringbuf bridge — no new concurrency primitive), so the

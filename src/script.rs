@@ -36,8 +36,9 @@ use rand::{Rng, SeedableRng};
 use symphonia::core::audio::SignalSpec;
 
 use crate::config::{
-    AacProfile, ControlConfig, FileOutputConfig, HlsOutputConfig, LiveConfig, MixerConfig,
-    OutputConfig, OutputFormat, OutputProtocol, SoundcardOutputConfig, StreamConfig, collect_audio,
+    AacProfile, ControlConfig, FileOutputConfig, HlsOutputConfig, HlsRendition, LiveConfig,
+    MixerConfig, OutputConfig, OutputFormat, OutputProtocol, SoundcardOutputConfig, StreamConfig,
+    collect_audio,
 };
 #[cfg(feature = "video")]
 use crate::config::{collect_images, collect_video};
@@ -3301,11 +3302,80 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
                     ));
                 }
             }
+            // Multi-rendition ABR (G3.3): one encoder + subdirectory per
+            // entry, tied together by a variant master playlist. With a
+            // `video = marker` each rendition also gets its own H.264 encode
+            // at its own resolution/bitrate.
+            let renditions: Vec<Table> = opts
+                .get::<Option<Vec<Table>>>("renditions")?
+                .unwrap_or_default();
+            let mut parsed_renditions = Vec::new();
+            let mut names: Vec<String> = Vec::new();
+            for r in &renditions {
+                let bitrate: u32 = r.get("bitrate").map_err(|_| {
+                    mlua::Error::runtime("output.hls: every rendition needs a bitrate")
+                })?;
+                if bitrate == 0 {
+                    return Err(mlua::Error::runtime(
+                        "output.hls: rendition bitrate must be > 0",
+                    ));
+                }
+                let name: String = r
+                    .get("name")
+                    .unwrap_or_else(|_| format!("{}k", bitrate / 1000));
+                if name.is_empty()
+                    || name.contains('/')
+                    || name.contains('\\')
+                    || name == ".."
+                {
+                    return Err(mlua::Error::runtime(format!(
+                        "output.hls: rendition name {name:?} must be a plain directory name"
+                    )));
+                }
+                if names.contains(&name) {
+                    return Err(mlua::Error::runtime(format!(
+                        "output.hls: duplicate rendition name {name:?}"
+                    )));
+                }
+                names.push(name.clone());
+                let width: Option<u32> = r.get("width")?;
+                let height: Option<u32> = r.get("height")?;
+                if width.is_some() != height.is_some() {
+                    return Err(mlua::Error::runtime(format!(
+                        "output.hls: rendition {name:?} sets width and height together"
+                    )));
+                }
+                if width == Some(0) || height == Some(0) {
+                    return Err(mlua::Error::runtime(format!(
+                        "output.hls: rendition {name:?} resolution must be > 0"
+                    )));
+                }
+                let video_bitrate: u64 = r.get("video_bitrate").unwrap_or(1_500_000);
+                parsed_renditions.push(HlsRendition {
+                    name,
+                    bitrate,
+                    video_bitrate,
+                    width,
+                    height,
+                });
+            }
+            let segment_name: String = opts
+                .get("segment_name")
+                .unwrap_or_else(|_| "seg-{n}.ts".into());
+            if !segment_name.contains("{n}") || !segment_name.ends_with(".ts") {
+                return Err(mlua::Error::runtime(
+                    "output.hls: segment_name must contain {n} and end in .ts (e.g. \"seg-{n}.ts\")",
+                ));
+            }
             let cfg = HlsOutputConfig {
                 directory: directory.into(),
                 segment_seconds: opts.get("segment_seconds").unwrap_or(5.0),
                 retention: opts.get("retention").unwrap_or(12),
                 video: has_video,
+                renditions: parsed_renditions,
+                segment_name,
+                persist_at: opts.get::<Option<String>>("persist_at")?.map(PathBuf::from),
+                fallible: opts.get("fallible").unwrap_or(false),
             };
             let mut s = hls_state.borrow_mut();
             claim_root(&mut s, &mut source)?;
@@ -3498,6 +3568,21 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
     lua.load(src).set_name("crabsoup.lua").exec()?;
 
     let mut s = state.borrow_mut();
+    // `output.hls({fallible = true})` (G3.3): keep the engine alive with
+    // silence when the source exhausts instead of ending the stream — wrap
+    // the shared root in fallback([root, blank()]) (the mksafe shape) so the
+    // tap never ends. Applies to every output sharing the root, which is the
+    // point: a station whose source dies keeps broadcasting dead air rather
+    // than going off air.
+    if s.hls_outputs.iter().any(|o| o.fallible)
+        && let Some(root) = s.root.take()
+    {
+        let root_src = LuaSource::new(root);
+        s.root = Some(Box::new(FallbackSource::new(vec![
+            root_src,
+            LuaSource::new(Box::new(BlankSource::new())),
+        ])));
+    }
     let result = ScriptResult {
         stream: s.stream.clone(),
         mixer: s.mixer.clone(),
@@ -5540,6 +5625,50 @@ mod tests {
         );
         assert_eq!(res.hls_outputs[0].segment_seconds, 5.0);
         assert_eq!(res.hls_outputs[0].retention, 12);
+        assert!(res.hls_outputs[0].renditions.is_empty());
+        assert_eq!(res.hls_outputs[0].segment_name, "seg-{n}.ts");
+        assert!(res.hls_outputs[0].persist_at.is_none());
+        assert!(!res.hls_outputs[0].fallible);
+    }
+
+    #[test]
+    fn hls_output_parses_renditions_and_options() {
+        let (_rt, res) = run(r#"
+            output.hls({
+                directory = "/tmp/crabsoup-hls-abr",
+                segment_seconds = 2,
+                retention = 6,
+                segment_name = "chunk-{n}.ts",
+                persist_at = "/tmp/crabsoup-hls-state.json",
+                fallible = true,
+                renditions = {
+                    {bitrate = 64000, name = "64k"},
+                    {bitrate = 128000},
+                    {bitrate = 320000, video_bitrate = 1500000,
+                     width = 1280, height = 720},
+                },
+            }, sine({freq = 440}))
+            "#)
+        .expect("script runs");
+        let cfg = &res.hls_outputs[0];
+        assert_eq!(cfg.segment_seconds, 2.0);
+        assert_eq!(cfg.retention, 6);
+        assert_eq!(cfg.segment_name, "chunk-{n}.ts");
+        assert_eq!(
+            cfg.persist_at.as_deref(),
+            Some(std::path::Path::new("/tmp/crabsoup-hls-state.json"))
+        );
+        assert!(cfg.fallible, "fallible parsed");
+        assert_eq!(cfg.renditions.len(), 3);
+        assert_eq!(cfg.renditions[0].name, "64k");
+        assert_eq!(cfg.renditions[0].bitrate, 64_000);
+        assert_eq!(cfg.renditions[0].video_bitrate, 1_500_000, "video_bitrate default");
+        assert_eq!(cfg.renditions[1].name, "128k", "name defaults to bitrate/1000");
+        assert_eq!(cfg.renditions[1].bitrate, 128_000);
+        assert_eq!(cfg.renditions[2].video_bitrate, 1_500_000);
+        assert_eq!(cfg.renditions[2].width, Some(1280));
+        assert_eq!(cfg.renditions[2].height, Some(720));
+        assert!(res.root.is_some(), "root wrapped by fallible");
     }
 
     #[test]
@@ -5552,6 +5681,110 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("directory is required"));
+    }
+
+    #[test]
+    fn hls_rendition_validation_errors() {
+        let err = match run(r#"
+            output.hls({directory = "/tmp/x", renditions = {{}}}, sine({freq = 440}))
+            "#)
+        {
+            Ok(_) => panic!("rendition without bitrate must fail"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("needs a bitrate"));
+
+        let err = match run(r#"
+            output.hls({directory = "/tmp/x", renditions = {
+                {bitrate = 64000, name = "a"},
+                {bitrate = 128000, name = "a"},
+            }}, sine({freq = 440}))
+            "#)
+        {
+            Ok(_) => panic!("duplicate rendition names must fail"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("duplicate rendition name"));
+
+        let err = match run(r#"
+            output.hls({directory = "/tmp/x", segment_name = "seg.ts"}, sine({freq = 440}))
+            "#)
+        {
+            Ok(_) => panic!("segment_name without {{n}} must fail"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("segment_name must contain {n}"));
+
+        let err = match run(r#"
+            output.hls({directory = "/tmp/x", segment_name = "seg-{n}"}, sine({freq = 440}))
+            "#)
+        {
+            Ok(_) => panic!("segment_name without .ts must fail"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("end in .ts"));
+
+        let err = match run(r#"
+            output.hls({directory = "/tmp/x", renditions = {
+                {bitrate = 64000, width = 1280},
+            }}, sine({freq = 440}))
+            "#)
+        {
+            Ok(_) => panic!("width without height must fail"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("width and height together"));
+
+        let err = match run(r#"
+            output.hls({directory = "/tmp/x", renditions = {
+                {bitrate = 64000, width = 0, height = 720},
+            }}, sine({freq = 440}))
+            "#)
+        {
+            Ok(_) => panic!("zero resolution must fail"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("resolution must be > 0"));
+    }
+
+    #[test]
+    fn hls_fallible_keeps_the_engine_alive() {
+        let (_rt, res) = run(r#"
+            output.hls({directory = "/tmp/hls-fallible", fallible = true},
+                       sine({freq = 440, duration = 0.3}))
+            "#)
+        .expect("script runs");
+        let mut root = res.root.expect("root");
+        // 0.3 s at 44.1 kHz is ~13k frames; pull far past it: the fallback
+        // must hand over to the blank child instead of exhausting.
+        let mut buf = vec![0f32; 4096];
+        let mut total = 0usize;
+        for _ in 0..50 {
+            let n = root.next_buffer(&mut buf);
+            total += n;
+            if root.is_exhausted() {
+                break;
+            }
+        }
+        assert!(!root.is_exhausted(), "fallible root must never exhaust");
+        assert!(
+            total > 30_000,
+            "expected silence past the finite source, got {total}"
+        );
+    }
+
+    #[test]
+    fn hls_without_fallible_exhausts_normally() {
+        let (_rt, res) = run(r#"
+            output.hls({directory = "/tmp/hls-finite"}, sine({freq = 440, duration = 0.3}))
+            "#)
+        .expect("script runs");
+        let mut root = res.root.expect("root");
+        let mut buf = vec![0f32; 4096];
+        for _ in 0..50 {
+            root.next_buffer(&mut buf);
+        }
+        assert!(root.is_exhausted(), "finite root without fallible must exhaust");
     }
 
     #[cfg(feature = "video")]

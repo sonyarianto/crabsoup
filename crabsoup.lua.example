@@ -145,6 +145,27 @@ output.icecast({host = "localhost", port = 8000,
 -- Decode + mix locally without broadcasting (instead of output.icecast):
 -- output.preview(fallback({j, live, pl}))
 
+-- Audio ABR (plain build): one tap fanned into several AAC encodes,
+-- each in its own subdirectory, tied together by the variant master
+-- `index.m3u8` (one #EXT-X-STREAM-INF per rendition). `persist_at` makes
+-- restarts resume the playlist (no renumbering/gap); `fallible = true`
+-- keeps the engine alive with silence when the source exhausts. With a
+-- video build, add `video_bitrate`/`width`/`height` per rendition for
+-- its own H.264 encode (RESOLUTION lands in the master playlist).
+-- output.hls({directory = "/var/www/hls", segment_seconds = 5,
+--             renditions = {
+--                 {bitrate = 64000, name = "64k"},
+--                 {bitrate = 128000, name = "128k"},
+--                 {bitrate = 320000, name = "320k"},
+--                 -- video ladder (--features video):
+--                 {bitrate = 128000, video_bitrate = 1500000,
+--                  width = 1280, height = 720},
+--             },
+--             segment_name = "seg-{t}-{n}.ts",
+--             persist_at = "/var/lib/crabsoup/hls-state.json",
+--             fallible = true},
+--            fallback({j, live, pl}))
+
 -- HLS(video) instead of a broadcast (video build only:
 -- `cargo build --release --features video`): the audio side of each file
 -- flows through the normal audio graph, the video side rides its own

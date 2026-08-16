@@ -73,6 +73,12 @@ Per-format test scripts live in `examples/`:
 The last three need a feature build (`--features video`, `--features rtmp,video`).
 Audio-only HLS (`output.hls({directory = ...}, src)` without `video = ...`)
 works on a plain build; only the `video = marker` option needs `--features video`.
+Audio ABR (`renditions = {{bitrate = 64000}, ...}` — several encodes + a
+variant `index.m3u8` master), custom `segment_name` templates, `persist_at`
+resume state, and `fallible = true` all work on a plain build too; with
+`--features video` each rendition can add `video_bitrate`/`width`/`height`
+for its own H.264 encode and the master carries per-rendition
+`RESOLUTION` (see `website/guide/video.md`).
 RTMP and MP4 always need their feature builds, even audio-only (librtmp / FFmpeg
 muxer).
 

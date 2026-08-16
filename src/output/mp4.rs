@@ -12,7 +12,7 @@
 //! `unsafe` for FFI.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 use ffmpeg::codec::packet::Flags;

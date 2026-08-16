@@ -230,7 +230,9 @@ fn main() -> crabsoup::Result<()> {
             })?;
             let spec = first_video_spec(&result)
                 .ok_or_else(|| "output.hls video track has no spec".to_string())?;
-            Some((tap.register(), spec))
+            // The output subscribes one consumer per rendition (classic:
+            // one), so per-rendition H.264 encodes share the same tap.
+            Some((tap, spec))
         } else {
             None
         };
@@ -443,12 +445,22 @@ fn print_result(result: &ScriptResult, preview: bool) {
             ));
         }
         for hls in &result.hls_outputs {
-            lines.push(format!(
-                "hls: AAC segments to {} ({:.1}s x {})",
-                hls.directory.display(),
-                hls.segment_seconds,
-                hls.retention
-            ));
+            if hls.renditions.is_empty() {
+                lines.push(format!(
+                    "hls: AAC segments to {} ({:.1}s x {})",
+                    hls.directory.display(),
+                    hls.segment_seconds,
+                    hls.retention
+                ));
+            } else {
+                lines.push(format!(
+                    "hls: {} ABR renditions to {} ({:.1}s x {})",
+                    hls.renditions.len(),
+                    hls.directory.display(),
+                    hls.segment_seconds,
+                    hls.retention
+                ));
+            }
         }
         for sc in &result.soundcard_outputs {
             lines.push(format!(

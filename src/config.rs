@@ -113,6 +113,25 @@ pub struct SoundcardOutputConfig {
     pub device: Option<String>,
 }
 
+/// One ABR rendition of an HLS output (G3.3): its own AAC encoder (and,
+/// when the output has a `video = marker`, its own H.264 encoder), segment
+/// window, subdirectory, and variant master-playlist entry.
+#[derive(Debug, Clone)]
+pub struct HlsRendition {
+    /// Subdirectory name (also the `NAME` attribute in the master playlist).
+    pub name: String,
+    /// AAC encoder bitrate in bits per second.
+    pub bitrate: u32,
+    /// H.264 encoder bitrate in bits per second for this rendition's video
+    /// encode (only when the output is video-enabled).
+    pub video_bitrate: u64,
+    /// Output resolution for this rendition's video encode. `None` = the
+    /// source's (effect-scaled) resolution — no rescale. Both or neither
+    /// must be set.
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
+
 /// Config for `output.hls`: encode the tap to AAC and slice it into a
 /// sliding window of MPEG-TS HLS segments with a media playlist.
 #[derive(Debug, Clone)]
@@ -127,6 +146,24 @@ pub struct HlsOutputConfig {
     /// Mux the shared video tap into the segments (Part H6): requires
     /// `video.video(path)` registered in the same script.
     pub video: bool,
+    /// Multi-rendition ABR: when non-empty, one encoder + segment window per
+    /// rendition (each in `directory/<name>/`) plus a variant master
+    /// playlist (`index.m3u8`) tying them together. Empty = the classic
+    /// single stream (`playlist.m3u8` at the top level).
+    pub renditions: Vec<HlsRendition>,
+    /// Segment file name template. `{n}` is the zero-padded sequence number
+    /// and `{t}` the unix seconds of the segment's start; default
+    /// `seg-{n}.ts`.
+    pub segment_name: String,
+    /// State file for resumable runs (`persist_at`): stores each rendition's
+    /// next segment counter and retained window so a restart continues the
+    /// playlist (no renumbering, no gap/drift) instead of clearing the
+    /// directory.
+    pub persist_at: Option<PathBuf>,
+    /// Keep the engine alive with silence when the source exhausts (wrap the
+    /// shared root in `fallback([root, blank()])`) instead of finalizing the
+    /// playlist with `#EXT-X-ENDLIST` and ending the stream.
+    pub fallible: bool,
 }
 
 /// Config for `output.rtmp` (Part H5): publish the tap to an RTMP server
@@ -167,6 +204,10 @@ impl Default for HlsOutputConfig {
             segment_seconds: 5.0,
             retention: 12,
             video: false,
+            renditions: Vec::new(),
+            segment_name: "seg-{n}.ts".into(),
+            persist_at: None,
+            fallible: false,
         }
     }
 }
