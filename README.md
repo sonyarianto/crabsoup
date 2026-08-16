@@ -45,7 +45,7 @@ different rates and channel counts just work.
 
 ```sh
 cp crabsoup.lua.example crabsoup.lua   # or write your own (see above)
-RUST_LOG=crabsoup=info ./target/release/crabsoup -c crabsoup.lua
+./target/release/crabsoup -c crabsoup.lua   # RUST_LOG=crabsoup=info is the default
 ```
 
 With an `output.icecast` call it connects to Icecast as a source. Without one
