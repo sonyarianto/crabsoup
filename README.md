@@ -69,6 +69,8 @@ Per-format test scripts live in `examples/`:
 ./target/release/crabsoup -c examples/crabsoup.mp4.lua      # file -> MP4 recording
 ```
 
+The last three need a feature build (`--features video`, `--features rtmp,video`).
+
 ## Building
 
 Requires Rust (edition 2024) and the dev packages for the native codecs:
