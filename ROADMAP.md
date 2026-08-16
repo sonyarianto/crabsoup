@@ -1,6 +1,20 @@
 # Crabsoup roadmap
 
 ## Done (verified end-to-end)
+- [x] **G3.8 — `append`/`prepend` followers (`annotated`)**: the new
+      `annotated(src, {append = "stinger.mp3", prepend = "intro.mp3"})`
+      operator wraps any source and plays the followers after/before every
+      track. Per-track `annotate:append`/`annotate:prepend` keys override
+      the defaults per track and `"false"` inhibits them. The followers
+      ride the existing per-track cue channel (`CrossfadeOverrides`
+      gained `append`/`prepend`), resolved lazily at each boundary so a
+      missing file logs and skips. Boundaries are detected by the child's
+      label changing during a pull (crossfade promotion, `sequence`
+      advancing, queue refill); the new track's first buffer is staged so
+      followers interleave cleanly. Acceptance met: tone-pair
+      label-sequence tests (append after every tone including the last,
+      prepend before every tone including the first) and a playlist test
+      asserting `"false"` inhibit, default inherit, and per-track override.
 - [x] **G3.7 — per-track `start_next` annotation**: `start_next` extends
       `TrackCues` and lands in the mixer via the new `CrossfadeOverrides`
       struct (replacing the `(fade_in, fade_out)` tuple). The mixer
@@ -754,13 +768,21 @@ window of Parts I–K):
       compresses the fade window to fit a shorter start; `apply_cues`
       wraps for `start_next` alone; mixer, parse and real-jingle timing
       tests green (see Done section).
-- [ ] **G3.8 — `append` / `prepend` annotations.** Append an extra
-      track after (or before) every track, inhibited per-track by setting
-      the metadata to `"false"`. Crabsoup has no per-track follower
+- [x] **G3.8 — `append` / `prepend` annotations.** Append an extra track
+      after (or before) every track, inhibited per-track by setting the
+      metadata to `"false"`. Crabsoup has no per-track follower
       source. Design: a wrapper source between the child and the mixer
       that inserts a jingle-style one-shot when the child's track
       boundary passes. Acceptance: a `sequence` of two tones gains a
       third tone in between (append), and the pre-track tone for prepend.
+      — **done**: `annotated(src, {append = uri, prepend = uri})` wraps any
+      source with a `FollowSource` that reads per-track
+      `annotate:append`/`annotate:prepend` cues (overriding the defaults,
+      with `"false"` inhibiting) and inserts the followers at each track
+      boundary; `CrossfadeOverrides` now carries the follower URIs so the
+      existing per-track plumbing reaches it for free. Acceptance met:
+      label-sequence tests on tone pairs, and a playlist test asserting
+      inhibit/override/inherit behavior (see Done section).
 - **Annotation vocabulary note (2026):** crabsoup's `annotate:` keys are
   its own (`cue_in`, `cue_out`, `fade_in`, `fade_out`, `amplify`,
   `start_next`, `append`, `prepend`) — not Liquidsoap's `liq_*` names.

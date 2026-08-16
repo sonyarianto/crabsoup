@@ -185,5 +185,20 @@ margin) for that track — e.g. to ramp the next track in over a 5 s outro
 instead of the global window. The fade window compresses to fit when the
 track ends sooner.
 
+Per-track followers (`append`/`prepend`) are set the same way — either
+per request, or for every track of a source with the `annotated`
+operator:
+
+```
+annotate:append="jingles/stinger.mp3":/path/track.mp3
+annotate:append="false":/path/no-stinger.mp3
+src = annotated(playlist({...}), {append = "jingles/stinger.mp3",
+                                  prepend = "jingles/intro.mp3"})
+```
+
+The follower plays after (`append`) or before (`prepend`) the track, is
+resolved lazily at each boundary (a missing file logs and skips), and
+`"false"` inhibits the default for a single track.
+
 `http://` / `https://` requests are download-then-play with retry/timeout;
 temp files are auto-removed. HTTPS uses rustls (redirects may cross scheme).

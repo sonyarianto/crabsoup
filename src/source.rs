@@ -2,6 +2,7 @@ pub mod amplify;
 pub mod blank_detect;
 pub mod cue_cut;
 pub mod file;
+pub mod follow;
 pub mod http;
 pub mod opus;
 pub mod pipe;
@@ -67,7 +68,7 @@ pub trait AudioSource: Send {
 /// Per-track crossfade settings, from the `annotate:` prefix or `cue_cut`.
 /// Each `None` = fall back to the global `crossfade_seconds` for that
 /// aspect.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct CrossfadeOverrides {
     /// Fade-in duration for this track, in seconds.
     pub fade_in: Option<f64>,
@@ -76,6 +77,14 @@ pub struct CrossfadeOverrides {
     /// `start_next`: how many seconds before this track ends the next
     /// track starts (overrides the preload margin).
     pub start_next: Option<f64>,
+    /// A request URI to play after this track ends (the `append`
+    /// annotation); `"false"` inhibits the `annotated` operator's
+    /// default append for this track.
+    pub append: Option<String>,
+    /// A request URI to play before this track starts (the `prepend`
+    /// annotation); `"false"` inhibits the `annotated` operator's
+    /// default prepend for this track.
+    pub prepend: Option<String>,
 }
 
 /// Supplies the *next* source on demand so a crossfade can be preloaded.

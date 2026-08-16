@@ -58,7 +58,7 @@ impl CueCutSource {
     /// Length of the audible window in samples (`cue_out - cue_in`,
     /// rounded once), or 0 when there is no `cue_out`.
     fn window_samples(&self) -> usize {
-        let Some(cues) = self.cues else {
+        let Some(cues) = &self.cues else {
             return 0;
         };
         let Some(out) = cues.cue_out else {
@@ -73,7 +73,7 @@ impl CueCutSource {
     /// Re-arm the window for a new track (the child's label changed).
     fn reset_track(&mut self) {
         let spps = self.samples_per_sec() as f64;
-        let skip = self.cues.map_or(0.0, |c| c.cue_in.max(0.0));
+        let skip = self.cues.as_ref().map_or(0.0, |c| c.cue_in.max(0.0));
         self.skip_left_samples = (skip * spps).round() as usize;
         self.emitted_samples = 0;
         self.done = false;
@@ -82,7 +82,7 @@ impl CueCutSource {
     /// Emit up to `n` samples, truncating at `cue_out`. Without a `cue_out`
     /// this is a passthrough.
     fn emit(&mut self, buffer: &mut [f32], n: usize) -> usize {
-        let Some(cues) = self.cues else {
+        let Some(cues) = &self.cues else {
             return n;
         };
         if cues.cue_out.is_none() {
@@ -148,7 +148,7 @@ impl AudioSource for CueCutSource {
         if self.done {
             return Some(0.0);
         }
-        if self.cues.is_some_and(|c| c.cue_out.is_some()) {
+        if self.cues.as_ref().is_some_and(|c| c.cue_out.is_some()) {
             let spps = self.samples_per_sec() as f64;
             let left = self.window_samples().saturating_sub(self.emitted_samples);
             return Some(left as f64 / spps);
@@ -167,11 +167,15 @@ impl AudioSource for CueCutSource {
     }
 
     fn crossfade_overrides(&self) -> Option<crate::source::CrossfadeOverrides> {
-        let cues = self.cues?;
+        let Some(cues) = &self.cues else {
+            return None;
+        };
         let overrides = crate::source::CrossfadeOverrides {
             fade_in: cues.fade_in,
             fade_out: cues.fade_out,
             start_next: cues.start_next,
+            append: cues.append.clone(),
+            prepend: cues.prepend.clone(),
         };
         (overrides != crate::source::CrossfadeOverrides::default()).then_some(overrides)
     }
@@ -195,8 +199,9 @@ mod tests {
             cue_out,
             fade_in: None,
             fade_out: None,
-            amplify: None,
-            start_next: None,
+            amplify: None,start_next: None,
+append: None,
+prepend: None,
         }
     }
 
@@ -255,12 +260,23 @@ mod tests {
                 fade_in: Some(2.0),
                 fade_out: Some(3.0),
                 amplify: None,
-            start_next: None,
+                start_next: None,
+                append: None,
+                prepend: None,
             },
             RATE,
             CHANS,
         );
-        assert_eq!(src.crossfade_overrides(), Some(crate::source::CrossfadeOverrides { fade_in: Some(2.0), fade_out: Some(3.0), start_next: None }));
+        assert_eq!(
+            src.crossfade_overrides(),
+            Some(crate::source::CrossfadeOverrides {
+                fade_in: Some(2.0),
+                fade_out: Some(3.0),
+                start_next: None,
+                append: None,
+                prepend: None,
+            })
+        );
 
         // Only cue points, no fades: no override reported.
         let child: Box<dyn AudioSource> = Box::new(SineSource::new(25.0, None, 1.0, RATE, CHANS));

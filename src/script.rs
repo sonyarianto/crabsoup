@@ -2620,9 +2620,45 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
                 fade_out,
                 amplify: None,
                 start_next: None,
+                append: None,
+                prepend: None,
             };
             let wrapped = CueCutSource::new(child, cues, spec.rate, spec.channels.count());
             Ok(LuaSource::new(Box::new(wrapped)))
+        })?,
+    )?;
+
+    // ---- per-track followers (Liquidsoap `liq_append`/`liq_prepend`) ------
+    // `annotated(src, {append = "stinger.mp3", prepend = "intro.mp3"})` plays
+    // the given tracks after/before every track of `src`; a per-track
+    // `annotate:append="other.mp3"` (or `prepend`) overrides the default for
+    // that track, and `annotate:append="false"` inhibits it. Followers are
+    // resolved lazily at each boundary, so a missing file logs and skips
+    // instead of failing the script.
+    let annotated_state = state.clone();
+    globals.set(
+        "annotated",
+        lua.create_function(move |_, (mut source, opts): (LuaSource, Option<Table>)| {
+            let append = match &opts {
+                Some(t) => t.get::<Option<String>>("append")?,
+                None => None,
+            };
+            let prepend = match &opts {
+                Some(t) => t.get::<Option<String>>("prepend")?,
+                None => None,
+            };
+            let (spec, fpb) = bus(&annotated_state);
+            let request = annotated_state.borrow().request;
+            let child = source.take();
+            let src = crate::source::follow::FollowSource::new(
+                child,
+                append,
+                prepend,
+                request,
+                spec,
+                fpb,
+            );
+            Ok(LuaSource::new(Box::new(src)))
         })?,
     )?;
 
@@ -4414,7 +4450,13 @@ mod tests {
         let root = res.preview.expect("preview source");
         assert_eq!(
             root.crossfade_overrides(),
-            Some(crate::source::CrossfadeOverrides { fade_in: Some(2.0), fade_out: Some(3.0), start_next: None }),
+            Some(crate::source::CrossfadeOverrides {
+                fade_in: Some(2.0),
+                fade_out: Some(3.0),
+                start_next: None,
+                append: None,
+                prepend: None,
+            }),
             "cue_cut must report fade overrides to the crossfade mixer"
         );
         // Without fades, no overrides are reported (global window applies).
@@ -4443,7 +4485,13 @@ mod tests {
         let root = res.preview.expect("preview source");
         assert_eq!(
             root.crossfade_overrides(),
-            Some(crate::source::CrossfadeOverrides { fade_in: Some(2.0), fade_out: Some(3.0), start_next: None }),
+            Some(crate::source::CrossfadeOverrides {
+                fade_in: Some(2.0),
+                fade_out: Some(3.0),
+                start_next: None,
+                append: None,
+                prepend: None,
+            }),
             "annotate fades must reach the mixer"
         );
     }
@@ -4855,6 +4903,115 @@ mod tests {
         assert!(
             (gap - 5.0).abs() < 1.0,
             "start_next margin was {gap:.1}s, expected ~5s"
+        );
+    }
+
+    /// A tiny PCM WAV on disk; its file stem is the follower label.
+    fn follower_wav(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "crabsoup-follower-{name}-{}.wav",
+            std::process::id()
+        ));
+        std::fs::write(&path, sine_wav_bytes(660.0, 0.2, 44_100)).unwrap();
+        path
+    }
+
+    /// Pull `root` to exhaustion, recording every label change.
+    fn label_sequence(root: &mut dyn crate::source::AudioSource) -> Vec<String> {
+        let mut buf = vec![0f32; 4096 * 2];
+        let mut seen = Vec::new();
+        let mut last = None;
+        for _ in 0..1000 {
+            if root.next_buffer(&mut buf) == 0 {
+                break;
+            }
+            let label = root.label();
+            if label != last {
+                seen.push(label.clone().unwrap_or_default());
+                last = label;
+            }
+        }
+        seen
+    }
+
+    #[test]
+    fn annotated_appends_a_follower_after_every_track() {
+        let stinger = follower_wav("append");
+        let stem = stinger.file_stem().unwrap().to_string_lossy().into_owned();
+        let (_rt, res) = run(&format!(r#"
+            src = annotated(sequence({{sine({{freq = 440, duration = 0.4}}),
+                                      sine({{freq = 880, duration = 0.4}})}}),
+                             {{append = "{path}"}})
+            output.preview(src)
+            "#, path = stinger.display()))
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        // Each tone is followed by the stinger, including after the last.
+        assert_eq!(
+            label_sequence(&mut *root),
+            vec!["sine 440 Hz".to_string(), stem.clone(), "sine 880 Hz".to_string(), stem]
+        );
+    }
+
+    #[test]
+    fn annotated_prepends_a_follower_before_every_track() {
+        let intro = follower_wav("prepend");
+        let stem = intro.file_stem().unwrap().to_string_lossy().into_owned();
+        let (_rt, res) = run(&format!(r#"
+            src = annotated(sequence({{sine({{freq = 440, duration = 0.4}}),
+                                      sine({{freq = 880, duration = 0.4}})}}),
+                             {{prepend = "{path}"}})
+            output.preview(src)
+            "#, path = intro.display()))
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        assert_eq!(
+            label_sequence(&mut *root),
+            vec![stem.clone(), "sine 440 Hz".to_string(), stem, "sine 880 Hz".to_string()]
+        );
+    }
+
+    #[test]
+    fn annotate_append_false_inhibits_and_a_path_overrides_the_default() {
+        // Track A inhibits the default append; track B inherits it; track
+        // C overrides it with its own follower. The playlist crossfades
+        // internally, so followers appear between the tracks and once more
+        // after the last one.
+        let a = follower_wav("track-a");
+        let b = follower_wav("track-b");
+        let c = follower_wav("track-c");
+        let stinger = follower_wav("default-stinger");
+        let custom = follower_wav("custom-stinger");
+        let script = format!(
+            r#"
+            src = annotated(playlist({{files = {{"annotate:append=\"false\":{a}",
+                                                 "{b}",
+                                                 "annotate:append=\"{custom}\":{c}"}}}}),
+                             {{append = "{stinger}"}})
+            output.preview(src)
+            "#,
+            a = a.display(),
+            b = b.display(),
+            c = c.display(),
+            custom = custom.display(),
+            stinger = stinger.display()
+        );
+        let (_rt, res) = run(&script).expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let stem = |p: &PathBuf| p.file_stem().unwrap().to_string_lossy().into_owned();
+        let seq = label_sequence(&mut *root);
+        assert_eq!(
+            &seq[..8],
+            &[
+                stem(&a),
+                stem(&b),
+                stem(&stinger),
+                stem(&c),
+                stem(&custom),
+                stem(&a),
+                stem(&b),
+                stem(&stinger),
+            ][..]
         );
     }
 

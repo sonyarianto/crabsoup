@@ -156,7 +156,8 @@ One engine thread plus one thread per output:
   Option<TrackCues>)`): `single`, `playlist` entries, and the telnet
   request queue all carry URIs and resolve at play time via `resolve()`.
   `new()` parses the `annotate:` prefix (`cue_in`,
-  `cue_out`, `fade_in`, `fade_out`) into a `TrackCues`;
+  `cue_out`, `fade_in`, `fade_out`, `start_next`, `amplify`,
+  `append`, `prepend`) into a `TrackCues`;
   malformed prefixes fall back to the plain URI. `TrackCues` holds `f64`s,
   so `RequestUri`'s `Eq`/`Ord` are hand-written (`None` < `Some`, values
   by `total_cmp`). `Local` opens a `FileSource`; `Url` downloads to
@@ -174,7 +175,17 @@ One engine thread plus one thread per output:
   playlist trims every track). `CueCutSource` also reports per-track
   crossfade overrides via `AudioSource::crossfade_overrides()` (its
   `fade_in`/`fade_out`), and `apply_cues` wraps even when *only* fades are
-  set, so `annotate:fade_in=...` alone reaches the mixer.
+  set, so `annotate:fade_in=...` alone reaches the mixer. The same channel
+  carries the `append`/`prepend` follower URIs (`CrossfadeOverrides`
+  fields), consumed by `FollowSource` (`src/source/follow.rs`): the
+  `annotated(src, {append, prepend})` operator wraps any source, and at
+  every child track boundary (detected by the child's label changing
+  during a pull — crossfade promotion, `sequence` advancing, queue
+  refill) it inserts the old track's `append` follower then the new
+  track's `prepend` follower, staging the new track's first buffer while
+  they play; per-track annotations override the defaults and `"false"`
+  inhibits them. Followers are resolved lazily per boundary, so a missing
+  file logs and skips.
 - The HTTP client is hand-rolled on a `Transport` enum — a plain
   `TcpStream` for `http://`, a `rustls::StreamOwned` (ring provider,
   webpki-roots Mozilla store) for `https://` — and the status/header/chunked

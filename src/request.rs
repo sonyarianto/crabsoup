@@ -55,7 +55,7 @@ impl RequestConfig {
 /// into the track); `fade_in`/`fade_out` override the global crossfade for
 /// this track (Part D step 2 — parsed here, consumed by `CrossfadeMixer`
 /// later).
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct TrackCues {
     /// Skip this many seconds into the track before audio starts.
     pub cue_in: f64,
@@ -73,6 +73,14 @@ pub struct TrackCues {
     /// Per-track `start_next` override in seconds, if set: how early the
     /// next track starts relative to this track's end.
     pub start_next: Option<f64>,
+    /// Per-track `append` follower, if set: a request URI played after
+    /// this track ends. The literal `"false"` inhibits the `annotated`
+    /// operator's default append.
+    pub append: Option<String>,
+    /// Per-track `prepend` follower, if set: a request URI played before
+    /// this track starts. The literal `"false"` inhibits the `annotated`
+    /// operator's default prepend.
+    pub prepend: Option<String>,
 }
 
 /// A media item: a local file path or an HTTP(S) URL, with optional per-track
@@ -158,7 +166,9 @@ fn cmp_cues(a: &Option<TrackCues>, b: &Option<TrackCues>) -> std::cmp::Ordering 
         (Some(x), Some(y)) => cmp_opt(&x.cue_out, &y.cue_out)
             .then_with(|| cmp_opt(&x.fade_in, &y.fade_in))
             .then_with(|| cmp_opt(&x.fade_out, &y.fade_out))
-            .then_with(|| x.cue_in.total_cmp(&y.cue_in)),
+            .then_with(|| x.cue_in.total_cmp(&y.cue_in))
+            .then_with(|| x.append.cmp(&y.append))
+            .then_with(|| x.prepend.cmp(&y.prepend)),
     }
 }
 
@@ -246,7 +256,28 @@ fn parse_annotate(uri: &str) -> (String, Option<TrackCues>) {
                     cues.amplify = Some(v);
                     found = true;
                 }
+                // A follower named like a number still works: the value is
+                // kept verbatim as a request URI.
+                "append" => {
+                    cues.append = Some(value.to_string());
+                    found = true;
+                }
+                "prepend" => {
+                    cues.prepend = Some(value.to_string());
+                    found = true;
+                }
                 _ => {} // unknown annotate key: carried but ignored
+            }
+        } else if key == "append" || key == "prepend" {
+            // The follower annotations take a request URI (or the literal
+            // `"false"` to inhibit a default follower), not a number.
+            if !value.is_empty() {
+                if key == "append" {
+                    cues.append = Some(value.to_string());
+                } else {
+                    cues.prepend = Some(value.to_string());
+                }
+                found = true;
             }
         } else if key == "amplify" {
             // The annotation also accepts decibels with the `dB` suffix
@@ -348,14 +379,16 @@ fn apply_cues(
     cues: Option<TrackCues>,
     target: symphonia::core::audio::SignalSpec,
 ) -> Box<dyn crate::source::AudioSource> {
-    let gain = cues.and_then(|c| c.amplify);
+    let gain = cues.as_ref().and_then(|c| c.amplify);
     let mut out = match cues {
         Some(c)
             if c.cue_in > 0.0
                 || c.cue_out.is_some()
                 || c.fade_in.is_some()
                 || c.fade_out.is_some()
-                || c.start_next.is_some() =>
+                || c.start_next.is_some()
+                || c.append.is_some()
+                || c.prepend.is_some() =>
         {
             Box::new(CueCutSource::new(
                 src,
@@ -384,14 +417,14 @@ pub fn resolve(
     match uri {
         RequestUri::Local(path, cues) => {
             let src = open_audio(path, target, frames_per_buffer)?;
-            Ok(apply_cues(src, *cues, target))
+            Ok(apply_cues(src, cues.clone(), target))
         }
         RequestUri::Url(url, cues) => {
             let tmp = temp_path(url);
             download(url, &tmp, config, None)?;
             let src = open_audio(&tmp, target, frames_per_buffer)?;
             let src = Box::new(DownloadSource::new(src, tmp, uri.display()));
-            Ok(apply_cues(src, *cues, target))
+            Ok(apply_cues(src, cues.clone(), target))
         }
     }
 }
@@ -1242,8 +1275,9 @@ mod tests {
                     cue_out: Some(180.0),
                     fade_in: None,
                     fade_out: None,
-                    amplify: None,
-                start_next: None,
+                    amplify: None,start_next: None,
+append: None,
+prepend: None,
                 })
             )
         );
@@ -1264,8 +1298,9 @@ mod tests {
                     cue_out: None,
                     fade_in: None,
                     fade_out: None,
-                    amplify: None,
-                start_next: None,
+                    amplify: None,start_next: None,
+append: None,
+prepend: None,
                 })
             )
         );
@@ -1285,8 +1320,9 @@ mod tests {
                     cue_out: None,
                     fade_in: Some(2.0),
                     fade_out: Some(3.0),
-                    amplify: None,
-                start_next: None,
+                    amplify: None,start_next: None,
+append: None,
+prepend: None,
                 })
             )
         );
@@ -1304,8 +1340,9 @@ mod tests {
                     cue_out: None,
                     fade_in: None,
                     fade_out: None,
-                    amplify: Some(0.5),
-                    start_next: None,
+                    amplify: Some(0.5),start_next: None,
+append: None,
+prepend: None,
                 })
             )
         );
@@ -1339,12 +1376,43 @@ mod tests {
                     fade_out: None,
                     amplify: None,
                     start_next: Some(1.0),
+                    append: None,
+                    prepend: None,
                 })
             )
         );
         // Non-finite values are rejected like every other cue.
         let bad = RequestUri::new("annotate:start_next=\"inf\":media/a.mp3");
         assert_eq!(bad, RequestUri::Local("media/a.mp3".into(), None));
+    }
+
+    #[test]
+    fn append_and_prepend_annotations_parse_into_cues() {
+        let uri = RequestUri::new(
+            "annotate:append=\"jingles/stinger.mp3\",prepend=\"false\":media/a.mp3",
+        );
+        assert_eq!(
+            uri,
+            RequestUri::Local(
+                "media/a.mp3".into(),
+                Some(TrackCues {
+                    cue_in: 0.0,
+                    cue_out: None,
+                    fade_in: None,
+                    fade_out: None,
+                    amplify: None,
+                    start_next: None,
+                    append: Some("jingles/stinger.mp3".into()),
+                    prepend: Some("false".into()),
+                })
+            )
+        );
+        // A follower named like a number is kept verbatim, not parsed.
+        let RequestUri::Local(_, cues) = RequestUri::new("annotate:append=\"0.5\":media/a.mp3")
+        else {
+            panic!("local uri expected")
+        };
+        assert_eq!(cues.as_ref().and_then(|c| c.append.as_deref()), Some("0.5"));
     }
 
     #[test]
@@ -1383,8 +1451,9 @@ mod tests {
                     cue_out: Some(5.0),
                     fade_in: None,
                     fade_out: None,
-                    amplify: None,
-                start_next: None,
+                    amplify: None,start_next: None,
+append: None,
+prepend: None,
                 })
             )
         );

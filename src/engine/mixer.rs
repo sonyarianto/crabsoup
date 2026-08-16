@@ -742,7 +742,7 @@ mod tests {
             Some(format!("src({})", self.value))
         }
         fn crossfade_overrides(&self) -> Option<crate::source::CrossfadeOverrides> {
-            self.fades
+            self.fades.clone()
         }
     }
 
@@ -976,7 +976,7 @@ mod tests {
         // 0.4s, so the next track is preloaded 0.4s early (not 0.2s) and the
         // overlap spans 40 frames. Buffers are 10 frames (0.1s).
         let provider = Box::new(FakeProvider::with_fades(vec![
-            (1.0, 1000, Some(crate::source::CrossfadeOverrides { fade_in: None, fade_out: Some(0.4), start_next: None })),
+            (1.0, 1000, Some(crate::source::CrossfadeOverrides { fade_in: None, fade_out: Some(0.4), start_next: None, append: None, prepend: None })),
             (2.0, 1000, None),
         ]));
         let cfg = mixer_config(0.2);
@@ -1011,7 +1011,7 @@ mod tests {
         // when it starts, so the remainder is finished by the tail ramp.
         let provider = Box::new(FakeProvider::with_fades(vec![
             (1.0, 1000, None),
-            (2.0, 1000, Some(crate::source::CrossfadeOverrides { fade_in: Some(0.4), fade_out: None, start_next: None })),
+            (2.0, 1000, Some(crate::source::CrossfadeOverrides { fade_in: Some(0.4), fade_out: None, start_next: None, append: None, prepend: None })),
         ]));
         let cfg = mixer_config(0.2);
         let mut mix = CrossfadeMixer::new(provider, &cfg, RATE as u32, CHANS);
@@ -1085,6 +1085,8 @@ mod tests {
                     fade_in: None,
                     fade_out: None,
                     start_next: Some(0.4),
+                    append: None,
+                    prepend: None,
                 }),
             ),
             (2.0, 1000, None),
@@ -1128,6 +1130,8 @@ mod tests {
                     fade_in: None,
                     fade_out: Some(0.4),
                     start_next: Some(0.2),
+                    append: None,
+                    prepend: None,
                 }),
             ),
             (2.0, 1000, None),
