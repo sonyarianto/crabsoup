@@ -15,13 +15,14 @@ cargo build                    # debug build
 cargo build --release          # release build
 cargo test --lib               # run all tests (inline #[cfg(test)] modules)
 cargo clippy -- -D warnings    # lint
-./target/release/crabsoup -c crabsoup.lua          # run
+./target/release/crabsoup -c internal/scripts/crabsoup.lua   # run (dev scripts live in internal/scripts/)
 ./target/release/crabsoup --check                  # evaluate script, print config, exit
 RUST_LOG=crabsoup=info ./target/release/crabsoup   # run with logging
 ```
 
-`crabsoup.lua` is gitignored; `crabsoup.lua.example` is the tracked reference
-script. `internal/` (media/, jingles/, tools/) is gitignored — audio files stay local, tests
+`crabsoup.lua.example` is the tracked reference script; local dev/test scripts
+live in `internal/scripts/` (gitignored). `internal/` (media/, jingles/, tools/)
+is gitignored — audio files stay local, tests
 that use them skip when absent.
 
 ## Conventions
