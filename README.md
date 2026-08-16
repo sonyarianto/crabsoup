@@ -70,6 +70,10 @@ Per-format test scripts live in `examples/`:
 ```
 
 The last three need a feature build (`--features video`, `--features rtmp,video`).
+Audio-only HLS (`output.hls({directory = ...}, src)` without `video = ...`)
+works on a plain build; only the `video = marker` option needs `--features video`.
+RTMP and MP4 always need their feature builds, even audio-only (librtmp / FFmpeg
+muxer).
 
 ## Building
 
