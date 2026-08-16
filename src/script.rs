@@ -6482,6 +6482,9 @@ mod tests {
     fn dbg_real_mp3_rotate_crossfade_dump() {
         // Reproduce the user's exact recipe with their real files (jingles
         // 11-30 s, songs real MP3s) and dump label changes + silence runs.
+        if !std::path::Path::new("./internal/media/audio/songs").is_dir() {
+            return;
+        }
         let (_rt, _res) = run(r#"
             songs = playlist({directory = "./internal/media/audio/songs", shuffle = true, loop = true,
                               crossfade = false})
