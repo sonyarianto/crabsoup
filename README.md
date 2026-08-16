@@ -1,6 +1,8 @@
 # Crabsoup
 
 [![Sponsor](https://img.shields.io/badge/Sponsor-GitHub%20Sponsors-ea4aaa.svg)](https://github.com/sponsors/sonyarianto)
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-sonyarianto-ffdd00.svg)](https://buymeacoffee.com/sonyarianto)
+[![PayPal](https://img.shields.io/badge/donate-PayPal-00457C.svg)](https://paypal.me/sonyarianto)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 [![CI](https://github.com/sonyarianto/crabsoup/actions/workflows/ci.yml/badge.svg)](https://github.com/sonyarianto/crabsoup/actions/workflows/ci.yml)
 
