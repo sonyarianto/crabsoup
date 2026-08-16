@@ -1,6 +1,7 @@
 /target
 /media
 /crabsoup.lua
+/crabsoup.test.lua
 /jingles
 /website/node_modules
 /website/.vitepress/dist

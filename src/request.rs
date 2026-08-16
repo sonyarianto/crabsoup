@@ -81,6 +81,9 @@ pub struct TrackCues {
     /// this track starts. The literal `"false"` inhibits the `annotated`
     /// operator's default prepend.
     pub prepend: Option<String>,
+    /// On-air title override (the `title` annotation), if set. Overrides
+    /// the label the source would otherwise derive from tags or filename.
+    pub title: Option<String>,
 }
 
 /// A media item: a local file path or an HTTP(S) URL, with optional per-track
@@ -168,7 +171,8 @@ fn cmp_cues(a: &Option<TrackCues>, b: &Option<TrackCues>) -> std::cmp::Ordering 
             .then_with(|| cmp_opt(&x.fade_out, &y.fade_out))
             .then_with(|| x.cue_in.total_cmp(&y.cue_in))
             .then_with(|| x.append.cmp(&y.append))
-            .then_with(|| x.prepend.cmp(&y.prepend)),
+            .then_with(|| x.prepend.cmp(&y.prepend))
+            .then_with(|| x.title.cmp(&y.title)),
     }
 }
 
@@ -224,10 +228,17 @@ fn parse_annotate(uri: &str) -> (String, Option<TrackCues>) {
         }
         let value = &rest[val_start..cursor];
         cursor += 1; // closing quote
+        // The title annotation is free-form text for on-air metadata;
+        // parsed first so a numeric-looking title is not taken for a cue.
+        if key == "title" {
+            if !value.is_empty() {
+                cues.title = Some(value.to_string());
+                found = true;
+            }
         // Only finite, normalized values become cues: `inf` would saturate
         // the sample skip to usize::MAX (silent endless skip) and NaN/-0.0
         // break the Eq/Ord consistency of `TrackCues` (total_cmp vs ==).
-        if let Ok(v) = value.parse::<f64>()
+        } else if let Ok(v) = value.parse::<f64>()
             && v.is_finite()
         {
             let v = if v == 0.0 { 0.0 } else { v }; // -0.0 == 0.0, same in total_cmp
@@ -372,13 +383,15 @@ impl crate::source::AudioSource for DownloadSource {
 }
 
 /// Wrap a resolved source in [`CueCutSource`] when the request carries cue
-/// points or fade overrides, and in [`TrackGainSource`] when it carries an
-/// `amplify` annotation; otherwise return it unchanged.
+/// points or fade overrides, in [`TrackGainSource`] when it carries an
+/// `amplify` annotation, and in [`LabelOverrideSource`] when it carries a
+/// `title` annotation; otherwise return it unchanged.
 fn apply_cues(
     src: Box<dyn crate::source::AudioSource>,
     cues: Option<TrackCues>,
     target: symphonia::core::audio::SignalSpec,
 ) -> Box<dyn crate::source::AudioSource> {
+    let title = cues.as_ref().and_then(|c| c.title.clone());
     let gain = cues.as_ref().and_then(|c| c.amplify);
     let mut out = match cues {
         Some(c)
@@ -399,10 +412,57 @@ fn apply_cues(
         }
         _ => src,
     };
+    if let Some(title) = title {
+        out = Box::new(LabelOverrideSource::new(out, title));
+    }
     if let Some(g) = gain {
         out = Box::new(crate::source::amplify::TrackGainSource::new(out, g as f32));
     }
     out
+}
+
+/// Override a source's label with an `annotate:title` value. The wrapped
+/// source keeps the audio path and per-track cues; only the on-air metadata
+/// changes.
+struct LabelOverrideSource {
+    inner: Box<dyn crate::source::AudioSource>,
+    label: String,
+}
+
+impl LabelOverrideSource {
+    fn new(inner: Box<dyn crate::source::AudioSource>, label: String) -> Self {
+        Self { inner, label }
+    }
+}
+
+impl crate::source::AudioSource for LabelOverrideSource {
+    fn next_buffer(&mut self, buffer: &mut [f32]) -> usize {
+        self.inner.next_buffer(buffer)
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.inner.is_exhausted()
+    }
+
+    fn remaining_seconds(&self) -> Option<f64> {
+        self.inner.remaining_seconds()
+    }
+
+    fn label(&self) -> Option<String> {
+        Some(self.label.clone())
+    }
+
+    fn replaygain_db(&self) -> Option<f32> {
+        self.inner.replaygain_db()
+    }
+
+    fn crossfade_overrides(&self) -> Option<crate::source::CrossfadeOverrides> {
+        self.inner.crossfade_overrides()
+    }
+
+    fn skip(&mut self) {
+        self.inner.skip();
+    }
 }
 
 /// Resolve a request to a playable source, downloading first if needed.
@@ -777,13 +837,100 @@ fn http_get(
 
         let mut file = File::create(dest)?;
         if chunked {
-            read_chunked(&mut reader, &mut file)?;
+            read_chunked(&mut reader, &mut file, u64::MAX)?;
         } else if let Some(len) = content_length {
             std::io::copy(&mut reader.by_ref().take(len), &mut file)?;
         } else {
             std::io::copy(&mut reader, &mut file)?;
         }
         return Ok(());
+    }
+    Err("too many redirects".into())
+}
+
+/// One-shot `GET` returning the response body as a UTF-8 string (the Lua
+/// `http_get` helper — Deezco-style track listings are small JSON).
+/// Follows redirects exactly like [`http_get`]; bodies past
+/// `HTTP_GET_STRING_CAP` bytes are rejected so a misbehaving endpoint
+/// cannot balloon memory, and non-UTF-8 bodies fail the conversion.
+pub fn http_get_string(
+    url: &str,
+    timeout: Duration,
+    tls_roots: Option<&Arc<rustls::RootCertStore>>,
+) -> crate::Result<String> {
+    const HTTP_GET_STRING_CAP: usize = 16 * 1024 * 1024;
+    let mut target = HttpUrl::parse(url)?;
+    for _ in 0..4 {
+        let mut stream = connect_transport(&target, timeout, tls_roots)?;
+        write!(
+            stream,
+            "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: crabsoup/0.1\r\nConnection: close\r\nAccept: */*\r\n\r\n",
+            target.path, target.host
+        )?;
+        stream.flush()?;
+
+        let mut reader = BufReader::new(stream);
+        let mut status_line = String::new();
+        reader.read_line(&mut status_line)?;
+        let mut status_words = status_line.split_whitespace();
+        let _protocol = status_words.next();
+        let code: u16 = status_words
+            .next()
+            .ok_or_else(|| format!("malformed status line: {status_line:?}"))?
+            .parse()
+            .map_err(|_| format!("malformed status line: {status_line:?}"))?;
+
+        let mut chunked = false;
+        let mut content_length: Option<u64> = None;
+        let mut location: Option<String> = None;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line)? == 0 {
+                break;
+            }
+            let trimmed = line.trim_end();
+            if trimmed.is_empty() {
+                break;
+            }
+            let Some((key, value)) = trimmed.split_once(':') else {
+                continue;
+            };
+            let value = value.trim();
+            match key.to_ascii_lowercase().as_str() {
+                "transfer-encoding" if value.eq_ignore_ascii_case("chunked") => chunked = true,
+                "content-length" => content_length = value.parse().ok(),
+                "location" => location = Some(value.to_string()),
+                _ => {}
+            }
+        }
+
+        if (300..400).contains(&code) {
+            let Some(loc) = location else {
+                return Err(format!("redirect {code} without Location").into());
+            };
+            target = HttpUrl::parse(&target.join(&loc))?;
+            continue;
+        }
+        if code != 200 {
+            return Err(format!("HTTP {code} for {url}").into());
+        }
+
+        let mut body = Vec::new();
+        if chunked {
+            read_chunked(&mut reader, &mut body, HTTP_GET_STRING_CAP as u64)?;
+        } else if let Some(len) = content_length {
+            if len as usize > HTTP_GET_STRING_CAP {
+                return Err(format!("body of {len} bytes exceeds the 16 MiB cap").into());
+            }
+            body.reserve(len as usize);
+            std::io::copy(&mut reader.by_ref().take(len), &mut body)?;
+        } else {
+            std::io::copy(&mut reader.by_ref().take(HTTP_GET_STRING_CAP as u64 + 1), &mut body)?;
+            if body.len() > HTTP_GET_STRING_CAP {
+                return Err("body exceeds the 16 MiB cap".into());
+            }
+        }
+        return String::from_utf8(body).map_err(|e| format!("non-UTF-8 body: {e}").into());
     }
     Err("too many redirects".into())
 }
@@ -982,8 +1129,13 @@ pub fn http_post_json(
     Ok(())
 }
 
-/// Decode a chunked body into `file`.
-fn read_chunked(reader: &mut BufReader<Transport>, file: &mut File) -> crate::Result<()> {
+/// Decode a chunked body into `dest`.
+fn read_chunked(
+    reader: &mut BufReader<Transport>,
+    dest: &mut impl Write,
+    cap: u64,
+) -> crate::Result<()> {
+    let mut total = 0u64;
     loop {
         let mut size_line = String::new();
         if reader.read_line(&mut size_line)? == 0 {
@@ -1003,7 +1155,11 @@ fn read_chunked(reader: &mut BufReader<Transport>, file: &mut File) -> crate::Re
             }
             return Ok(());
         }
-        std::io::copy(&mut reader.by_ref().take(size), file)?;
+        total += size;
+        if total > cap {
+            return Err(format!("body exceeds the {cap} byte cap").into());
+        }
+        std::io::copy(&mut reader.by_ref().take(size), dest)?;
         let mut crlf = [0u8; 2];
         reader.read_exact(&mut crlf)?;
     }
@@ -1109,6 +1265,53 @@ mod tests {
             }
         });
         format!("http://{addr}/test.mp3")
+    }
+
+    #[test]
+    fn http_get_string_reads_the_body_and_follows_redirects() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let final_url = format!("http://{addr}/playlists/1");
+        thread::spawn(move || {
+            let mut hops = 0usize;
+            for _ in 0..8 {
+                let (mut stream, _) = listener.accept().expect("accept");
+                drain_request(&mut stream);
+                hops += 1;
+                if hops == 1 {
+                    stream
+                        .write_all(b"HTTP/1.1 302 Found\r\nLocation: /tracks.json\r\n\r\n")
+                        .expect("redirect");
+                } else {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n{\"title\":\"A\"}\r\n",
+                        )
+                        .expect("final");
+                }
+                stream.flush().expect("flush");
+            }
+        });
+        let body =
+            http_get_string(&final_url, Duration::from_secs(5), None).expect("get succeeds");
+        assert_eq!(body, "{\"title\":\"A\"}\r\n");
+    }
+
+    #[test]
+    fn http_get_string_rejects_non_2xx_and_caps_the_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            drain_request(&mut stream);
+            stream
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")
+                .expect("write");
+            stream.flush().expect("flush");
+        });
+        let url = format!("http://{addr}/missing");
+        let err = http_get_string(&url, Duration::from_secs(5), None).expect_err("get fails");
+        assert!(err.to_string().contains("500"), "{err}");
     }
 
     #[test]
@@ -1278,6 +1481,7 @@ mod tests {
                     amplify: None,start_next: None,
 append: None,
 prepend: None,
+title: None,
                 })
             )
         );
@@ -1288,7 +1492,7 @@ prepend: None,
     #[test]
     fn annotate_prefix_handles_http_uris_and_ignores_unknown_keys() {
         let uri =
-            RequestUri::new("annotate:title=\"intro\",cue_in=\"5\":http://x.example/track.mp3");
+            RequestUri::new("annotate:genre=\"intro\",cue_in=\"5\":http://x.example/track.mp3");
         assert_eq!(
             uri,
             RequestUri::Url(
@@ -1301,6 +1505,45 @@ prepend: None,
                     amplify: None,start_next: None,
 append: None,
 prepend: None,
+title: None,
+                })
+            )
+        );
+    }
+
+    #[test]
+    fn annotate_title_parses_into_cues_even_when_numeric() {
+        let uri = RequestUri::new("annotate:title=\"Lea\":http://x.example/track.mp3");
+        assert_eq!(
+            uri,
+            RequestUri::Url(
+                "http://x.example/track.mp3".into(),
+                Some(TrackCues {
+                    cue_in: 0.0,
+                    cue_out: None,
+                    fade_in: None,
+                    fade_out: None,
+                    amplify: None,start_next: None,
+append: None,
+prepend: None,
+title: Some("Lea".to_string()),
+                })
+            )
+        );
+        let numeric = RequestUri::new("annotate:title=\"123\":media/a.mp3");
+        assert_eq!(
+            numeric,
+            RequestUri::Local(
+                "media/a.mp3".into(),
+                Some(TrackCues {
+                    cue_in: 0.0,
+                    cue_out: None,
+                    fade_in: None,
+                    fade_out: None,
+                    amplify: None,start_next: None,
+append: None,
+prepend: None,
+title: Some("123".to_string()),
                 })
             )
         );
@@ -1323,6 +1566,7 @@ prepend: None,
                     amplify: None,start_next: None,
 append: None,
 prepend: None,
+title: None,
                 })
             )
         );
@@ -1343,6 +1587,7 @@ prepend: None,
                     amplify: Some(0.5),start_next: None,
 append: None,
 prepend: None,
+title: None,
                 })
             )
         );
@@ -1378,6 +1623,7 @@ prepend: None,
                     start_next: Some(1.0),
                     append: None,
                     prepend: None,
+                    title: None,
                 })
             )
         );
@@ -1404,6 +1650,7 @@ prepend: None,
                     start_next: None,
                     append: Some("jingles/stinger.mp3".into()),
                     prepend: Some("false".into()),
+                    title: None,
                 })
             )
         );
@@ -1424,7 +1671,7 @@ prepend: None,
             RequestUri::Local("annotate:cue_in=\"30\"".into(), None)
         );
         // Unknown keys only: no cues (metadata is not acted on).
-        let uri = RequestUri::new("annotate:title=\"x\":/path/a.mp3");
+        let uri = RequestUri::new("annotate:genre=\"x\":/path/a.mp3");
         assert_eq!(uri, RequestUri::Local("/path/a.mp3".into(), None));
     }
 
@@ -1454,6 +1701,7 @@ prepend: None,
                     amplify: None,start_next: None,
 append: None,
 prepend: None,
+title: None,
                 })
             )
         );

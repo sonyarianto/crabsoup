@@ -44,7 +44,7 @@ One engine thread plus one thread per output:
   `output.file`,
   `output.preview`, `output.soundcard`, `output.hls`, `server.telnet`,
   `server.register`, `on_metadata`, `on_track`, `on_next_metadata`, `json`
-  (`stringify`/`parse`), `http_post`, `set`, `log`.
+  (`stringify`/`parse`), `http_post`, `http_get`, `set`, `log`.
 - `blank` is a *callable table* (a `__call` metamethod) so it can carry
   `blank.detect`; Lua calls a table's `__call` as `f(self, args...)`, so
   the closure takes a leading `_self` parameter.
@@ -202,12 +202,15 @@ One engine thread plus one thread per output:
   fade (`fresh * curve(t)`). Nothing is ever replayed and the fade never
   drags over dead air: the window is sized per fade to the ring's audible
   tail, found with a BS.1770-style loudness gate instead of a fixed
-  amplitude floor — short-time mean-square windows (50 ms, 10 ms hop)
+  amplitude floor — the span is K-weighted first (BS.1770-4 Tables 1/2
+  at 48 kHz, De Man biquads), then short-time mean-square windows
+  (50 ms, 10 ms hop)
   are gated at −70 dBFS, then at 10 LU below the mean of the windows
   that passed, and the last passing window is refined sample-by-sample
   against that level. A track's own loudness defines its silence, so a
   −66 dBFS noise floor or a click in the tail never stretches the fade,
-  a quiet track (−68 dBFS) is still faded to its music, and the window
+  a quiet track (down to ~−67 dBFS peak, the −70 dBFS absolute floor)
+  is still faded to its music, and the window
   is floored at 0.15 s and capped by the outgoing track's last quarter
   when nothing passes. The first `fade_frames` output
   frames are silence while the ring fills (startup latency equals the

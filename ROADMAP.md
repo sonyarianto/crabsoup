@@ -19,6 +19,20 @@
       then 10 LU below the gated mean; floored at 0.15 s, capped by the
       outgoing track's last quarter), so tracks that end in trailing
       silence or a decaying tail don't fade over dead air.
+      **The `smart_crossfade` operator was removed in the session that
+      landed the gate** (the fixed −30 dB threshold window choice is
+      superseded by the gate; the `CrossfadeMixer` engine stays for
+      `playlist(crossfade = true)`/`jingles`). Follow-up on top: the
+      control-plane `http_get` Lua helper (synchronous GET → body string,
+      16 MiB cap, raises on failure; `read_chunked` generalized to write to
+      any `Write` with a cap) turns `request.dynamic` into a remote-playlist
+      scheduler — a Deezer playlist served by a local downloader daemon
+      plays through the existing download-then-play URL path (temp file per
+      track, auto-removed on track end), so any playlist size touches only
+      the current + prefetched track on disk. Acceptance: `request.rs`
+      unit tests (redirect-following GET into a string, non-2xx rejected)
+      plus a script-level test hitting a local server through
+      `json.parse(http_get(url))` (351 tests pass).
       Startup latency equals the fade duration (3 s in the live config —
       fine for broadcast; Icecast now-playing metadata runs that far
       ahead, cosmetic). New `playlist({..., crossfade = false})` returns a
@@ -75,8 +89,24 @@
       cross-check against ffmpeg `silencedetect` at the gate level —
       boundaries agree within 50 ms on steep decays and end *before* the
       peak-based reference on slow decays (the skipped remainder is ≥10 LU
-      below the ring's own mean, inaudible); four songs' silence exceeds
-      the 3 s ring and correctly floor the fade (349 tests pass).
+below the ring's own mean, inaudible); four songs' silence exceeds
+       the 3 s ring and correctly floor the fade (349 tests pass).
+       Fifth follow-up (pure BS.1770): the gate now K-weights the scanned
+       span first (BS.1770-4 Tables 1/2 at 48 kHz via De Man biquads —
+       the stage-2 high-pass reproduces the published coefficients to 1e-11,
+       the stage-1 shelf to ~5e-5, the ITU's own rounding) so a decaying
+       *high-frequency* tail stays audible exactly like a full-band one,
+       and the DC-biased machinery tests gave way to an AC gate suite at
+       4 kHz (125 Hz tone, one cycle per 32 frames) where the shelf corner
+       (1681.97 Hz) is honest. The fade-point geometry is pinned sample-
+       exact: the gate's `last_audible` lands a deterministic handful of
+       frames into the high-pass decay after the tone cut (e.g. 2010 frames
+       = 2000 music + 10 decay for a 5 s track), the fade covers exactly
+       that, the jump skips the trailing silence, and the drain replays the
+       incoming track's held tail. Acceptance: 7 gate tests (5 fade-point
+       scenarios: trailing silence, dead air, noise floor, click in the
+       tail, quiet track at −60 dBFS peak; plus the biquad-coefficient pin
+       and DC rejection), 354 tests pass, clippy clean, release build green.
 - [x] **G3.8 — `append`/`prepend` followers (`annotated`)**: the new
       `annotated(src, {append = "stinger.mp3", prepend = "intro.mp3"})`
       operator wraps any source and plays the followers after/before every

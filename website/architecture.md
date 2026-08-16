@@ -57,10 +57,12 @@ constant per-track gain.
   the incoming track's `fade_in` override, else the outgoing track's
   `fade_out`, else the global `crossfade_seconds`.
 - The overlap `crossfade` source ends each fade at the outgoing track's
-  audible tail: a BS.1770-style dual gate (absolute −70 dBFS, then −10 LU
-  below the track's own gated mean) over 50 ms/10 ms mean-square windows
-  finds the last audible frame (this replaced the removed
-  `smart_crossfade` operator's fixed-threshold window choice).
+  audible tail: the span is K-weighted first (BS.1770-4 Tables 1/2 at
+  48 kHz, De Man biquads), then a BS.1770-style dual gate (absolute
+  −70 dBFS, then −10 LU below the track's own gated mean) over
+  50 ms/10 ms mean-square windows finds the last audible frame (this
+  replaced the removed `smart_crossfade` operator's fixed-threshold
+  window choice).
 - `PriorityMixer` crossfades between the main source and an override (live DJ
   or jingle) with a gain ramp over `duck_seconds`.
 - Both mixers keep reusable scratch buffers so `next_buffer` never allocates.

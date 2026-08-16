@@ -864,7 +864,7 @@ impl AudioSource for DynamicRequestSource {
     }
 
     fn label(&self) -> Option<String> {
-        self.current_uri.as_ref().map(|uri| uri.display())
+        self.current.as_ref().and_then(|c| c.label())
     }
 
     fn replaygain_db(&self) -> Option<f32> {
@@ -2009,6 +2009,23 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         })?,
     )?;
 
+    // ---- control-plane GET (JSON listings, e.g. a local Deezer/Deezco
+    // daemon's track queue) ---------------------------------------------
+    // Synchronous because the caller needs the body back, and
+    // small-payload oriented (16 MiB cap). Errors raise, so callers can
+    // `pcall` around transient daemon hiccups.
+    globals.set(
+        "http_get",
+        lua.create_function(|_, (url, opts): (String, Option<Table>)| {
+            let timeout = opts
+                .and_then(|t| t.get::<Option<f64>>("timeout").ok().flatten())
+                .map(Duration::from_secs_f64)
+                .unwrap_or(Duration::from_secs(5));
+            crate::request::http_get_string(&url, timeout, None)
+                .map_err(|e| mlua::Error::runtime(format!("http_get: {e}")))
+        })?,
+    )?;
+
     // ---- JSON helpers ------------------------------------------------
     // `json.stringify` lets side-file writers (now/next-playing.txt) and
     // telnet handlers emit machine-readable output; `json.parse` reads it
@@ -2674,6 +2691,7 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
                 start_next: None,
                 append: None,
                 prepend: None,
+                title: None,
             };
             let wrapped = CueCutSource::new(child, cues, spec.rate, spec.channels.count());
             Ok(LuaSource::new(Box::new(wrapped)))
@@ -4063,6 +4081,44 @@ mod tests {
             saw_relay,
             "relay must preempt the fallback once it connects"
         );
+    }
+
+    #[test]
+    fn http_get_fetches_a_json_body_from_a_local_server() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        // The control-plane GET helper (a local Deezco-style daemon): the
+        // script fetches a JSON listing, parses it, and asserts a field —
+        // a Lua error would surface from `run`.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let url = format!("http://{addr}/playlists/1/next");
+        std::thread::spawn(move || {
+            for _ in 0..8 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut head = [0u8; 1024];
+                let _ = stream.read(&mut head);
+                let body = r#"{"title":"Radio For All","url":"http://127.0.0.1:9001/tracks/505921"}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                if stream.write_all(resp.as_bytes()).is_err() {
+                    return;
+                }
+                let _ = stream.flush();
+            }
+        });
+        let script = format!(
+            "t = json.parse(http_get(\"{url}\"))\n\
+             assert(t.title == 'Radio For All')\n\
+             assert(t.url:match('^http://127%.0%.0%.1') ~= nil)\n\
+             output.preview(sine({{duration = 0.1}}))\n"
+        );
+        run(&script).expect("script runs and assertions pass");
     }
 
     /// A minimal RIFF/WAVE sine (PCM 16-bit stereo) for the relay feed.

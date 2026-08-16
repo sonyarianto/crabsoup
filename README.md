@@ -219,6 +219,13 @@ Named options are Lua tables; most have defaults. `format` is `"mp3"`,
 - `request.dynamic(function() return uri_or_nil end)` — plays whatever the
   callback returns, one request ahead of the current track (nil ends the
   source) — a live-programming scheduler without a playlist file
+- `http_get(url)` / `http_post(url, payload)` — control-plane HTTP from
+  Lua: `http_get` returns the response body as a string (synchronous, 16
+  MiB cap, raises on failure; pair with `json.parse`); `http_post` is a
+  fire-and-forget JSON webhook. Together with `request.dynamic` they drive
+  remote playlists that never live on disk — e.g. a Deezer playlist served
+  by a local "Deezco" downloader daemon: the engine downloads each track
+  URL to a temp file, plays it, and deletes it when the track ends
 - `crossfade(src, {duration, curve})` — a top-level overlap crossfade over
   the consecutive tracks of any source (Liquidsoap's `crossfade`): a delay
   ring holds the outgoing track's tail and blends it with the incoming
@@ -289,6 +296,7 @@ shipped and verified; the status of the rest of the project is tracked in
 | `switch` (dayparting), `rotate` | `switch({ {when = {days, from, to}, src = ...}, {src = default} })`, `rotate({...}, {weights = ...})` |
 | `on_metadata` / `on_track` / `on_next_metadata` | `on_metadata(src, fn)` (title table), `on_track(src, fn)` (boundary, no args), `on_next_metadata(src, fn)` (upcoming title, preload/queue) |
 | `http://` / `https://` request resolution | `single("http(s)://...")`, `playlist(entries)`, `queue.push <url>` — download-then-play with retry/timeout, temp files auto-removed; HTTPS via rustls (redirects may cross scheme) |
+| `http_get` (control-plane GET) | `http_get(url)` — body as string, 16 MiB cap, raises on failure (pair with `json.parse`); drives remote playlists via `request.dynamic` |
 | `server.register` custom telnet commands | `server.register("name", function(args) return reply end)` |
 | `mksafe(src)` | `mksafe(src)` — composes `fallback({src, blank()})` |
 | `add([...])` | `add({a, b}, {weights = {0.5, 1.0}})` — sample-wise sum, bed + voice-over |

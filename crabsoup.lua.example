@@ -60,6 +60,34 @@ pl = playlist({directory = "./media", shuffle = false, loop = true})
 -- One-shot jingles, playable from the telnet control port (`jingles.play`).
 j = jingles({directory = "./jingles"})
 
+-- Remote playlist without local files (e.g. a Deezer playlist served by a
+-- sibling "Deezco" downloader daemon on localhost:9001): `http_get` is the
+-- control-plane GET (synchronous, 16 MiB cap, raises on failure) and
+-- `request.dynamic` asks for the next track lazily. The engine downloads
+-- each `http(s)://` URL to a temp file, plays it, and deletes the file
+-- when the track ends — so only the current track plus the prefetched
+-- next one ever touch the disk, whatever the playlist size. Wrap the
+-- recipe in `pcall` so a daemon hiccup returns nil (source drains) and
+-- `fallback` can carry the show instead of killing the script:
+--   deezco = "http://127.0.0.1:9001"
+--   playlist_id = "1234567890"
+--   function deezer_next()
+--       local ok, t = pcall(function()
+--           return json.parse(http_get(deezco .. "/playlists/" .. playlist_id .. "/next"))
+--       end)
+--       if not ok or t == nil or t.url == nil then
+--           log("deezco: no track (" .. tostring(t) .. ")")
+--           return nil
+--       end
+--       return "annotate:title=\"" .. t.title .. "\":" .. t.url
+--   end
+--   songs = request.dynamic(deezer_next)
+-- Use it in place of the local `pl`:
+--   jr = crossfade(rotate({songs, js}, {weights = {3, 1}}),
+--                  {duration = 3.0})
+--   output.icecast({host = ..., mount = "/crabsoup.opus", ...},
+--                  fallback({live, jr}))
+
 -- Automatic jingle rotation (the Liquidsoap `rotate` radio recipe):
 -- every N tracks a jingle plays, forever, picked at random. The jingle
 -- child loops and re-shuffles each cycle, so each pick is a fresh random

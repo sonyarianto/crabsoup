@@ -202,6 +202,7 @@ mod tests {
             amplify: None,start_next: None,
 append: None,
 prepend: None,
+title: None,
         }
     }
 
@@ -263,6 +264,7 @@ prepend: None,
                 start_next: None,
                 append: None,
                 prepend: None,
+                title: None,
             },
             RATE,
             CHANS,

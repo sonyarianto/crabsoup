@@ -14,7 +14,7 @@ soundcard.
   `rotate`, `jingles`, `mksafe`, `add`, `cue_cut`, `request.queue`,
   `request.dynamic`, `blank.detect`, `map_metadata`, `input.harbor`,
   `input.soundcard`, `input.http`, `output.icecast`, `output.preview`, `output.soundcard`,
-  `server.telnet`, `set`, `log`
+  `server.telnet`, `http_get`, `http_post`, `set`, `log`
 - **Playlist scheduling**: recursive directory scan, explicit file lists,
   loop and shuffle
 - **Gapless crossfades** with configurable overlap and fade curve, ending at

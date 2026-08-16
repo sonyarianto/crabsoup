@@ -86,6 +86,31 @@ request.dynamic(function() return "media/track.mp3" end)
 The next URI is requested as soon as a track is promoted, so a fast callback
 gives gapless handovers. Unresolvable requests are skipped and re-asked.
 
+## `http_get(url)` — control-plane GET
+
+Fetches a URL and returns the response body as a string (synchronous,
+16 MiB cap, raises on failure — wrap in `pcall` for transient daemon
+hiccups). Paired with `json.parse` and `request.dynamic` it drives remote
+playlists that never live on disk, e.g. a Deezer playlist served by a local
+"Deezco" downloader daemon:
+
+```lua
+deezco = "http://127.0.0.1:9001"
+playlist_id = "1234567890"
+songs = request.dynamic(function()
+    local ok, t = pcall(function()
+        return json.parse(http_get(deezco .. "/playlists/" .. playlist_id .. "/next"))
+    end)
+    if not ok or t == nil or t.url == nil then return nil end
+    return "annotate:title=\"" .. t.title .. "\":" .. t.url
+end)
+jr = crossfade(rotate({songs, jingles_src}, {weights = {3, 1}}), {duration = 3.0})
+```
+
+Each `http(s)://` URL is downloaded to a temp file, played, and the file is
+deleted when the track ends — only the current track plus the prefetched
+next one ever touch the disk, whatever the playlist size.
+
 ## `input.harbor({...})`
 
 The live DJ harbor — an Icecast source-protocol listener:
