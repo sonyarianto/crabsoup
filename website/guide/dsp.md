@@ -169,11 +169,14 @@ end)
 
 ## Request URIs: `annotate:` and `http(s)://`
 
-Any request URI can carry Liquidsoap-style cue points and fade overrides:
+Any request URI can carry per-track annotations — cue points, crossfade
+fades, and gain (linear or dB):
 
 ```
-annotate:liq_cue_in="30",liq_cue_out="180":/path/track.mp3
-annotate:liq_fade_in="2",liq_fade_out="3":http://example.com/track.opus
+annotate:cue_in="30",cue_out="180":/path/track.mp3
+annotate:fade_in="2",fade_out="3":http://example.com/track.opus
+annotate:amplify="0.7":/path/quiet.mp3
+annotate:amplify="-8.2 dB":/path/loud.mp3
 ```
 
 `http://` / `https://` requests are download-then-play with retry/timeout;

@@ -2618,6 +2618,7 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
                 cue_out,
                 fade_in,
                 fade_out,
+                amplify: None,
             };
             let wrapped = CueCutSource::new(child, cues, spec.rate, spec.channels.count());
             Ok(LuaSource::new(Box::new(wrapped)))
@@ -4195,6 +4196,44 @@ mod tests {
     }
 
     #[test]
+    fn amplify_annotation_scales_the_track_level() {
+        let real = PathBuf::from("jingles/audio/mrwashingt0n-simple-radio-jingle-501090.mp3");
+        if !real.exists() {
+            return;
+        }
+        let (_rt, res) = run(r#"
+            q = request.queue()
+            output.preview(q)
+            "#)
+        .expect("script runs");
+        let queue = res.request_queue.as_ref().expect("queue registered");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        let audio_in = |buf: &[f32]| buf.iter().any(|&s| s != 0.0);
+
+        // Sanity: the plain file is audible, so a mute below is meaningful.
+        queue.push(RequestUri::new(real.to_str().unwrap()));
+        let mut plain_loud = false;
+        for _ in 0..50 {
+            let n = root.next_buffer(&mut buf);
+            plain_loud |= audio_in(&buf[..n]);
+        }
+        assert!(plain_loud, "the plain jingle must produce audio");
+        queue.request_skip();
+
+        // The same file with an `amplify = 0` annotation is muted.
+        let annotated =
+            RequestUri::new(&format!("annotate:amplify=\"0.0\":{}", real.display()));
+        queue.push(annotated);
+        let mut muted = true;
+        for _ in 0..50 {
+            let n = root.next_buffer(&mut buf);
+            muted &= !audio_in(&buf[..n]);
+        }
+        assert!(muted, "amplify = 0 must mute the annotated track");
+    }
+
+    #[test]
     fn add_sums_sources_sample_wise() {
         let (_rt, res) = run(r#"
             output.preview(add({sine({freq = 440, amplitude = 0.5}),
@@ -4336,7 +4375,7 @@ mod tests {
             return;
         }
         let script = format!(
-            "output.preview(single(\"annotate:liq_cue_in=\\\"1\\\",liq_cue_out=\\\"2\\\":{}\"))",
+            "output.preview(single(\"annotate:cue_in=\\\"1\\\",cue_out=\\\"2\\\":{}\"))",
             real.display()
         );
         let (_rt, res) = run(&script).expect("script runs");
@@ -4396,7 +4435,7 @@ mod tests {
             return;
         }
         let script = format!(
-            "output.preview(single(\"annotate:liq_fade_in=\\\"2\\\",liq_fade_out=\\\"3\\\":{}\"))",
+            "output.preview(single(\"annotate:fade_in=\\\"2\\\",fade_out=\\\"3\\\":{}\"))",
             real.display()
         );
         let (_rt, res) = run(&script).expect("script runs");

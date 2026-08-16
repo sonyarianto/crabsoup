@@ -155,8 +155,8 @@ One engine thread plus one thread per output:
 - `RequestUri` (`Local(PathBuf, Option<TrackCues>)` | `Url(String,
   Option<TrackCues>)`): `single`, `playlist` entries, and the telnet
   request queue all carry URIs and resolve at play time via `resolve()`.
-  `new()` parses a Liquidsoap-style `annotate:` prefix (`liq_cue_in`,
-  `liq_cue_out`, `liq_fade_in`, `liq_fade_out`) into a `TrackCues`;
+  `new()` parses the `annotate:` prefix (`cue_in`,
+  `cue_out`, `fade_in`, `fade_out`) into a `TrackCues`;
   malformed prefixes fall back to the plain URI. `TrackCues` holds `f64`s,
   so `RequestUri`'s `Eq`/`Ord` are hand-written (`None` < `Some`, values
   by `total_cmp`). `Local` opens a `FileSource`; `Url` downloads to
@@ -174,7 +174,7 @@ One engine thread plus one thread per output:
   playlist trims every track). `CueCutSource` also reports per-track
   crossfade overrides via `AudioSource::crossfade_overrides()` (its
   `fade_in`/`fade_out`), and `apply_cues` wraps even when *only* fades are
-  set, so `annotate:liq_fade_in=...` alone reaches the mixer.
+  set, so `annotate:fade_in=...` alone reaches the mixer.
 - The HTTP client is hand-rolled on a `Transport` enum — a plain
   `TcpStream` for `http://`, a `rustls::StreamOwned` (ring provider,
   webpki-roots Mozilla store) for `https://` — and the status/header/chunked

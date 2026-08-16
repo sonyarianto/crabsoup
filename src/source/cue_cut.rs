@@ -194,6 +194,7 @@ mod tests {
             cue_out,
             fade_in: None,
             fade_out: None,
+            amplify: None,
         }
     }
 
@@ -251,6 +252,7 @@ mod tests {
                 cue_out: None,
                 fade_in: Some(2.0),
                 fade_out: Some(3.0),
+                amplify: None,
             },
             RATE,
             CHANS,

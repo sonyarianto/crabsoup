@@ -1,3 +1,4 @@
+pub mod amplify;
 pub mod blank_detect;
 pub mod cue_cut;
 pub mod file;

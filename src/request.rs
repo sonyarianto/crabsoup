@@ -66,6 +66,10 @@ pub struct TrackCues {
     pub fade_in: Option<f64>,
     /// Per-track crossfade fade-out override in seconds, if set.
     pub fade_out: Option<f64>,
+    /// Per-track linear gain multiplier (the `amplify` annotation), if
+    /// set. The annotation accepts a plain factor (`"0.7"`) or dB with the
+    /// `dB` suffix (`"-8.2 dB"`); both land here as a linear multiplier.
+    pub amplify: Option<f64>,
 }
 
 /// A media item: a local file path or an HTTP(S) URL, with optional per-track
@@ -165,10 +169,11 @@ fn cmp_opt(a: &Option<f64>, b: &Option<f64>) -> std::cmp::Ordering {
 }
 
 /// Parse a Liquidsoap-style `annotate:` prefix: `key="value",key="value":<uri>`.
-/// Recognized keys are `liq_cue_in`, `liq_cue_out`, `liq_fade_in`,
-/// `liq_fade_out`; other keys are ignored (they carry arbitrary metadata in
-/// Liquidsoap). Returns the bare URI and any cue points. Malformed prefixes
-/// fall back to the whole string as a plain URI with no cues.
+/// Recognized keys are `cue_in`, `cue_out`, `fade_in`,
+/// `fade_out`, `amplify`; other keys are ignored (they carry
+/// arbitrary metadata in Liquidsoap). Returns the bare URI and any cue
+/// points. Malformed prefixes fall back to the whole string as a plain URI
+/// with no cues.
 fn parse_annotate(uri: &str) -> (String, Option<TrackCues>) {
     let Some(rest) = uri.strip_prefix("annotate:") else {
         return (uri.to_string(), None);
@@ -214,23 +219,42 @@ fn parse_annotate(uri: &str) -> (String, Option<TrackCues>) {
         {
             let v = if v == 0.0 { 0.0 } else { v }; // -0.0 == 0.0, same in total_cmp
             match key {
-                "liq_cue_in" => {
+                "cue_in" => {
                     cues.cue_in = v;
                     found = true;
                 }
-                "liq_cue_out" => {
+                "cue_out" => {
                     cues.cue_out = Some(v);
                     found = true;
                 }
-                "liq_fade_in" => {
+                "fade_in" => {
                     cues.fade_in = Some(v);
                     found = true;
                 }
-                "liq_fade_out" => {
+                "fade_out" => {
                     cues.fade_out = Some(v);
                     found = true;
                 }
+                "amplify" => {
+                    cues.amplify = Some(v);
+                    found = true;
+                }
                 _ => {} // unknown annotate key: carried but ignored
+            }
+        } else if key == "amplify" {
+            // The annotation also accepts decibels with the `dB` suffix
+            // ("-8.2 dB" — spaces do not matter), which plain f64 parse
+            // rejects. Convert to a linear multiplier.
+            let trimmed = value.trim();
+            let bare = trimmed
+                .get(..trimmed.len().saturating_sub(2))
+                .filter(|_| trimmed.ends_with("dB") || trimmed.ends_with("db"));
+            if let Some(bare) = bare
+                && let Ok(db) = bare.trim().parse::<f64>()
+                && db.is_finite()
+            {
+                cues.amplify = Some(crate::engine::effects::db_to_gain(db as f32) as f64);
+                found = true;
             }
         }
         // Separator: ',' continues metadata, ':' starts the URI.
@@ -310,13 +334,15 @@ impl crate::source::AudioSource for DownloadSource {
 }
 
 /// Wrap a resolved source in [`CueCutSource`] when the request carries cue
-/// points or fade overrides; otherwise return it unchanged.
+/// points or fade overrides, and in [`TrackGainSource`] when it carries an
+/// `amplify` annotation; otherwise return it unchanged.
 fn apply_cues(
     src: Box<dyn crate::source::AudioSource>,
     cues: Option<TrackCues>,
     target: symphonia::core::audio::SignalSpec,
 ) -> Box<dyn crate::source::AudioSource> {
-    match cues {
+    let gain = cues.and_then(|c| c.amplify);
+    let mut out = match cues {
         Some(c)
             if c.cue_in > 0.0
                 || c.cue_out.is_some()
@@ -331,7 +357,11 @@ fn apply_cues(
             ))
         }
         _ => src,
+    };
+    if let Some(g) = gain {
+        out = Box::new(crate::source::amplify::TrackGainSource::new(out, g as f32));
     }
+    out
 }
 
 /// Resolve a request to a playable source, downloading first if needed.
@@ -1194,7 +1224,7 @@ mod tests {
 
     #[test]
     fn annotate_prefix_parses_cue_points_and_strips_to_the_uri() {
-        let uri = RequestUri::new("annotate:liq_cue_in=\"30\",liq_cue_out=\"180\":media/a.mp3");
+        let uri = RequestUri::new("annotate:cue_in=\"30\",cue_out=\"180\":media/a.mp3");
         assert_eq!(
             uri,
             RequestUri::Local(
@@ -1204,6 +1234,7 @@ mod tests {
                     cue_out: Some(180.0),
                     fade_in: None,
                     fade_out: None,
+                    amplify: None,
                 })
             )
         );
@@ -1214,7 +1245,7 @@ mod tests {
     #[test]
     fn annotate_prefix_handles_http_uris_and_ignores_unknown_keys() {
         let uri =
-            RequestUri::new("annotate:title=\"intro\",liq_cue_in=\"5\":http://x.example/track.mp3");
+            RequestUri::new("annotate:title=\"intro\",cue_in=\"5\":http://x.example/track.mp3");
         assert_eq!(
             uri,
             RequestUri::Url(
@@ -1224,6 +1255,7 @@ mod tests {
                     cue_out: None,
                     fade_in: None,
                     fade_out: None,
+                    amplify: None,
                 })
             )
         );
@@ -1233,7 +1265,7 @@ mod tests {
     fn fade_only_annotate_carries_the_overrides() {
         // No cue points, just fade overrides: parsed and reported for the
         // CrossfadeMixer (step 2).
-        let uri = RequestUri::new("annotate:liq_fade_in=\"2\",liq_fade_out=\"3\":media/a.mp3");
+        let uri = RequestUri::new("annotate:fade_in=\"2\",fade_out=\"3\":media/a.mp3");
         assert_eq!(
             uri,
             RequestUri::Local(
@@ -1243,18 +1275,51 @@ mod tests {
                     cue_out: None,
                     fade_in: Some(2.0),
                     fade_out: Some(3.0),
+                    amplify: None,
                 })
             )
         );
     }
 
     #[test]
+    fn amplify_annotation_parses_linear_and_db_values() {
+        let linear = RequestUri::new("annotate:amplify=\"0.5\":media/a.mp3");
+        assert_eq!(
+            linear,
+            RequestUri::Local(
+                "media/a.mp3".into(),
+                Some(TrackCues {
+                    cue_in: 0.0,
+                    cue_out: None,
+                    fade_in: None,
+                    fade_out: None,
+                    amplify: Some(0.5),
+                })
+            )
+        );
+        // dB values (spaces do not matter) land as linear multipliers.
+        let db = RequestUri::new("annotate:amplify=\"-8.2 dB\":media/a.mp3");
+        let db_gain = match db {
+            RequestUri::Local(_, Some(c)) => c.amplify.expect("dB gain parsed"),
+            _ => panic!("dB annotation must yield cues"),
+        };
+        let expected = crate::engine::effects::db_to_gain(-8.2) as f64;
+        assert!(
+            (db_gain - expected).abs() < 1e-6,
+            "expected {expected}, got {db_gain}"
+        );
+        // Unknown/ill-formed values are ignored like any other key.
+        let bad = RequestUri::new("annotate:amplify=\"loud\":media/a.mp3");
+        assert_eq!(bad, RequestUri::Local("media/a.mp3".into(), None));
+    }
+
+    #[test]
     fn malformed_annotate_prefix_falls_back_to_a_plain_uri() {
         // No separating ':' after the metadata: treat as a plain path.
-        let uri = RequestUri::new("annotate:liq_cue_in=\"30\"");
+        let uri = RequestUri::new("annotate:cue_in=\"30\"");
         assert_eq!(
             uri,
-            RequestUri::Local("annotate:liq_cue_in=\"30\"".into(), None)
+            RequestUri::Local("annotate:cue_in=\"30\"".into(), None)
         );
         // Unknown keys only: no cues (metadata is not acted on).
         let uri = RequestUri::new("annotate:title=\"x\":/path/a.mp3");
@@ -1266,7 +1331,7 @@ mod tests {
         // `inf`/`NaN` would corrupt the sample-count math (and break the
         // Eq/Ord consistency of TrackCues), so they must not become cues.
         for bad in ["inf", "-inf", "NaN"] {
-            let uri = RequestUri::new(&format!("annotate:liq_cue_in=\"{bad}\":media/a.mp3"));
+            let uri = RequestUri::new(&format!("annotate:cue_in=\"{bad}\":media/a.mp3"));
             assert_eq!(
                 uri,
                 RequestUri::Local("media/a.mp3".into(), None),
@@ -1274,7 +1339,7 @@ mod tests {
             );
         }
         // A good value next to a bad one still applies.
-        let uri = RequestUri::new("annotate:liq_cue_in=\"inf\",liq_cue_out=\"5\":media/a.mp3");
+        let uri = RequestUri::new("annotate:cue_in=\"inf\",cue_out=\"5\":media/a.mp3");
         assert_eq!(
             uri,
             RequestUri::Local(
@@ -1284,6 +1349,7 @@ mod tests {
                     cue_out: Some(5.0),
                     fade_in: None,
                     fade_out: None,
+                    amplify: None,
                 })
             )
         );
