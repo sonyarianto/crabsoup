@@ -1,7 +1,7 @@
 # Crabsoup
 
 [![Sponsor](https://img.shields.io/badge/Sponsor-GitHub%20Sponsors-ea4aaa.svg)](https://github.com/sponsors/sonyarianto)
-[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/sonyarianto/crabsoup/actions/workflows/ci.yml/badge.svg)](https://github.com/sonyarianto/crabsoup/actions/workflows/ci.yml)
 
 An audio/video streaming engine in one binary: the Lua runtime, scheduler,
@@ -368,7 +368,7 @@ See [ROADMAP.md](ROADMAP.md).
 
 ## License
 
-AGPL-3.0
+MIT
 
 If Crabsoup runs your station and you want to say thanks: [GitHub
 Sponsors](https://github.com/sponsors/sonyarianto) · [Buy Me a

@@ -3,7 +3,7 @@ name = "crabsoup"
 version = "0.1.0"
 edition = "2024"
 description = "Liquidsoap-inspired audio streaming engine: playlist scheduling, crossfades, live DJ ducking, Icecast output (MP3/Opus)"
-license = "AGPL-3.0"
+license = "MIT"
 
 [dependencies]
 # Audio decoding + resampling
