@@ -10,7 +10,7 @@ Recursively scanned directory and/or explicit file lists, with loop and
 shuffle:
 
 ```lua
-pl = playlist({directory = "./media", shuffle = false, loop = true})
+pl = playlist({directory = "./internal/media", shuffle = false, loop = true})
 ```
 
 ## `single("path")`
@@ -23,7 +23,7 @@ One-shot clips played over the music, triggered from the
 [telnet control port](/guide/control-port):
 
 ```lua
-j = jingles({directory = "./jingles"})
+j = jingles({directory = "./internal/jingles"})
 ```
 
 ## `fallback({...})` / `sequence({...})`
@@ -47,8 +47,8 @@ at each track boundary; the last slot must be a default without `when`.
 `track_sensitive = false` re-checks every buffer and cuts mid-track.
 
 ```lua
-daytime = playlist({directory = "./media/day"})
-overnight = playlist({directory = "./media/night"})
+daytime = playlist({directory = "./internal/media/day"})
+overnight = playlist({directory = "./internal/media/night"})
 pl = switch({{when = {days = {"mon", "tue", "wed", "thu", "fri"},
                       from = "09:00", to = "17:00"}, src = daytime},
              {src = overnight}})
@@ -80,7 +80,7 @@ Plays the requests its Lua callback returns, one ahead of the current track
 (nil ends the source) — a live-programming scheduler without a playlist file:
 
 ```lua
-request.dynamic(function() return "media/track.mp3" end)
+request.dynamic(function() return "internal/media/track.mp3" end)
 ```
 
 The next URI is requested as soon as a track is promoted, so a fast callback
@@ -148,7 +148,7 @@ backoff when the connection drops:
 
 ```lua
 relay = input.http("https://feed.example.net/affiliate.mp3")
-output.preview(fallback({relay, playlist({directory = "./media"})}))
+output.preview(fallback({relay, playlist({directory = "./internal/media"})}))
 ```
 
 While disconnected the relay reports exhausted, so a `fallback` around it

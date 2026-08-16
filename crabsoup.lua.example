@@ -18,14 +18,14 @@ set("fade_curve", 1.0)           -- 1.0 = linear, 2.0 = equal-ish power
 set("duck_seconds", 1.5)         -- fade time into/out of a live DJ
 
 -- Local media playback: recursively scanned directory and/or explicit files.
-pl = playlist({directory = "./media", shuffle = false, loop = true})
+pl = playlist({directory = "./internal/media", shuffle = false, loop = true})
 
 -- DSP effects chain (each wraps the previous stage):
 --   stretch({ratio = 1.5}, src)     tempo change, pitch preserved
 --   pitch({semitones = 7}, src)     key shift, duration preserved
 --   echo(src, {delay = 0.25, ping = 0.5, feedback = 0.5,
 --              delay2 = 0.5, ping2 = 0.25})   multi-tap echo
---   reverb(src, {ir = "./media/hall.wav", wet = 0.3, dry = 0.7})  convolution
+--   reverb(src, {ir = "./internal/media/hall.wav", wet = 0.3, dry = 0.7})  convolution
 --   eq(src, {bands = {{type = "lowpass", freq = 15000},
 --                     {type = "peaking", freq = 1000, gain = 3, q = 1.0}}})
 --   filter(src, {type = "highpass", freq = 80})   single-band biquad
@@ -47,8 +47,8 @@ pl = playlist({directory = "./media", shuffle = false, loop = true})
 -- source, so audio never stops. `USE_ST` toggles the chain for A/B.
 -- USE_ST = true
 -- if USE_ST then
---     st = pipe({process = 'tools/stereo_tool/stereo_tool_cmd_64 -q -s '
---                       .. 'tools/stereo_tool/audio.sts '
+--     st = pipe({process = 'internal/tools/stereo_tool/stereo_tool_cmd_64 -q -s '
+--                       .. 'internal/tools/stereo_tool/audio.sts '
 --                       .. '-b 16 -r 44100 -k "<your-key>" - -',
 --                format = "s16le"},
 --               pl)
@@ -58,7 +58,7 @@ pl = playlist({directory = "./media", shuffle = false, loop = true})
 -- end
 
 -- One-shot jingles, playable from the telnet control port (`jingles.play`).
-j = jingles({directory = "./jingles"})
+j = jingles({directory = "./internal/jingles"})
 
 -- Remote playlist without local files (e.g. a Deezer playlist served by a
 -- sibling "Deezco" downloader daemon on localhost:9001): `http_get` is the
@@ -98,14 +98,14 @@ j = jingles({directory = "./jingles"})
 -- jingle->jingle. `weights = {3, 1}` means 3 songs, 1 jingle, strictly
 -- alternating at track boundaries (Liquidsoap's rotate picks randomly
 -- per track instead). Use the wrapped source in place of `pl` (and `j`):
---   songs = playlist({directory = "./media", crossfade = false})
---   js = playlist({directory = "./jingles", loop = true, shuffle = true,
+--   songs = playlist({directory = "./internal/media", crossfade = false})
+--   js = playlist({directory = "./internal/jingles", loop = true, shuffle = true,
 --                  crossfade = false})
 --   jr = crossfade(rotate({songs, js}, {weights = {3, 1}}),
 --                  {duration = 3.0})
 --   output.icecast({host = ..., mount = "/crabsoup.opus", ...},
 --                  fallback({live, jr}))
--- Per-track followers (`annotated(src, {append = "jingles/x.mp3"})`) are
+-- Per-track followers (`annotated(src, {append = "internal/jingles/x.mp3"})`) are
 -- the fixed-jingle variant: the same track after every song, no rotation.
 
 -- Live DJ harbor (Icecast source protocol): DJs PUT to this mount and the
@@ -151,7 +151,7 @@ output.icecast({host = "localhost", port = 8000,
 -- decode thread, and `output.hls` interleaves both into keyframe-aligned
 -- MPEG-TS segments plus `index.m3u8` (master) / `playlist.m3u8` (media).
 -- Keep the two lists over the same files, in the same order, for a/v sync.
--- vpl = video.playlist({directory = "./media/video", loop = true})
+-- vpl = video.playlist({directory = "./internal/media/video", loop = true})
 -- output.hls({directory = "/var/www/hls", video = vpl,
 --             segment_seconds = 4, retention = 12},
 --            fallback({j, live, pl}))
@@ -169,7 +169,7 @@ output.icecast({host = "localhost", port = 8000,
 -- updated marker and compose, so the output encodes at the scaled size.
 -- -- src = video.scale({width = 640, height = 360},
 -- --                   video.fade({fade_in = 1, fade_out = 2},
--- --                              video.video("./media/video/clip.mp4")))
+-- --                              video.video("./internal/media/video/clip.mp4")))
 -- -- output.hls({directory = "/var/www/hls", video = src,
 -- --             segment_seconds = 4, retention = 12},
 -- --            fallback({j, live, pl}))
@@ -178,7 +178,7 @@ output.icecast({host = "localhost", port = 8000,
 -- add `video` for h264+aac). Publishes FLV (raw AAC, optional H.264) to any
 -- RTMP server, e.g. nginx-rtmp on localhost:1935. `url` is required; drop
 -- `video = vpl` (and the vpl line) for audio-only.
--- -- vpl = video.playlist({directory = "./media/video", loop = true})
+-- -- vpl = video.playlist({directory = "./internal/media/video", loop = true})
 -- -- output.rtmp({url = "rtmp://localhost/live/stream", bitrate = 128000,
 -- --              video = vpl},
 -- --             fallback({j, live, pl}))
@@ -187,6 +187,6 @@ output.icecast({host = "localhost", port = 8000,
 -- video`; drop `video = vpl` and the vpl line for audio-only). The file is
 -- opened at script start and finalized with the moov trailer when the tap
 -- ends or on shutdown, so it is always seekable.
--- -- vpl = video.playlist({directory = "./media/video", loop = true})
+-- -- vpl = video.playlist({directory = "./internal/media/video", loop = true})
 -- -- output.mp4({file = "/tmp/out.mp4", bitrate = 128000, video = vpl},
 -- --            fallback({j, live, pl}))

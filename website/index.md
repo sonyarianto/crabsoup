@@ -43,8 +43,8 @@ set("channels", 2)
 set("crossfade_seconds", 3.0)    -- track-to-track overlap
 set("duck_seconds", 1.5)         -- live DJ / jingle fade time
 
-pl = playlist({directory = "./media", shuffle = false, loop = true})
-j  = jingles({directory = "./jingles"})        -- telnet-triggered clips
+pl = playlist({directory = "./internal/media", shuffle = false, loop = true})
+j  = jingles({directory = "./internal/jingles"})        -- telnet-triggered clips
 live = input.harbor({port = 8005, mount = "/live", password = "dj"})
 server.telnet({host = "127.0.0.1", port = 1234})
 

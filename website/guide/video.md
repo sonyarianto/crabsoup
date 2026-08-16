@@ -36,10 +36,10 @@ script evaluation (fail fast) and returns an opaque marker table for
 `output.hls`.
 
 ```lua
-video.video("media/clip.mp4")            -- one file, plays once
-video.single("media/clip.mp4")           -- same, registered as a sequence
+video.video("internal/media/clip.mp4")            -- one file, plays once
+video.single("internal/media/clip.mp4")           -- same, registered as a sequence
 
-vpl = video.playlist({directory = "./media/video", shuffle = true})  -- loops by default
+vpl = video.playlist({directory = "./internal/media/video", shuffle = true})  -- loops by default
 vpl = video.playlist({files = {"a.mp4", "b.mp4"}, loop = false})     -- plays once
 
 ss = video.slideshow({directory = "./art", seconds_per_image = 5,
@@ -70,14 +70,14 @@ Both operators wrap any `video.*` marker and return an updated marker
 (they compose, in any order):
 
 ```lua
-src   = video.video("media/clip.mp4")
+src   = video.video("internal/media/clip.mp4")
 scaled = video.scale({width = 1280, height = 720}, src)
 faded  = video.fade({fade_in = 2, fade_out = 3}, scaled)
 
 -- or straight from a playlist / slideshow:
 vpl = video.fade({fade_in = 1},
                  video.scale({width = 640, height = 360},
-                             video.playlist({directory = "./media/video"})))
+                             video.playlist({directory = "./internal/media/video"})))
 ```
 
 - `video.scale({width, height}, marker)` rescales to the target size
@@ -98,8 +98,8 @@ The audio of each video file is **not** played by these operators — the
 audio graph is untouched. Feed it separately, over the same files:
 
 ```lua
-pl  = playlist({directory = "./media/video", loop = true})  -- audio side
-vpl = video.playlist({directory = "./media/video", loop = true})  -- video side
+pl  = playlist({directory = "./internal/media/video", loop = true})  -- audio side
+vpl = video.playlist({directory = "./internal/media/video", loop = true})  -- video side
 ```
 
 Run both lists in the same order and the two sides stay in sync; a/v sync

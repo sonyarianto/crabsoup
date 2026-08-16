@@ -41,7 +41,7 @@ Uniformly partitioned overlap-save with zero added latency — reverb of a
 transient starts exactly at the transient:
 
 ```lua
-reverb(src, {ir = "./media/hall.wav", wet = 0.3, dry = 0.7})
+reverb(src, {ir = "./internal/media/hall.wav", wet = 0.3, dry = 0.7})
 ```
 
 ## `eq(source, {bands})` / `filter(source, opts)`
@@ -89,8 +89,8 @@ Offline analysis (pure-Rust, no FFI): `bpm()` returns the tempo in BPM
 profiles):
 
 ```lua
-tempo = bpm("./media/track.mp3")   -- e.g. 123.4
-k = key("./media/track.mp3")       -- e.g. "A major"
+tempo = bpm("./internal/media/track.mp3")   -- e.g. 123.4
+k = key("./internal/media/track.mp3")       -- e.g. "A major"
 ```
 
 ## `replaygain(source, opts)`
@@ -190,10 +190,10 @@ per request, or for every track of a source with the `annotated`
 operator:
 
 ```
-annotate:append="jingles/stinger.mp3":/path/track.mp3
+annotate:append="internal/jingles/stinger.mp3":/path/track.mp3
 annotate:append="false":/path/no-stinger.mp3
-src = annotated(playlist({...}), {append = "jingles/stinger.mp3",
-                                  prepend = "jingles/intro.mp3"})
+src = annotated(playlist({...}), {append = "internal/jingles/stinger.mp3",
+                                  prepend = "internal/jingles/intro.mp3"})
 ```
 
 The follower plays after (`append`) or before (`prepend`) the track, is
@@ -213,8 +213,8 @@ exact track boundary — the next track's first buffer is held until the
 schedule rotates back, so nothing bleeds across the handover:
 
 ```
-songs = playlist({directory = "./media", shuffle = true, crossfade = false})
-jingles = playlist({directory = "./jingles", loop = true, shuffle = true,
+songs = playlist({directory = "./internal/media", shuffle = true, crossfade = false})
+jingles = playlist({directory = "./internal/jingles", loop = true, shuffle = true,
                     crossfade = false})
 src = crossfade(rotate({songs, jingles}, {weights = {3, 1}}),
                 {duration = 3.0})

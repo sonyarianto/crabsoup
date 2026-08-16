@@ -747,8 +747,8 @@ mod tests {
 
     fn jingles() -> Vec<PathBuf> {
         vec![
-            PathBuf::from("jingles/a-intro.mp3"),
-            PathBuf::from("jingles/b-sting.wav"),
+            PathBuf::from("internal/jingles/a-intro.mp3"),
+            PathBuf::from("internal/jingles/b-sting.wav"),
         ]
     }
 
@@ -1159,7 +1159,7 @@ mod tests {
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(
             v["jingles"],
-            serde_json::json!(["jingles/a-intro.mp3", "jingles/b-sting.wav"])
+            serde_json::json!(["internal/jingles/a-intro.mp3", "internal/jingles/b-sting.wav"])
         );
 
         let (code, body) = http_route("POST", "/cmd", r#"{"command":"skip"}"#, &ctx, &mut rng);

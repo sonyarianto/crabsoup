@@ -82,7 +82,7 @@ cargo bench --bench engine   # hot-path baselines (mixers, resampler, effects, e
 ```
 
 Tests are inline `#[cfg(test)]` modules per source file. A few tests use real
-files from `media/` and `jingles/` and skip when they are absent. The
+files from `internal/media/` and `internal/jingles/` and skip when they are absent. The
 `CRABSOUP_DUMP=/path/out.ogg` env var makes the Opus end-to-end test persist
 the encoded stream for external inspection (ffprobe, curl to Icecast).
 

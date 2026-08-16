@@ -10,8 +10,8 @@ set("crossfade_seconds", 3.0)    -- track-to-track overlap
 set("fade_curve", 1.0)           -- 1.0 linear, 2.0 equal-ish power
 set("duck_seconds", 1.5)         -- live DJ / jingle fade time
 
-pl = playlist({directory = "./media", shuffle = false, loop = true})
-j  = jingles({directory = "./jingles"})        -- telnet-triggered clips
+pl = playlist({directory = "./internal/media", shuffle = false, loop = true})
+j  = jingles({directory = "./internal/jingles"})        -- telnet-triggered clips
 live = input.harbor({port = 8005, mount = "/live", password = "dj"})
 server.telnet({host = "127.0.0.1", port = 1234})
 
@@ -28,7 +28,7 @@ Named options are passed as Lua tables; most have defaults. `format` is
 
 1. `set()` fixes the PCM bus spec — every source is resampled/converted to
    this before mixing.
-2. The `playlist` scans `./media` recursively for audio files. A `jingles`
+2. The `playlist` scans `./internal/media` recursively for audio files. A `jingles`
    source stages one-shot clips for the control port.
 3. `input.harbor` opens an Icecast source-protocol listener on port 8005; a
    DJ who `PUT`s to `/live` ducks the playlist out via the mixer.

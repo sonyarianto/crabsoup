@@ -8,8 +8,8 @@
 //! set("sample_rate", 44100)
 //! set("crossfade_seconds", 3.0)
 //!
-//! pl = playlist({directory = "./media", shuffle = true})
-//! j  = jingles({directory = "./jingles"})
+//! pl = playlist({directory = "./internal/media", shuffle = true})
+//! j  = jingles({directory = "./internal/jingles"})
 //! live = input.harbor({mount = "/live", password = "dj"})
 //! server.telnet({port = 1234})
 //!
@@ -4342,7 +4342,7 @@ mod tests {
 
     #[test]
     fn amplify_annotation_scales_the_track_level() {
-        let real = PathBuf::from("jingles/audio/mrwashingt0n-simple-radio-jingle-501090.mp3");
+        let real = PathBuf::from("internal/jingles/audio/mrwashingt0n-simple-radio-jingle-501090.mp3");
         if !real.exists() {
             return;
         }
@@ -4513,9 +4513,9 @@ mod tests {
 
     #[test]
     fn annotate_uri_plays_through_single_with_cue_points() {
-        // A real file with an annotate: cue window; skipped when media/ is
+        // A real file with an annotate: cue window; skipped when internal/media/ is
         // absent, like the other real-file tests.
-        let real = PathBuf::from("media/sunset-house-grooves-deep-house-sunset-538759.mp3");
+        let real = PathBuf::from("internal/media/sunset-house-grooves-deep-house-sunset-538759.mp3");
         if !real.exists() {
             return;
         }
@@ -4581,7 +4581,7 @@ mod tests {
     fn annotate_fade_keys_reach_the_resolved_source() {
         // An `annotate:` prefix with only fade keys (no cue points) must
         // still wrap the source so the mixer sees the overrides.
-        let real = PathBuf::from("media/sunset-house-grooves-deep-house-sunset-538759.mp3");
+        let real = PathBuf::from("internal/media/sunset-house-grooves-deep-house-sunset-538759.mp3");
         if !real.exists() {
             return;
         }
@@ -4725,7 +4725,7 @@ mod tests {
 
     #[test]
     fn request_queue_preempts_a_playing_playlist_when_pushed() {
-        let real = PathBuf::from("media/sunset-house-grooves-deep-house-sunset-538759.mp3");
+        let real = PathBuf::from("internal/media/sunset-house-grooves-deep-house-sunset-538759.mp3");
         if !real.exists() {
             return;
         }
@@ -4846,7 +4846,7 @@ mod tests {
 
     #[test]
     fn on_next_metadata_reports_the_preloaded_crossfade_track() {
-        let dir = "jingles/audio";
+        let dir = "internal/jingles/audio";
         if !std::path::Path::new(dir).is_dir() {
             return;
         }
@@ -4890,7 +4890,7 @@ mod tests {
 
     #[test]
     fn on_next_metadata_reports_the_next_queued_request() {
-        let jingle = std::path::Path::new("jingles/audio/mrwashingt0n-radio-for-all-505928.mp3");
+        let jingle = std::path::Path::new("internal/jingles/audio/mrwashingt0n-radio-for-all-505928.mp3");
         if !jingle.exists() {
             return;
         }
@@ -4902,8 +4902,8 @@ mod tests {
             "#)
         .expect("script runs");
         let queue = res.request_queue.expect("request queue");
-        let first = "jingles/audio/mrwashingt0n-simple-radio-jingle-501090.mp3";
-        let second = "jingles/audio/mrwashingt0n-radio-for-all-505928.mp3";
+        let first = "internal/jingles/audio/mrwashingt0n-simple-radio-jingle-501090.mp3";
+        let second = "internal/jingles/audio/mrwashingt0n-radio-for-all-505928.mp3";
         queue.push(RequestUri::new(first));
         queue.push(RequestUri::new(second));
         let first_stem = "mrwashingt0n-simple-radio-jingle-501090";
@@ -4936,11 +4936,11 @@ mod tests {
 
     #[test]
     fn start_next_annotation_starts_the_next_track_earlier() {
-        let first = PathBuf::from("jingles/audio/mrwashingt0n-radio-for-all-505928.mp3");
+        let first = PathBuf::from("internal/jingles/audio/mrwashingt0n-radio-for-all-505928.mp3");
         if !first.exists() {
             return;
         }
-        let second = "jingles/audio/mrwashingt0n-radio-for-all-trance-505921.mp3";
+        let second = "internal/jingles/audio/mrwashingt0n-radio-for-all-trance-505921.mp3";
         let annotated = format!("annotate:start_next=\"5\":{}", first.display());
         let (_rt, res) = run(&format!(r#"
             next_seen = nil
@@ -6483,9 +6483,9 @@ mod tests {
         // Reproduce the user's exact recipe with their real files (jingles
         // 11-30 s, songs real MP3s) and dump label changes + silence runs.
         let (_rt, _res) = run(r#"
-            songs = playlist({directory = "./media/audio/songs", shuffle = true, loop = true,
+            songs = playlist({directory = "./internal/media/audio/songs", shuffle = true, loop = true,
                               crossfade = false})
-            j = playlist({directory = "./jingles/audio", loop = true, shuffle = true,
+            j = playlist({directory = "./internal/jingles/audio", loop = true, shuffle = true,
                           crossfade = false})
             src = crossfade(rotate({songs, j}, {weights = {1, 1}}), {duration = 3.0})
             output.preview(src)

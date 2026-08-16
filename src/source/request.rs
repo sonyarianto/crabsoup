@@ -250,7 +250,7 @@ mod tests {
     #[test]
     fn plays_a_pushed_real_file() {
         // A short jingle (~12 s) so the test can drain the track fully.
-        let real = RequestUri::new("jingles/mrwashingt0n-simple-radio-jingle-501090.mp3");
+        let real = RequestUri::new("internal/jingles/mrwashingt0n-simple-radio-jingle-501090.mp3");
         let RequestUri::Local(path, _) = &real else {
             return;
         };

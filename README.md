@@ -25,8 +25,8 @@ set("crossfade_seconds", 3.0)    -- track-to-track overlap
 set("fade_curve", 1.0)           -- 1.0 linear, 2.0 equal-ish power
 set("duck_seconds", 1.5)         -- live DJ / jingle fade time
 
-pl = playlist({directory = "./media", shuffle = false, loop = true})
-j  = jingles({directory = "./jingles"})        -- telnet-triggered clips
+pl = playlist({directory = "./internal/media", shuffle = false, loop = true})
+j  = jingles({directory = "./internal/jingles"})        -- telnet-triggered clips
 live = input.harbor({port = 8005, mount = "/live", password = "dj"})
 server.telnet({host = "127.0.0.1", port = 1234})
 
@@ -258,8 +258,8 @@ Named options are Lua tables; most have defaults. `format` is `"mp3"`,
 - `output.preview(...)` — decode and mix without broadcasting
 
 ```lua
-daytime = playlist({directory = "./media/day"})
-overnight = playlist({directory = "./media/night"})
+daytime = playlist({directory = "./internal/media/day"})
+overnight = playlist({directory = "./internal/media/night"})
 pl = switch({{when = {days = {"mon", "tue", "wed", "thu", "fri"},
                       from = "09:00", to = "17:00"}, src = daytime},
              {src = overnight}})
@@ -273,7 +273,7 @@ shipped and verified; the status of the rest of the project is tracked in
 
 | Liquidsoap (.liq) | Crabsoup (.lua) |
 | --- | --- |
-| `playlist("dir")` | `playlist({directory = "./media", shuffle = true})` |
+| `playlist("dir")` | `playlist({directory = "./internal/media", shuffle = true})` |
 | `single("file")` | `single("path")` |
 | `fallback([...])`, `sequence([...])` | `fallback({...})`, `sequence({...})` |
 | `random([...])` | `random({...})` |
@@ -300,7 +300,7 @@ shipped and verified; the status of the rest of the project is tracked in
 | `server.register` custom telnet commands | `server.register("name", function(args) return reply end)` |
 | `mksafe(src)` | `mksafe(src)` — composes `fallback({src, blank()})` |
 | `add([...])` | `add({a, b}, {weights = {0.5, 1.0}})` — sample-wise sum, bed + voice-over |
-| `request.dynamic(fn)` | `request.dynamic(function() return "media/track.mp3" end)` — callback-driven requests, nil ends |
+| `request.dynamic(fn)` | `request.dynamic(function() return "internal/media/track.mp3" end)` — callback-driven requests, nil ends |
 | `annotate:` cue points + `cue_cut(src)` | `annotate:cue_in="30",cue_out="180":/path/track.mp3` on any request URI; `cue_cut(src, {cue_in, cue_out})` |
 | per-track crossfade (`fade_in`/`fade_out`) | `annotate:fade_in="2",fade_out="3":...` or `cue_cut(src, {fade_in, fade_out})` — overrides `crossfade_seconds` per track |
 | per-track gain (`amplify`) | `annotate:amplify="0.7":...` (linear) or `annotate:amplify="-8.2 dB":...` — scales a single track |
@@ -316,7 +316,7 @@ Implementation-level wiring (engine tap, threading model, gotchas) lives in
 `docs/ARCHITECTURE.md`; this is the user-facing summary.
 
 ```
-media/ + jingles/   (decoded via symphonia)
+internal/media/ + internal/jingles/   (decoded via symphonia)
    ▼
 root source ──► PriorityMixer ──► TAP (one puller thread)
 (script graph:    (live/jingle       │  shared PCM + title
@@ -358,7 +358,7 @@ cargo bench --bench engine   # hot-path baselines (mixers, resampler, effects, e
 ```
 
 Tests are inline `#[cfg(test)]` modules per source file. A few tests use real
-files from `media/` and `jingles/` and skip when they are absent. The
+files from `internal/media/` and `internal/jingles/` and skip when they are absent. The
 `CRABSOUP_DUMP=/path/out.ogg` env var makes the Opus end-to-end test persist
 the encoded stream for external inspection (ffprobe, curl to Icecast).
 

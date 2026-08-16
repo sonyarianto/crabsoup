@@ -21,7 +21,7 @@ RUST_LOG=crabsoup=info ./target/release/crabsoup   # run with logging
 ```
 
 `crabsoup.lua` is gitignored; `crabsoup.lua.example` is the tracked reference
-script. `media/` and `jingles/` are gitignored — audio files stay local, tests
+script. `internal/` (media/, jingles/, tools/) is gitignored — audio files stay local, tests
 that use them skip when absent.
 
 ## Conventions

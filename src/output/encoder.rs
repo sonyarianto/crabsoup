@@ -877,7 +877,7 @@ fn opus_streams_a_real_48k_mp3_file() {
     // 44.1k -> 48k) across many packets.
     let media = std::path::Path::new("media");
     if !media.is_dir() {
-        return; // media/ only exists in the repo checkout
+        return; // internal/media/ only exists in the repo checkout
     }
     use crate::source::AudioSource;
     let mut files: Vec<_> = std::fs::read_dir(media)

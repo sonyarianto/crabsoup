@@ -1444,8 +1444,8 @@ mod tests {
     #[test]
     fn request_uri_classifies_and_displays() {
         assert_eq!(
-            RequestUri::new("media/a.mp3"),
-            RequestUri::Local("media/a.mp3".into(), None)
+            RequestUri::new("internal/media/a.mp3"),
+            RequestUri::Local("internal/media/a.mp3".into(), None)
         );
         assert_eq!(
             RequestUri::new("http://x.example/track.mp3"),
@@ -1463,16 +1463,16 @@ mod tests {
             RequestUri::new("http://x.example/track.mp3").display(),
             "track.mp3"
         );
-        assert_eq!(RequestUri::new("media/a.mp3").display(), "a");
+        assert_eq!(RequestUri::new("internal/media/a.mp3").display(), "a");
     }
 
     #[test]
     fn annotate_prefix_parses_cue_points_and_strips_to_the_uri() {
-        let uri = RequestUri::new("annotate:cue_in=\"30\",cue_out=\"180\":media/a.mp3");
+        let uri = RequestUri::new("annotate:cue_in=\"30\",cue_out=\"180\":internal/media/a.mp3");
         assert_eq!(
             uri,
             RequestUri::Local(
-                "media/a.mp3".into(),
+                "internal/media/a.mp3".into(),
                 Some(TrackCues {
                     cue_in: 30.0,
                     cue_out: Some(180.0),
@@ -1485,7 +1485,7 @@ title: None,
                 })
             )
         );
-        assert_eq!(uri.raw(), "media/a.mp3");
+        assert_eq!(uri.raw(), "internal/media/a.mp3");
         assert_eq!(uri.display(), "a");
     }
 
@@ -1530,11 +1530,11 @@ title: Some("Lea".to_string()),
                 })
             )
         );
-        let numeric = RequestUri::new("annotate:title=\"123\":media/a.mp3");
+        let numeric = RequestUri::new("annotate:title=\"123\":internal/media/a.mp3");
         assert_eq!(
             numeric,
             RequestUri::Local(
-                "media/a.mp3".into(),
+                "internal/media/a.mp3".into(),
                 Some(TrackCues {
                     cue_in: 0.0,
                     cue_out: None,
@@ -1553,11 +1553,11 @@ title: Some("123".to_string()),
     fn fade_only_annotate_carries_the_overrides() {
         // No cue points, just fade overrides: parsed and reported for the
         // CrossfadeMixer (step 2).
-        let uri = RequestUri::new("annotate:fade_in=\"2\",fade_out=\"3\":media/a.mp3");
+        let uri = RequestUri::new("annotate:fade_in=\"2\",fade_out=\"3\":internal/media/a.mp3");
         assert_eq!(
             uri,
             RequestUri::Local(
-                "media/a.mp3".into(),
+                "internal/media/a.mp3".into(),
                 Some(TrackCues {
                     cue_in: 0.0,
                     cue_out: None,
@@ -1574,11 +1574,11 @@ title: None,
 
     #[test]
     fn amplify_annotation_parses_linear_and_db_values() {
-        let linear = RequestUri::new("annotate:amplify=\"0.5\":media/a.mp3");
+        let linear = RequestUri::new("annotate:amplify=\"0.5\":internal/media/a.mp3");
         assert_eq!(
             linear,
             RequestUri::Local(
-                "media/a.mp3".into(),
+                "internal/media/a.mp3".into(),
                 Some(TrackCues {
                     cue_in: 0.0,
                     cue_out: None,
@@ -1592,7 +1592,7 @@ title: None,
             )
         );
         // dB values (spaces do not matter) land as linear multipliers.
-        let db = RequestUri::new("annotate:amplify=\"-8.2 dB\":media/a.mp3");
+        let db = RequestUri::new("annotate:amplify=\"-8.2 dB\":internal/media/a.mp3");
         let db_gain = match db {
             RequestUri::Local(_, Some(c)) => c.amplify.expect("dB gain parsed"),
             _ => panic!("dB annotation must yield cues"),
@@ -1603,17 +1603,17 @@ title: None,
             "expected {expected}, got {db_gain}"
         );
         // Unknown/ill-formed values are ignored like any other key.
-        let bad = RequestUri::new("annotate:amplify=\"loud\":media/a.mp3");
-        assert_eq!(bad, RequestUri::Local("media/a.mp3".into(), None));
+        let bad = RequestUri::new("annotate:amplify=\"loud\":internal/media/a.mp3");
+        assert_eq!(bad, RequestUri::Local("internal/media/a.mp3".into(), None));
     }
 
     #[test]
     fn start_next_annotation_parses_into_cues() {
-        let uri = RequestUri::new("annotate:start_next=\"1\":media/a.mp3");
+        let uri = RequestUri::new("annotate:start_next=\"1\":internal/media/a.mp3");
         assert_eq!(
             uri,
             RequestUri::Local(
-                "media/a.mp3".into(),
+                "internal/media/a.mp3".into(),
                 Some(TrackCues {
                     cue_in: 0.0,
                     cue_out: None,
@@ -1628,19 +1628,19 @@ title: None,
             )
         );
         // Non-finite values are rejected like every other cue.
-        let bad = RequestUri::new("annotate:start_next=\"inf\":media/a.mp3");
-        assert_eq!(bad, RequestUri::Local("media/a.mp3".into(), None));
+        let bad = RequestUri::new("annotate:start_next=\"inf\":internal/media/a.mp3");
+        assert_eq!(bad, RequestUri::Local("internal/media/a.mp3".into(), None));
     }
 
     #[test]
     fn append_and_prepend_annotations_parse_into_cues() {
         let uri = RequestUri::new(
-            "annotate:append=\"jingles/stinger.mp3\",prepend=\"false\":media/a.mp3",
+            "annotate:append=\"internal/jingles/stinger.mp3\",prepend=\"false\":internal/media/a.mp3",
         );
         assert_eq!(
             uri,
             RequestUri::Local(
-                "media/a.mp3".into(),
+                "internal/media/a.mp3".into(),
                 Some(TrackCues {
                     cue_in: 0.0,
                     cue_out: None,
@@ -1648,14 +1648,14 @@ title: None,
                     fade_out: None,
                     amplify: None,
                     start_next: None,
-                    append: Some("jingles/stinger.mp3".into()),
+                    append: Some("internal/jingles/stinger.mp3".into()),
                     prepend: Some("false".into()),
                     title: None,
                 })
             )
         );
         // A follower named like a number is kept verbatim, not parsed.
-        let RequestUri::Local(_, cues) = RequestUri::new("annotate:append=\"0.5\":media/a.mp3")
+        let RequestUri::Local(_, cues) = RequestUri::new("annotate:append=\"0.5\":internal/media/a.mp3")
         else {
             panic!("local uri expected")
         };
@@ -1680,19 +1680,19 @@ title: None,
         // `inf`/`NaN` would corrupt the sample-count math (and break the
         // Eq/Ord consistency of TrackCues), so they must not become cues.
         for bad in ["inf", "-inf", "NaN"] {
-            let uri = RequestUri::new(&format!("annotate:cue_in=\"{bad}\":media/a.mp3"));
+            let uri = RequestUri::new(&format!("annotate:cue_in=\"{bad}\":internal/media/a.mp3"));
             assert_eq!(
                 uri,
-                RequestUri::Local("media/a.mp3".into(), None),
+                RequestUri::Local("internal/media/a.mp3".into(), None),
                 "{bad} must not be accepted as a cue value"
             );
         }
         // A good value next to a bad one still applies.
-        let uri = RequestUri::new("annotate:cue_in=\"inf\",cue_out=\"5\":media/a.mp3");
+        let uri = RequestUri::new("annotate:cue_in=\"inf\",cue_out=\"5\":internal/media/a.mp3");
         assert_eq!(
             uri,
             RequestUri::Local(
-                "media/a.mp3".into(),
+                "internal/media/a.mp3".into(),
                 Some(TrackCues {
                     cue_in: 0.0,
                     cue_out: Some(5.0),

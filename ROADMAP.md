@@ -1667,7 +1667,7 @@ load tests + fuzzing.
       values as the explicit override case), a quiet (-40 dBFS) tail
       collapses to the 10-frame `fade_mid` window (complete a full buffer
       earlier), and a script-level `smart_crossfade({directory = "./media"})`
-      plays a real directory with audio (skips when `media/` absent).
+      plays a real directory with audio (skips when `internal/media/` absent).
       **Later removed** (see the overlap-source follow-ups): the BS.1770
       gate in the `crossfade` operator ends fades at the audible tail
       with the track's own loudness floor, superseding the fixed

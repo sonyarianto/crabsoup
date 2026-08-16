@@ -434,7 +434,7 @@ mod tests {
 
     #[test]
     fn parses_replaygain_from_id3_txxx_tags() {
-        let real = Path::new("media/poshpony-shamanic-house-310684.mp3");
+        let real = Path::new("internal/media/poshpony-shamanic-house-310684.mp3");
         if !real.exists() {
             return;
         }
@@ -450,7 +450,7 @@ mod tests {
 
     #[test]
     fn album_gain_is_the_fallback_and_untagged_files_report_none() {
-        let real = Path::new("media/poshpony-shamanic-house-310684.mp3");
+        let real = Path::new("internal/media/poshpony-shamanic-house-310684.mp3");
         if !real.exists() {
             return;
         }
@@ -474,7 +474,7 @@ mod tests {
 
     #[test]
     fn replaygain_tag_without_suffix_parses_too() {
-        let real = Path::new("media/poshpony-shamanic-house-310684.mp3");
+        let real = Path::new("internal/media/poshpony-shamanic-house-310684.mp3");
         if !real.exists() {
             return;
         }

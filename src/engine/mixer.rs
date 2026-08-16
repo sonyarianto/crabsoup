@@ -1119,7 +1119,7 @@ mod tests {
     #[test]
     fn plays_a_real_jingle_file() {
         use std::path::PathBuf;
-        let jingle = PathBuf::from("jingles/mrwashingt0n-radio-for-all-trance-505921.mp3");
+        let jingle = PathBuf::from("internal/jingles/mrwashingt0n-radio-for-all-trance-505921.mp3");
         if !jingle.exists() {
             return; // not available in CI-less env; skip
         }
@@ -1158,7 +1158,7 @@ mod tests {
     #[test]
     fn jingle_reaches_the_opus_encoder_end_to_end() {
         use std::path::PathBuf;
-        let jingle = PathBuf::from("jingles/mrwashingt0n-radio-for-all-trance-505921.mp3");
+        let jingle = PathBuf::from("internal/jingles/mrwashingt0n-radio-for-all-trance-505921.mp3");
         if !jingle.exists() {
             return; // repo-checkout only
         }
