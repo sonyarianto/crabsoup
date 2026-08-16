@@ -197,7 +197,7 @@ impl AudioSource for RequestQueueSource {
         self.current.as_ref().and_then(|c| c.replaygain_db())
     }
 
-    fn crossfade_overrides(&self) -> Option<(Option<f64>, Option<f64>)> {
+    fn crossfade_overrides(&self) -> Option<crate::source::CrossfadeOverrides> {
         self.current.as_ref().and_then(|c| c.crossfade_overrides())
     }
 }

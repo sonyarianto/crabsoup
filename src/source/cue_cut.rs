@@ -166,13 +166,14 @@ impl AudioSource for CueCutSource {
         self.child.replaygain_db()
     }
 
-    fn crossfade_overrides(&self) -> Option<(Option<f64>, Option<f64>)> {
+    fn crossfade_overrides(&self) -> Option<crate::source::CrossfadeOverrides> {
         let cues = self.cues?;
-        if cues.fade_in.is_some() || cues.fade_out.is_some() {
-            Some((cues.fade_in, cues.fade_out))
-        } else {
-            None
-        }
+        let overrides = crate::source::CrossfadeOverrides {
+            fade_in: cues.fade_in,
+            fade_out: cues.fade_out,
+            start_next: cues.start_next,
+        };
+        (overrides != crate::source::CrossfadeOverrides::default()).then_some(overrides)
     }
 
     fn skip(&mut self) {
@@ -195,6 +196,7 @@ mod tests {
             fade_in: None,
             fade_out: None,
             amplify: None,
+            start_next: None,
         }
     }
 
@@ -253,11 +255,12 @@ mod tests {
                 fade_in: Some(2.0),
                 fade_out: Some(3.0),
                 amplify: None,
+            start_next: None,
             },
             RATE,
             CHANS,
         );
-        assert_eq!(src.crossfade_overrides(), Some((Some(2.0), Some(3.0))));
+        assert_eq!(src.crossfade_overrides(), Some(crate::source::CrossfadeOverrides { fade_in: Some(2.0), fade_out: Some(3.0), start_next: None }));
 
         // Only cue points, no fades: no override reported.
         let child: Box<dyn AudioSource> = Box::new(SineSource::new(25.0, None, 1.0, RATE, CHANS));

@@ -463,7 +463,7 @@ impl AudioSource for PipeSource {
         self.child.lock().unwrap().replaygain_db()
     }
 
-    fn crossfade_overrides(&self) -> Option<(Option<f64>, Option<f64>)> {
+    fn crossfade_overrides(&self) -> Option<crate::source::CrossfadeOverrides> {
         self.child.lock().unwrap().crossfade_overrides()
     }
 

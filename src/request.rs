@@ -70,6 +70,9 @@ pub struct TrackCues {
     /// set. The annotation accepts a plain factor (`"0.7"`) or dB with the
     /// `dB` suffix (`"-8.2 dB"`); both land here as a linear multiplier.
     pub amplify: Option<f64>,
+    /// Per-track `start_next` override in seconds, if set: how early the
+    /// next track starts relative to this track's end.
+    pub start_next: Option<f64>,
 }
 
 /// A media item: a local file path or an HTTP(S) URL, with optional per-track
@@ -168,9 +171,9 @@ fn cmp_opt(a: &Option<f64>, b: &Option<f64>) -> std::cmp::Ordering {
     }
 }
 
-/// Parse a Liquidsoap-style `annotate:` prefix: `key="value",key="value":<uri>`.
+/// Parse the `annotate:` prefix: `key="value",key="value":<uri>`.
 /// Recognized keys are `cue_in`, `cue_out`, `fade_in`,
-/// `fade_out`, `amplify`; other keys are ignored (they carry
+/// `fade_out`, `start_next`, `amplify`; other keys are ignored (they carry
 /// arbitrary metadata in Liquidsoap). Returns the bare URI and any cue
 /// points. Malformed prefixes fall back to the whole string as a plain URI
 /// with no cues.
@@ -233,6 +236,10 @@ fn parse_annotate(uri: &str) -> (String, Option<TrackCues>) {
                 }
                 "fade_out" => {
                     cues.fade_out = Some(v);
+                    found = true;
+                }
+                "start_next" => {
+                    cues.start_next = Some(v);
                     found = true;
                 }
                 "amplify" => {
@@ -324,7 +331,7 @@ impl crate::source::AudioSource for DownloadSource {
         self.inner.replaygain_db()
     }
 
-    fn crossfade_overrides(&self) -> Option<(Option<f64>, Option<f64>)> {
+    fn crossfade_overrides(&self) -> Option<crate::source::CrossfadeOverrides> {
         self.inner.crossfade_overrides()
     }
 
@@ -347,7 +354,8 @@ fn apply_cues(
             if c.cue_in > 0.0
                 || c.cue_out.is_some()
                 || c.fade_in.is_some()
-                || c.fade_out.is_some() =>
+                || c.fade_out.is_some()
+                || c.start_next.is_some() =>
         {
             Box::new(CueCutSource::new(
                 src,
@@ -1235,6 +1243,7 @@ mod tests {
                     fade_in: None,
                     fade_out: None,
                     amplify: None,
+                start_next: None,
                 })
             )
         );
@@ -1256,6 +1265,7 @@ mod tests {
                     fade_in: None,
                     fade_out: None,
                     amplify: None,
+                start_next: None,
                 })
             )
         );
@@ -1276,6 +1286,7 @@ mod tests {
                     fade_in: Some(2.0),
                     fade_out: Some(3.0),
                     amplify: None,
+                start_next: None,
                 })
             )
         );
@@ -1294,6 +1305,7 @@ mod tests {
                     fade_in: None,
                     fade_out: None,
                     amplify: Some(0.5),
+                    start_next: None,
                 })
             )
         );
@@ -1310,6 +1322,28 @@ mod tests {
         );
         // Unknown/ill-formed values are ignored like any other key.
         let bad = RequestUri::new("annotate:amplify=\"loud\":media/a.mp3");
+        assert_eq!(bad, RequestUri::Local("media/a.mp3".into(), None));
+    }
+
+    #[test]
+    fn start_next_annotation_parses_into_cues() {
+        let uri = RequestUri::new("annotate:start_next=\"1\":media/a.mp3");
+        assert_eq!(
+            uri,
+            RequestUri::Local(
+                "media/a.mp3".into(),
+                Some(TrackCues {
+                    cue_in: 0.0,
+                    cue_out: None,
+                    fade_in: None,
+                    fade_out: None,
+                    amplify: None,
+                    start_next: Some(1.0),
+                })
+            )
+        );
+        // Non-finite values are rejected like every other cue.
+        let bad = RequestUri::new("annotate:start_next=\"inf\":media/a.mp3");
         assert_eq!(bad, RequestUri::Local("media/a.mp3".into(), None));
     }
 
@@ -1350,6 +1384,7 @@ mod tests {
                     fade_in: None,
                     fade_out: None,
                     amplify: None,
+                start_next: None,
                 })
             )
         );

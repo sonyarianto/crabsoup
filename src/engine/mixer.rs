@@ -128,12 +128,13 @@ impl CrossfadeMixer {
     }
 
     /// Seconds before the active track's end at which the next track must be
-    /// preloaded: the active track's `fade_out` override, else the global
-    /// window (or the smart `fade_out` margin in smart mode).
+    /// preloaded: the active track's `start_next` override, else its
+    /// `fade_out` override, else the global window (or the smart `fade_out`
+    /// margin in smart mode).
     fn preload_margin(&self) -> f64 {
         self.active
             .crossfade_overrides()
-            .and_then(|(_, fo)| fo)
+            .and_then(|c| c.start_next.or(c.fade_out))
             .unwrap_or_else(|| {
                 self.smart
                     .map(|s| s.fade_out)
@@ -211,17 +212,28 @@ impl CrossfadeMixer {
             log::info!("crossfade: preloading next track");
             // Per-track fade override: the incoming track's `fade_in` wins,
             // then the outgoing track's `fade_out` (or, in smart mode, the
-            // level-chosen window), then the global window.
+            // level-chosen window), then the global window. An explicit
+            // `start_next` on the outgoing track also caps the window to
+            // the margin it forces (the fade fits the shorter duration).
             let window = src
                 .crossfade_overrides()
-                .and_then(|(fi, _)| fi)
+                .and_then(|c| c.fade_in)
                 .or_else(|| {
                     self.active
                         .crossfade_overrides()
-                        .and_then(|(_, fo)| fo)
+                        .and_then(|c| c.fade_out)
                         .or_else(|| self.smart_window())
                 })
                 .unwrap_or(self.crossfade_seconds);
+            let window = if self
+                .active
+                .crossfade_overrides()
+                .is_some_and(|c| c.start_next.is_some())
+            {
+                window.min(self.preload_margin())
+            } else {
+                window
+            };
             self.fade_frames = (window * self.sample_rate as f64).max(1.0) as usize;
             self.next = Some(src);
             self.next_label = Some(label);
@@ -393,7 +405,7 @@ impl AudioSource for CrossfadeMixer {
         self.active.replaygain_db()
     }
 
-    fn crossfade_overrides(&self) -> Option<(Option<f64>, Option<f64>)> {
+    fn crossfade_overrides(&self) -> Option<crate::source::CrossfadeOverrides> {
         self.active.crossfade_overrides()
     }
 
@@ -690,7 +702,7 @@ impl AudioSource for PriorityMixer {
         self.main.replaygain_db()
     }
 
-    fn crossfade_overrides(&self) -> Option<(Option<f64>, Option<f64>)> {
+    fn crossfade_overrides(&self) -> Option<crate::source::CrossfadeOverrides> {
         self.main.crossfade_overrides()
     }
 }
@@ -707,7 +719,7 @@ mod tests {
         value: f32,
         total_frames: usize,
         pos_frames: usize,
-        fades: Option<(Option<f64>, Option<f64>)>,
+        fades: Option<crate::source::CrossfadeOverrides>,
     }
 
     impl AudioSource for FakeSource {
@@ -729,7 +741,7 @@ mod tests {
         fn label(&self) -> Option<String> {
             Some(format!("src({})", self.value))
         }
-        fn crossfade_overrides(&self) -> Option<(Option<f64>, Option<f64>)> {
+        fn crossfade_overrides(&self) -> Option<crate::source::CrossfadeOverrides> {
             self.fades
         }
     }
@@ -756,8 +768,9 @@ mod tests {
 
         /// Like [`Self::new`], but each source carries a per-track fade
         /// override.
-        #[allow(clippy::type_complexity)]
-        fn with_fades(values: Vec<(f32, usize, Option<(Option<f64>, Option<f64>)>)>) -> Self {
+        fn with_fades(
+            values: Vec<(f32, usize, Option<crate::source::CrossfadeOverrides>)>,
+        ) -> Self {
             let sources = values
                 .into_iter()
                 .map(|(v, total, fades)| -> Box<dyn AudioSource> {
@@ -963,7 +976,7 @@ mod tests {
         // 0.4s, so the next track is preloaded 0.4s early (not 0.2s) and the
         // overlap spans 40 frames. Buffers are 10 frames (0.1s).
         let provider = Box::new(FakeProvider::with_fades(vec![
-            (1.0, 1000, Some((None, Some(0.4)))),
+            (1.0, 1000, Some(crate::source::CrossfadeOverrides { fade_in: None, fade_out: Some(0.4), start_next: None })),
             (2.0, 1000, None),
         ]));
         let cfg = mixer_config(0.2);
@@ -998,7 +1011,7 @@ mod tests {
         // when it starts, so the remainder is finished by the tail ramp.
         let provider = Box::new(FakeProvider::with_fades(vec![
             (1.0, 1000, None),
-            (2.0, 1000, Some((Some(0.4), None))),
+            (2.0, 1000, Some(crate::source::CrossfadeOverrides { fade_in: Some(0.4), fade_out: None, start_next: None })),
         ]));
         let cfg = mixer_config(0.2);
         let mut mix = CrossfadeMixer::new(provider, &cfg, RATE as u32, CHANS);
@@ -1054,6 +1067,88 @@ mod tests {
         mix.next_buffer(&mut buf);
         assert!((buf[0] - 1.75).abs() < 1e-6);
         // Buffer 101: fade complete (40 frames), B at full gain.
+        mix.next_buffer(&mut buf);
+        assert!((buf[0] - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn start_next_override_starts_the_next_track_early() {
+        // Global window is 0.2s. Track A overrides `start_next` to 0.4s:
+        // the next track is preloaded 0.4s early (not 0.2s), but the fade
+        // window stays 0.2s — B ramps in over the last 0.2s, then plays at
+        // full gain while A still has 0.2s of audio left.
+        let provider = Box::new(FakeProvider::with_fades(vec![
+            (
+                1.0,
+                1000,
+                Some(crate::source::CrossfadeOverrides {
+                    fade_in: None,
+                    fade_out: None,
+                    start_next: Some(0.4),
+                }),
+            ),
+            (2.0, 1000, None),
+        ]));
+        let cfg = mixer_config(0.2);
+        let mut mix = CrossfadeMixer::new(provider, &cfg, RATE as u32, CHANS);
+
+        let mut buf = vec![0f32; 10 * CHANS];
+        // Buffers 1..=96: A has more than 0.4s left -> passthrough.
+        for _ in 0..96 {
+            mix.next_buffer(&mut buf);
+            assert!((buf[0] - 1.0).abs() < 1e-6);
+        }
+        // Buffer 97: A has exactly 0.4s left -> preload, fade begins.
+        mix.next_buffer(&mut buf);
+        assert!((buf[0] - 1.0).abs() < 1e-6);
+        // Buffer 98: t=0.5 of the 20-frame window -> 0.5*A + 0.5*B = 1.5.
+        // (The plain global window would preload 0.2s later and still be
+        // fading here.)
+        mix.next_buffer(&mut buf);
+        assert!((buf[0] - 1.5).abs() < 1e-6);
+        // Buffer 99: fade complete; B plays at full gain 0.2s early.
+        mix.next_buffer(&mut buf);
+        assert!((buf[0] - 2.0).abs() < 1e-6);
+        // Buffer 100: A ends; promoted to B, which continues at full gain.
+        mix.next_buffer(&mut buf);
+        assert!((buf[0] - 2.0).abs() < 1e-6);
+        assert_eq!(mix.label().as_deref(), Some("src(2)"));
+    }
+
+    #[test]
+    fn start_next_override_caps_the_fade_window_when_shorter_than_fade_out() {
+        // Track A overrides fade_out to 0.4s but `start_next` to 0.2s: the
+        // next track starts at the 0.2s margin and the fade compresses to
+        // fit (the fade cannot outlive the shorter start window).
+        let provider = Box::new(FakeProvider::with_fades(vec![
+            (
+                1.0,
+                1000,
+                Some(crate::source::CrossfadeOverrides {
+                    fade_in: None,
+                    fade_out: Some(0.4),
+                    start_next: Some(0.2),
+                }),
+            ),
+            (2.0, 1000, None),
+        ]));
+        let cfg = mixer_config(0.2);
+        let mut mix = CrossfadeMixer::new(provider, &cfg, RATE as u32, CHANS);
+
+        let mut buf = vec![0f32; 10 * CHANS];
+        // Buffers 1..=98: A has more than 0.2s left -> passthrough.
+        for _ in 0..98 {
+            mix.next_buffer(&mut buf);
+            assert!((buf[0] - 1.0).abs() < 1e-6);
+        }
+        // Buffer 99: A has exactly 0.2s left -> preload, fade begins.
+        mix.next_buffer(&mut buf);
+        assert!((buf[0] - 1.0).abs() < 1e-6);
+        // Buffer 100: t=0.5 -> 1.5. An uncapped 0.4s fade would still be
+        // at t=0.25 -> 1.25 here (and A would be promoted mid-fade).
+        mix.next_buffer(&mut buf);
+        assert!((buf[0] - 1.5).abs() < 1e-6);
+        // Buffer 101: fade complete, A exhausted, B at full gain.
         mix.next_buffer(&mut buf);
         assert!((buf[0] - 2.0).abs() < 1e-6);
     }

@@ -289,6 +289,7 @@ shipped and verified; the status of the rest of the project is tracked in
 | `annotate:` cue points + `cue_cut(src)` | `annotate:cue_in="30",cue_out="180":/path/track.mp3` on any request URI; `cue_cut(src, {cue_in, cue_out})` |
 | per-track crossfade (`fade_in`/`fade_out`) | `annotate:fade_in="2",fade_out="3":...` or `cue_cut(src, {fade_in, fade_out})` — overrides `crossfade_seconds` per track |
 | per-track gain (`amplify`) | `annotate:amplify="0.7":...` (linear) or `annotate:amplify="-8.2 dB":...` — scales a single track |
+| earlier next-track start (`start_next`) | `annotate:start_next="5":...` — the next track begins 5 s before this one ends |
 | `smart_crossfade` (level-aware transitions) | `smart_crossfade({directory, fade_out, fade_mid, threshold})` — outgoing tail loudness picks the fade window |
 | `pipe(process, src)` (external processor) | `pipe({process = "...", format = "s16le"\|"s24le", restart_backoff = 500}, src)` — stdin/stdout raw PCM bridge; bypass + restart on death |
 | `blank.detect(src)` (dead-air detection) | `blank.detect(src, {threshold = -40, duration = 2, restart = 1, on_blank = fn})` — silence -> blank + exhausted so `fallback` hands over |

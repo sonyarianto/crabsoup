@@ -198,7 +198,7 @@ impl AudioSource for PitchSource {
         self.child.replaygain_db()
     }
 
-    fn crossfade_overrides(&self) -> Option<(Option<f64>, Option<f64>)> {
+    fn crossfade_overrides(&self) -> Option<crate::source::CrossfadeOverrides> {
         self.child.crossfade_overrides()
     }
 

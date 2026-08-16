@@ -170,14 +170,20 @@ end)
 ## Request URIs: `annotate:` and `http(s)://`
 
 Any request URI can carry per-track annotations — cue points, crossfade
-fades, and gain (linear or dB):
+fades, gain (linear or dB), and an earlier start for the next track:
 
 ```
 annotate:cue_in="30",cue_out="180":/path/track.mp3
 annotate:fade_in="2",fade_out="3":http://example.com/track.opus
 annotate:amplify="0.7":/path/quiet.mp3
 annotate:amplify="-8.2 dB":/path/loud.mp3
+annotate:start_next="5":/path/next-begins-early.mp3
 ```
+
+`start_next` overrides how early the next track begins (the crossfade
+margin) for that track — e.g. to ramp the next track in over a 5 s outro
+instead of the global window. The fade window compresses to fit when the
+track ends sooner.
 
 `http://` / `https://` requests are download-then-play with retry/timeout;
 temp files are auto-removed. HTTPS uses rustls (redirects may cross scheme).

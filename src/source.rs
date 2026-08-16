@@ -52,18 +52,30 @@ pub trait AudioSource: Send {
         None
     }
 
-    /// Per-track crossfade override in seconds: `(fade_in, fade_out)` of the
-    /// current track, from `annotate:` / `cue_cut`. Each inner `None` = fall
-    /// back to the global `crossfade_seconds` for that edge; the outer
-    /// `None` = no overrides at all. Consumed by [`CrossfadeMixer`] to size
-    /// each transition's overlap window.
-    fn crossfade_overrides(&self) -> Option<(Option<f64>, Option<f64>)> {
+    /// Per-track crossfade override in seconds, if any. Consumed by
+    /// [`CrossfadeMixer`] to size each transition's overlap window and
+    /// schedule the preload.
+    fn crossfade_overrides(&self) -> Option<CrossfadeOverrides> {
         None
     }
 
     /// Advance to the next item immediately, where meaningful (telnet
     /// `skip`). Sources without a notion of "next" ignore it.
     fn skip(&mut self) {}
+}
+
+/// Per-track crossfade settings, from the `annotate:` prefix or `cue_cut`.
+/// Each `None` = fall back to the global `crossfade_seconds` for that
+/// aspect.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CrossfadeOverrides {
+    /// Fade-in duration for this track, in seconds.
+    pub fade_in: Option<f64>,
+    /// Fade-out duration for this track, in seconds.
+    pub fade_out: Option<f64>,
+    /// `start_next`: how many seconds before this track ends the next
+    /// track starts (overrides the preload margin).
+    pub start_next: Option<f64>,
 }
 
 /// Supplies the *next* source on demand so a crossfade can be preloaded.

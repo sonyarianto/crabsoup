@@ -1,6 +1,17 @@
 # Crabsoup roadmap
 
 ## Done (verified end-to-end)
+- [x] **G3.7 — per-track `start_next` annotation**: `start_next` extends
+      `TrackCues` and lands in the mixer via the new `CrossfadeOverrides`
+      struct (replacing the `(fade_in, fade_out)` tuple). The mixer
+      preloads the next track at `start_next.or(fade_out)` and compresses
+      the fade window when `start_next` is shorter than the fade-out
+      (Liquidsoap-style: the fade cannot outlive the earlier start).
+      `apply_cues` now wraps for `start_next` alone. Acceptance met:
+      mixer unit tests (early preload + window capping, sample-accurate
+      on tone pairs), a parse test, and a real-jingle script test
+      asserting the gap between the `on_next_metadata` announcement and
+      the track boundary is ~5 s with `start_next="5"`.
 - [x] **G3.6 — per-track `amplify` annotation + annotation rename**: the
       `annotate:` vocabulary is now crabsoup's own — `cue_in`, `cue_out`,
       `fade_in`, `fade_out`, `amplify` (the `liq_*` names are gone; see
@@ -730,14 +741,19 @@ window of Parts I–K):
       assertion), and a `dB` suffix parses (e.g. `-8.2 dB`). — **done**:
       parse + `TrackGainSource` wrap in `apply_cues`; mute and dB tests
       green (see Done section).
-- [ ] **G3.7 — per-track `start_next` (crossfade margin override).**
+- [x] **G3.7 — per-track `start_next` (crossfade margin override).**
       The annotation overrides the crossfade *duration* for the current
       track (how early the next track starts).
       Crabsoup already overrides per-track fade in/out for the crossfade;
       this extends the same `TrackCues` plumbing to the preload margin.
       Acceptance: with `annotate:start_next="1":...` the next track
       starts 1 s before the current ends (sample-accurate boundary
-      assertion on a tone pair).
+      assertion on a tone pair). — **done**: `CrossfadeOverrides`
+      (was a `(Option<f64>, Option<f64>)` tuple) carries `start_next`
+      end-to-end; the mixer preloads at `start_next.or(fade_out)` and
+      compresses the fade window to fit a shorter start; `apply_cues`
+      wraps for `start_next` alone; mixer, parse and real-jingle timing
+      tests green (see Done section).
 - [ ] **G3.8 — `append` / `prepend` annotations.** Append an extra
       track after (or before) every track, inhibited per-track by setting
       the metadata to `"false"`. Crabsoup has no per-track follower

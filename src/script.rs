@@ -431,7 +431,7 @@ impl AudioSource for OnMetadataSource {
         self.child.replaygain_db()
     }
 
-    fn crossfade_overrides(&self) -> Option<(Option<f64>, Option<f64>)> {
+    fn crossfade_overrides(&self) -> Option<crate::source::CrossfadeOverrides> {
         self.child.crossfade_overrides()
     }
 
@@ -502,7 +502,7 @@ impl AudioSource for OnTrackSource {
         self.child.replaygain_db()
     }
 
-    fn crossfade_overrides(&self) -> Option<(Option<f64>, Option<f64>)> {
+    fn crossfade_overrides(&self) -> Option<crate::source::CrossfadeOverrides> {
         self.child.crossfade_overrides()
     }
 
@@ -568,7 +568,7 @@ impl AudioSource for OnNextMetadataSource {
         self.child.replaygain_db()
     }
 
-    fn crossfade_overrides(&self) -> Option<(Option<f64>, Option<f64>)> {
+    fn crossfade_overrides(&self) -> Option<crate::source::CrossfadeOverrides> {
         self.child.crossfade_overrides()
     }
 
@@ -687,7 +687,7 @@ impl AudioSource for MapMetadataSource {
         self.child.replaygain_db()
     }
 
-    fn crossfade_overrides(&self) -> Option<(Option<f64>, Option<f64>)> {
+    fn crossfade_overrides(&self) -> Option<crate::source::CrossfadeOverrides> {
         self.child.crossfade_overrides()
     }
 
@@ -870,7 +870,7 @@ impl AudioSource for DynamicRequestSource {
         self.current.as_ref().and_then(|c| c.replaygain_db())
     }
 
-    fn crossfade_overrides(&self) -> Option<(Option<f64>, Option<f64>)> {
+    fn crossfade_overrides(&self) -> Option<crate::source::CrossfadeOverrides> {
         self.current.as_ref().and_then(|c| c.crossfade_overrides())
     }
 
@@ -1022,7 +1022,7 @@ impl AudioSource for FallbackSource {
             .and_then(|c| c.0.lock().unwrap().replaygain_db())
     }
 
-    fn crossfade_overrides(&self) -> Option<(Option<f64>, Option<f64>)> {
+    fn crossfade_overrides(&self) -> Option<crate::source::CrossfadeOverrides> {
         if let Some(i) = self.active() {
             return self.children[i].0.lock().unwrap().crossfade_overrides();
         }
@@ -1103,7 +1103,7 @@ impl AudioSource for RandomSource {
             .and_then(|&i| self.children[i].0.lock().unwrap().replaygain_db())
     }
 
-    fn crossfade_overrides(&self) -> Option<(Option<f64>, Option<f64>)> {
+    fn crossfade_overrides(&self) -> Option<crate::source::CrossfadeOverrides> {
         self.order
             .first()
             .and_then(|&i| self.children[i].0.lock().unwrap().crossfade_overrides())
@@ -1188,7 +1188,7 @@ impl AudioSource for AddSource {
             .and_then(|c| c.0.lock().unwrap().replaygain_db())
     }
 
-    fn crossfade_overrides(&self) -> Option<(Option<f64>, Option<f64>)> {
+    fn crossfade_overrides(&self) -> Option<crate::source::CrossfadeOverrides> {
         self.children
             .first()
             .and_then(|c| c.0.lock().unwrap().crossfade_overrides())
@@ -1471,7 +1471,7 @@ impl AudioSource for ScheduleSource {
             .and_then(|c| c.0.lock().unwrap().replaygain_db())
     }
 
-    fn crossfade_overrides(&self) -> Option<(Option<f64>, Option<f64>)> {
+    fn crossfade_overrides(&self) -> Option<crate::source::CrossfadeOverrides> {
         self.children
             .get(self.current)
             .and_then(|c| c.0.lock().unwrap().crossfade_overrides())
@@ -2619,6 +2619,7 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
                 fade_in,
                 fade_out,
                 amplify: None,
+                start_next: None,
             };
             let wrapped = CueCutSource::new(child, cues, spec.rate, spec.channels.count());
             Ok(LuaSource::new(Box::new(wrapped)))
@@ -4413,7 +4414,7 @@ mod tests {
         let root = res.preview.expect("preview source");
         assert_eq!(
             root.crossfade_overrides(),
-            Some((Some(2.0), Some(3.0))),
+            Some(crate::source::CrossfadeOverrides { fade_in: Some(2.0), fade_out: Some(3.0), start_next: None }),
             "cue_cut must report fade overrides to the crossfade mixer"
         );
         // Without fades, no overrides are reported (global window applies).
@@ -4442,7 +4443,7 @@ mod tests {
         let root = res.preview.expect("preview source");
         assert_eq!(
             root.crossfade_overrides(),
-            Some((Some(2.0), Some(3.0))),
+            Some(crate::source::CrossfadeOverrides { fade_in: Some(2.0), fade_out: Some(3.0), start_next: None }),
             "annotate fades must reach the mixer"
         );
     }
@@ -4810,6 +4811,51 @@ mod tests {
         );
         let next_seen: Option<String> = _rt.global("next_seen").expect("next_seen readable");
         assert_eq!(next_seen.as_deref(), Some(second_stem));
+    }
+
+    #[test]
+    fn start_next_annotation_starts_the_next_track_earlier() {
+        let first = PathBuf::from("jingles/audio/mrwashingt0n-radio-for-all-505928.mp3");
+        if !first.exists() {
+            return;
+        }
+        let second = "jingles/audio/mrwashingt0n-radio-for-all-trance-505921.mp3";
+        let annotated = format!("annotate:start_next=\"5\":{}", first.display());
+        let (_rt, res) = run(&format!(r#"
+            next_seen = nil
+            src = on_next_metadata(playlist({{files = {{'{annotated}', '{second}'}}}}),
+                                   function(m) next_seen = m.title end)
+            output.preview(src)
+            "#))
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        let mut at_preload = None;
+        let mut at_boundary = None;
+        for i in 0..4000 {
+            root.next_buffer(&mut buf);
+            _rt.drain_metadata();
+            let next_seen: Option<String> = _rt.global("next_seen").expect("next_seen readable");
+            if at_preload.is_none() && next_seen.is_some() {
+                at_preload = Some(i);
+            } else if at_preload.is_some() && root.label().as_deref() == next_seen.as_deref() {
+                at_boundary = Some(i);
+                break;
+            }
+        }
+        let (preload, boundary) = (
+            at_preload.expect("the next track must be announced while the first plays"),
+            at_boundary.expect("the next track must start"),
+        );
+        // The gap between the announcement and the boundary is the
+        // `start_next` margin: ~5 s, not the default 3 s. (The first jingle
+        // is ~11 s, so a default-margin track would announce at ~8 s and a
+        // `start_next = 5` track at ~6 s.)
+        let gap = (boundary - preload) as f64 * 4096.0 / 44100.0;
+        assert!(
+            (gap - 5.0).abs() < 1.0,
+            "start_next margin was {gap:.1}s, expected ~5s"
+        );
     }
 
     #[test]
