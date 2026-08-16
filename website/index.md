@@ -27,3 +27,28 @@ features:
   - title: Dead-air safe
     details: blank.detect silence guarding with fallback handover, mksafe never-fails sources, and request queues with retry and timeout.
 ---
+
+## What it looks like
+
+A station is a Lua script. This is the whole thing:
+
+```lua
+set("sample_rate", 44100)
+set("channels", 2)
+set("crossfade_seconds", 3.0)    -- track-to-track overlap
+set("duck_seconds", 1.5)         -- live DJ / jingle fade time
+
+pl = playlist({directory = "./media", shuffle = false, loop = true})
+j  = jingles({directory = "./jingles"})        -- telnet-triggered clips
+live = input.harbor({port = 8005, mount = "/live", password = "dj"})
+server.telnet({host = "127.0.0.1", port = 1234})
+
+output.icecast({host = "localhost", port = 8000,
+                mount = "/crabsoup.opus", format = "opus", bitrate = 128000,
+                source_password = "hackme", name = "Crabsoup"},
+               fallback({j, live, pl}))
+```
+
+`fallback` picks the first child that has audio — jingles while triggered,
+live DJ while connected, playlist otherwise. The [getting started
+guide](/guide/getting-started) walks through the pieces.
