@@ -282,16 +282,23 @@ fn read_icy_head(stream: &mut TcpStream, shutdown: &AtomicBool) -> Result<Vec<u8
 
 /// Connect with shutdown-aware slicing: the TCP handshake retries in short
 /// slices (checking `shutdown` between them) instead of blocking on the
-/// system default connect timeout.
+/// system default connect timeout. An address that silently drops SYNs
+/// (an unreachable IPv6 route, say) is abandoned after a short budget so
+/// the next resolved address (typically IPv4) gets its turn; if every
+/// address times out the error propagates and the caller's reconnect
+/// policy retries the whole resolution.
+const CONNECT_SLICE: Duration = Duration::from_secs(1);
+const CONNECT_ADDRESS_BUDGET: usize = 4; // ~4s per address
+
 fn connect_tcp(host: &str, port: u16, shutdown: &AtomicBool) -> Result<TcpStream> {
     let addrs: Vec<SocketAddr> = (host, port).to_socket_addrs()?.collect();
     let mut last_err: Option<std::io::Error> = None;
     for addr in addrs {
-        loop {
+        for _ in 0..CONNECT_ADDRESS_BUDGET {
             if shutdown.load(Ordering::SeqCst) {
                 return Err("shutdown requested during connect".into());
             }
-            match TcpStream::connect_timeout(&addr, Duration::from_millis(250)) {
+            match TcpStream::connect_timeout(&addr, CONNECT_SLICE) {
                 Ok(stream) => return Ok(stream),
                 Err(e)
                     if matches!(
