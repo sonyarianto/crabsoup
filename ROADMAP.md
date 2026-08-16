@@ -1,6 +1,26 @@
 # Crabsoup roadmap
 
 ## Done (verified end-to-end)
+- [x] **G-crossfade — top-level `crossfade(src, {duration, curve})`**: a
+      ring-buffer overlap crossfade over the consecutive tracks of any
+      source, mirroring Liquidsoap's `crossfade`/`rotate` recipe. A
+      `rotate`'s children cannot crossfade internally — the preloaded fade
+      starts seconds before the scheduler sees the boundary and the child
+      freezes mid-fade while another child plays (the leak heard in the
+      live `rotate` + crossfading-playlist config). `crossfade` fades
+      *between* whatever the child produces instead: a delay ring holds the
+      current track's tail, and when the child's label changes the tail is
+      mixed with the new track's head over the window. The output is a
+      passthrough otherwise (ring written continuously, read only during a
+      fade): no start delay, no tail replay, no double fades. New
+      `playlist({..., crossfade = false})` returns a plain sequential
+      source (no preload/mixer) for rotate children. Acceptance met: unit
+      tests (blend curve sample-accurate on tone pairs, mid-fade drain,
+      no-replay on exhaustion, zero-duration passthrough, equal-power
+      curve dip) and script tests (gapless two-tone sequence, plain
+      playlist labels+total, and the full rotate-composition recipe with
+      crossfade on top). The `crabsoup.lua` and example configs use the
+      recipe; docs (README, ARCHITECTURE, dsp.md) updated.
 - [x] **G3.8 — `append`/`prepend` followers (`annotated`)**: the new
       `annotated(src, {append = "stinger.mp3", prepend = "intro.mp3"})`
       operator wraps any source and plays the followers after/before every

@@ -200,5 +200,28 @@ The follower plays after (`append`) or before (`prepend`) the track, is
 resolved lazily at each boundary (a missing file logs and skips), and
 `"false"` inhibits the default for a single track.
 
+## Crossfading around a rotation: `crossfade(src, {duration, curve})`
+
+A `rotate`'s children must be plain playlists — an internal crossfade
+would preload seconds before the scheduler sees the track boundary and
+leak the next track across it (and the abandoned child would freeze
+mid-fade). Instead, wrap the whole rotation in one top-level crossfade:
+it blends the outgoing track's tail with the incoming track's head at
+every label change (song->song, song->jingle, jingle->jingle), with no
+start delay and no repeated audio:
+
+```
+songs = playlist({directory = "./media", shuffle = true, crossfade = false})
+jingles = playlist({directory = "./jingles", loop = true, shuffle = true,
+                    crossfade = false})
+src = crossfade(rotate({songs, jingles}, {weights = {3, 1}}),
+                {duration = 3.0})
+```
+
+`duration` (default `crossfade_seconds`) is the overlap window; `curve`
+(default `fade_curve`) is the fade shape. `crossfade = false` on a
+playlist returns a plain sequential source with no preload and no fade —
+the non-crossfading sibling of the default crossfading playlist.
+
 `http://` / `https://` requests are download-then-play with retry/timeout;
 temp files are auto-removed. HTTPS uses rustls (redirects may cross scheme).

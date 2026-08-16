@@ -225,6 +225,15 @@ Named options are Lua tables; most have defaults. `format` is `"mp3"`,
   `fade_out` defaults to `crossfade_seconds`, `fade_mid` to half of it,
   `threshold` (dBFS, default -30) decides "quiet". Per-track
   `annotate:`/`cue_cut` fade overrides still win.
+- `crossfade(src, {duration, curve})` — a top-level overlap crossfade over
+  the consecutive tracks of any source (Liquidsoap's `crossfade`): a delay
+  ring holds the outgoing track's tail and blends it with the incoming
+  track's head at every label change. Pair with plain children —
+  `playlist({..., crossfade = false})` (no internal fade/preload) — inside
+  `rotate`/`fallback` for the classic radio recipe:
+  `crossfade(rotate({songs, jingles}, {weights = {3, 1}}), {duration = 3})`.
+  No start delay and no tail replay; `duration` defaults to
+  `crossfade_seconds`, `curve` to `fade_curve`.
 
 **DSP** (run inline in the pull chain):
 

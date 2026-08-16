@@ -5,6 +5,7 @@ pub mod file;
 pub mod follow;
 pub mod http;
 pub mod opus;
+pub mod overlap;
 pub mod pipe;
 pub mod playlist;
 pub mod replaygain;

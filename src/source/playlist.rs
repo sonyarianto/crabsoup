@@ -112,6 +112,71 @@ impl SourceProvider for Playlist {
     }
 }
 
+/// A plain sequential playlist source: each track plays to exhaustion, then
+/// the next is pulled. Unlike the [`crate::engine::mixer::CrossfadeMixer`]
+/// there is no preload and no overlap — a `rotate`'s children must be
+/// non-crossfading so the *top-level* [`crate::source::overlap::OverlapSource`]
+/// can fade between tracks without fighting a second fade layer (the
+/// `crossfade = false` playlist option).
+pub struct PlaylistSource {
+    provider: Playlist,
+    current: Option<Box<dyn AudioSource>>,
+    current_label: String,
+    started: bool,
+}
+
+impl PlaylistSource {
+    pub fn new(provider: Playlist) -> Self {
+        Self {
+            provider,
+            current: None,
+            current_label: String::new(),
+            started: false,
+        }
+    }
+}
+
+impl AudioSource for PlaylistSource {
+    fn next_buffer(&mut self, buffer: &mut [f32]) -> usize {
+        loop {
+            if self.current.is_none() && self.provider.has_next() {
+                let (src, label) = self.provider.next_source();
+                self.current = Some(src);
+                self.current_label = label;
+                self.started = true;
+            }
+            let Some(current) = self.current.as_mut() else {
+                return 0;
+            };
+            let n = current.next_buffer(buffer);
+            if n > 0 {
+                return n;
+            }
+            if current.is_exhausted() {
+                self.current = None;
+                continue;
+            }
+            return 0;
+        }
+    }
+
+    fn is_exhausted(&self) -> bool {
+        !self.provider.has_next() && self.current.is_none()
+    }
+
+    fn remaining_seconds(&self) -> Option<f64> {
+        self.current.as_ref().and_then(|c| c.remaining_seconds())
+    }
+
+    fn label(&self) -> Option<String> {
+        self.started.then(|| self.current_label.clone())
+    }
+
+    fn replaygain_db(&self) -> Option<f32> {
+        self.current.as_ref().and_then(|c| c.replaygain_db())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

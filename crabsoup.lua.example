@@ -63,12 +63,18 @@ j = jingles({directory = "./jingles"})
 -- Automatic jingle rotation (the Liquidsoap `rotate` radio recipe):
 -- every N tracks a jingle plays, forever, picked at random. The jingle
 -- child loops and re-shuffles each cycle, so each pick is a fresh random
--- jingle; `weights = {4, 1}` means 4 songs, 1 jingle, strictly
+-- jingle. The rotate children must be *plain* playlists (no internal
+-- crossfade — an internal fade would preload seconds ahead of the
+-- scheduler and leak across the boundary), and one `crossfade` on top
+-- fades every transition uniformly: song->song, song->jingle,
+-- jingle->jingle. `weights = {3, 1}` means 3 songs, 1 jingle, strictly
 -- alternating at track boundaries (Liquidsoap's rotate picks randomly
--- per track instead). Use the rotate source in place of `pl` (and `j`):
---   jr = rotate({pl, playlist({directory = "./jingles",
---                              loop = true, shuffle = true})},
---               {weights = {4, 1}})
+-- per track instead). Use the wrapped source in place of `pl` (and `j`):
+--   songs = playlist({directory = "./media", crossfade = false})
+--   js = playlist({directory = "./jingles", loop = true, shuffle = true,
+--                  crossfade = false})
+--   jr = crossfade(rotate({songs, js}, {weights = {3, 1}}),
+--                  {duration = 3.0})
 --   output.icecast({host = ..., mount = "/crabsoup.opus", ...},
 --                  fallback({live, jr}))
 -- Per-track followers (`annotated(src, {append = "jingles/x.mp3"})`) are

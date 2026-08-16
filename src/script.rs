@@ -50,8 +50,9 @@ use crate::engine::stereo::{Stereo, VocalRemover};
 use crate::request::{RequestConfig, RequestUri, TrackCues, resolve};
 use crate::source::blank_detect::{BlankDetectConfig, BlankDetectSource};
 use crate::source::cue_cut::CueCutSource;
+use crate::source::overlap::OverlapSource;
 use crate::source::pipe::{PcmFormat, PipeConfig, PipeSource};
-use crate::source::playlist::Playlist;
+use crate::source::playlist::{Playlist, PlaylistSource};
 use crate::source::replaygain::ReplayGainSource;
 use crate::source::request::{RequestQueue, RequestQueueSource};
 use crate::source::soundcard::{SoundcardInputConfig, SoundcardInputSource};
@@ -1990,7 +1991,18 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
             // Option-bool: mlua converts a missing key to Ok(false), so a
             // plain unwrap_or(true) would default to *not* looping.
             let loop_playlist: bool = opts.get("loop").ok().flatten().unwrap_or(true);
-            let src = crossfading_playlist(requests, shuffle, loop_playlist, &pl_state);
+            // `crossfade = false` returns a plain sequential source (no
+            // preload, no overlap) for children of `rotate` and friends;
+            // wrap the composition in `crossfade(...)` instead.
+            let crossfade: bool = opts.get("crossfade").ok().flatten().unwrap_or(true);
+            let src = if crossfade {
+                crossfading_playlist(requests, shuffle, loop_playlist, &pl_state)
+            } else {
+                let (spec, fpb) = bus(&pl_state);
+                let request = pl_state.borrow().request;
+                let playlist = Playlist::new(requests, shuffle, loop_playlist, request, spec, fpb, None);
+                Box::new(PlaylistSource::new(playlist))
+            };
             Ok(LuaSource::new(src))
         })?,
     )?;
@@ -2029,6 +2041,32 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
                     threshold_db,
                 });
             Ok(LuaSource::new(Box::new(mixer)))
+        })?,
+    )?;
+
+    // ---- top-level crossfade (Liquidsoap `crossfade`) ---------------------
+    // Overlap-fades between the consecutive tracks of any source, for
+    // compositions whose children cannot crossfade internally (`rotate`'s
+    // children, plain `playlist({crossfade = false})`). The wrap mixes the
+    // outgoing track's tail (a delay ring) with the incoming track's head
+    // over `duration` seconds; `curve` follows `fade_curve` by default.
+    let cf_state = state.clone();
+    globals.set(
+        "crossfade",
+        lua.create_function(move |_, (mut source, opts): (LuaSource, Option<Table>)| {
+            let cfg = cf_state.borrow().mixer.clone();
+            let duration = opt_f64(&opts, "duration", cfg.crossfade_seconds)?;
+            let curve = opt_f64(&opts, "curve", cfg.fade_curve)?;
+            let (spec, _) = bus(&cf_state);
+            let child = source.take();
+            let src = OverlapSource::new(
+                child,
+                duration,
+                curve,
+                spec.rate,
+                spec.channels.count(),
+            );
+            Ok(LuaSource::new(Box::new(src)))
         })?,
     )?;
 
@@ -5031,6 +5069,119 @@ mod tests {
         _rt.drain_metadata();
         let tracks: mlua::Table = _rt.global("tracks").expect("tracks table");
         assert_eq!(tracks.raw_len(), 1, "blank labels itself, so one boundary");
+    }
+
+    // ---- top-level crossfade (G-crossfade) -------------------------------
+
+    /// Pull `root` to exhaustion, recording label changes and the total
+    /// frames heard.
+    fn drain_labels_and_frames(root: &mut dyn crate::source::AudioSource) -> (Vec<String>, usize) {
+        let mut buf = vec![0f32; 4096 * 2];
+        let mut seen = Vec::new();
+        let mut total = 0;
+        let mut last = None;
+        for _ in 0..1000 {
+            let n = root.next_buffer(&mut buf);
+            if n == 0 {
+                break;
+            }
+            total += n;
+            let label = root.label();
+            if label != last {
+                seen.push(label.clone().unwrap_or_default());
+                last = label;
+            }
+        }
+        (seen, total)
+    }
+
+    #[test]
+    fn crossfade_overlap_produces_gapless_sequence() {
+        // Two 0.4s sines with a 0.1s fade: the fade overlaps the boundary,
+        // so the total is the full 0.8s — nothing is cut and nothing is
+        // held back.
+        let (_rt, res) = run(r#"
+            src = crossfade(sequence({sine({freq = 440, duration = 0.4}),
+                                      sine({freq = 880, duration = 0.4})}),
+                            {duration = 0.1})
+            output.preview(src)
+            "#)
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let (seq, total) = drain_labels_and_frames(&mut *root);
+        assert_eq!(
+            seq,
+            vec!["sine 440 Hz".to_string(), "sine 880 Hz".to_string()]
+        );
+        let expected = (0.8 * 44_100.0 * 2.0) as usize;
+        assert!(
+            (total as i64 - expected as i64).abs() < 4096 * 2,
+            "heard {total} frames, expected ~{expected}"
+        );
+    }
+
+    #[test]
+    fn playlist_crossfade_false_is_a_plain_sequence() {
+        let a = follower_wav("plain-a");
+        let b = follower_wav("plain-b");
+        let stem = |p: &PathBuf| p.file_stem().unwrap().to_string_lossy().into_owned();
+        let (_rt, res) = run(&format!(r#"
+            src = playlist({{files = {{'{a}', '{b}'}}, crossfade = false, loop = false}})
+            output.preview(src)
+            "#, a = a.display(), b = b.display()))
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let (seq, total) = drain_labels_and_frames(&mut *root);
+        assert_eq!(seq, vec![stem(&a), stem(&b)]);
+        let expected = (0.4 * 44_100.0 * 2.0) as usize;
+        assert!(
+            (total as i64 - expected as i64).abs() < 4096 * 2,
+            "heard {total} frames, expected ~{expected}"
+        );
+    }
+
+    #[test]
+    fn crossfade_rotate_composition_fades_every_boundary() {
+        // The radio recipe: plain playlists inside `rotate`, one `crossfade`
+        // on top. Every rotate boundary (song -> jingle -> song) surfaces as
+        // a label change the wrap can fade.
+        let s1 = follower_wav("rot-song-a");
+        let s2 = follower_wav("rot-song-b");
+        let j1 = follower_wav("rot-jingle-1");
+        let j2 = follower_wav("rot-jingle-2");
+        let stem = |p: &PathBuf| p.file_stem().unwrap().to_string_lossy().into_owned();
+        let (_rt, res) = run(&format!(r#"
+            songs = playlist({{files = {{'{s1}', '{s2}'}}, crossfade = false, loop = false}})
+            jingles = playlist({{files = {{'{j1}', '{j2}'}}, crossfade = false, loop = false}})
+            src = crossfade(rotate({{songs, jingles}}, {{weights = {{1, 1}}}}),
+                            {{duration = 0.05}})
+            output.preview(src)
+            "#, s1 = s1.display(), s2 = s2.display(),
+             j1 = j1.display(), j2 = j2.display()))
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        // The rotate switches at label changes, so each child plays its
+        // full tracks plus the first buffer of the next one before handing
+        // over; the interrupted tracks resume (frozen mid-track) when the
+        // child is picked again. All four tracks play in full, so the total
+        // is the sum of the durations.
+        let (seq, total) = drain_labels_and_frames(&mut *root);
+        assert_eq!(
+            seq,
+            vec![
+                stem(&s1),
+                stem(&s2),
+                stem(&j1),
+                stem(&j2),
+                stem(&s2),
+                stem(&j2)
+            ]
+        );
+        let expected = (4.0 * 0.2 * 44_100.0 * 2.0) as usize;
+        assert!(
+            (total as i64 - expected as i64).abs() < 4096 * 2,
+            "heard {total} frames, expected ~{expected}"
+        );
     }
 
     // ---- Part F4: blank.detect -----------------------------------------

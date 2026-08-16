@@ -186,6 +186,24 @@ One engine thread plus one thread per output:
   they play; per-track annotations override the defaults and `"false"`
   inhibits them. Followers are resolved lazily per boundary, so a missing
   file logs and skips.
+- The top-level `crossfade(src, {duration, curve})` operator
+  (`src/source/overlap.rs`) exists because `rotate`'s children cannot
+  crossfade internally: the `CrossfadeMixer` preloads the next track
+  `crossfade_seconds` early, so a fade would start before the scheduler
+  sees the boundary, and the abandoned child freezes mid-fade while the
+  scheduler pulls another child (the "leak" heard live). `OverlapSource`
+  instead fades *between* whatever the child produces: a delay ring
+  (`fade_frames * channels`) is written continuously but read only when
+  the child's label changes — then the ring's tail (the outgoing track's
+  last `duration` seconds) is mixed with the fresh head over the window
+  (`out = tail * curve(1-t) + fresh * curve(t)`, the mixer's curve
+  shape). The output is a passthrough otherwise, so there is no start
+  delay and the ring is never replayed; a child ending mid-fade drains
+  its unplayed tail (bounded by the window). `playlist({crossfade = false})`
+  returns the plain `PlaylistSource` (`src/source/playlist.rs`) — a
+  sequential bridge over the `Playlist` provider with no preload — for
+  exactly this composition; the recipe is
+  `crossfade(rotate({songs, jingles}, {weights = {3, 1}}))`.
 - The HTTP client is hand-rolled on a `Transport` enum — a plain
   `TcpStream` for `http://`, a `rustls::StreamOwned` (ring provider,
   webpki-roots Mozilla store) for `https://` — and the status/header/chunked
