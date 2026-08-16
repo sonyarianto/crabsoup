@@ -3,11 +3,12 @@
 An output is where the engine's root source ends up. The pipeline is:
 
 ```
-Playlist ──► CrossfadeMixer ──► PriorityMixer ──► Encoder ──► Icecast
-               (track overlap)  (live/jingle     (LAME,
-                                 override)        libopus+Ogg,
-                                                  or fdk-aac)
+root source (script graph, crossfades inside) -> PriorityMixer -> TAP -> [outputs]*
 ```
+
+One puller thread feeds every output from a shared tap, so a stalled output
+drops frames instead of stalling the others. `PriorityMixer` fades from the
+main source to an override (live DJ or jingle) over `duck_seconds`.
 
 ## `output.icecast({...}, src)`
 

@@ -27,7 +27,6 @@ soundcard.
 - **Video (opt-in, `--features video`)**: file → HLS(video) with
   `video.video`/`video.single`/`video.playlist` sources and keyframe-aligned
   MPEG-TS segments plus a master playlist — see the [video guide](/guide/video)
-- **Graceful Ctrl-C shutdown**
 
 ## Building
 
@@ -48,7 +47,7 @@ Lua 5.4 is vendored and compiled at build time (needs a C compiler).
 
 ```sh
 cp crabsoup.lua.example crabsoup.lua   # or write your own
-RUST_LOG=crabsoup=info ./target/release/crabsoup -c crabsoup.lua
+./target/release/crabsoup -c crabsoup.lua   # RUST_LOG=crabsoup=info is the default
 ```
 
 With an `output.icecast` call it connects to Icecast as a source. Without one
@@ -62,9 +61,17 @@ Per-format test scripts live in `examples/`:
 ./target/release/crabsoup -c examples/crabsoup.opus.lua    # Opus -> /crabsoup.opus
 ./target/release/crabsoup -c examples/crabsoup.mp3.lua     # MP3  -> /crabsoup.mp3
 ./target/release/crabsoup -c examples/crabsoup.aac.lua     # AAC  -> /crabsoup.aac
+./target/release/crabsoup -c examples/crabsoup.shoutcast.lua # SHOUTcast v1/v2
 ./target/release/crabsoup -c examples/crabsoup.pipe.lua    # external processor pipeline (preview)
+./target/release/crabsoup -c examples/crabsoup.dsp.lua     # compress -> normalize -> amplify
+./target/release/crabsoup -c examples/crabsoup.tone.lua    # blank/sine test tone, no media needed
 ./target/release/crabsoup -c examples/crabsoup.preview.lua # no broadcast
+./target/release/crabsoup -c examples/crabsoup.video.lua    # file -> HLS(video)
+./target/release/crabsoup -c examples/crabsoup.rtmp.lua     # file -> RTMP (nginx-rtmp)
+./target/release/crabsoup -c examples/crabsoup.mp4.lua      # file -> MP4 recording
 ```
+
+The last three need a feature build (`--features video`, `--features rtmp,video`).
 
 ## Testing
 
