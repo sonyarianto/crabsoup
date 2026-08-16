@@ -300,21 +300,22 @@ Implementation-level wiring (engine tap, threading model, gotchas) lives in
 ```
 media/ + jingles/   (decoded via symphonia)
    ▼
-root source ──► CrossfadeMixer ──► PriorityMixer ──► TAP (one puller thread)
-                (track overlap)    (live/jingle       │  shared PCM + title
-                                    override)         ├─► encoder → Icecast (MP3/Opus/AAC)
-                                                      ├─► encoder → file / soundcard
-                                                      ├─► HLS  (H.264 + AAC)
-                                                      ├─► MP4  (AAC-LC ± H.264)
-                                                      ├─► RTMP (FLV ± H.264)
-                                                      └─► preview (broadcasts nowhere)
+root source ──► PriorityMixer ──► TAP (one puller thread)
+(script graph:    (live/jingle       │  shared PCM + title
+ playlists cross-  ducking)          ├─► encoder → Icecast (MP3/Opus/AAC)
+ fade inside)                        ├─► encoder → file / soundcard
+                                     ├─► HLS  (AAC ± H.264)
+                                     ├─► MP4  (AAC-LC ± H.264)
+                                     ├─► RTMP (FLV ± H.264)
+                                     └─► preview (broadcasts nowhere)
 ```
 
 The script's root source (e.g. `fallback({jingle, live, playlist})`) becomes
-the crossfade+priority chain's input; one puller thread feeds every output
-from a shared tap, so a stalled output drops frames instead of stalling the
-others. The `PriorityMixer` fades from the main source to an override (live
-DJ or jingle) over `duck_seconds`; a live DJ always wins over a jingle.
+the engine's input. Playlists crossfade inside the script graph; the engine
+wraps the root in a `PriorityMixer`, which fades from the main source to an
+override (live DJ or jingle) over `duck_seconds` — a live DJ always wins over
+a jingle. One puller thread then feeds every output from a shared tap, so a
+stalled output drops frames instead of stalling the others.
 
 Source layout:
 
