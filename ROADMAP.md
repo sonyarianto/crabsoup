@@ -8,31 +8,60 @@
       starts seconds before the scheduler sees the boundary and the child
       freezes mid-fade while another child plays (the leak heard in the
       live `rotate` + crossfading-playlist config). `crossfade` fades
-      *between* whatever the child produces instead: a delay ring holds the
-      current track's tail, and when the child's label changes the tail is
-      mixed with the new track's head over the window. The output is a
-      passthrough otherwise (ring written continuously, read only during a
-      fade): no start delay, no tail replay, no double fades. New
-      `playlist({..., crossfade = false})` returns a plain sequential
-      source (no preload/mixer) for rotate children. Acceptance met: unit
-      tests (blend curve sample-accurate on tone pairs, mid-fade drain,
-      no-replay on exhaustion, zero-duration passthrough, equal-power
-      curve dip) and script tests (gapless two-tone sequence, plain
-      playlist labels+total, and the full rotate-composition recipe with
-      crossfade on top). The `crabsoup.lua` and example configs use the
-      recipe; docs (README, ARCHITECTURE, dsp.md) updated. Soak-test
-      follow-up: `rotate`/`switch` now hand over at the *exact* track
-      boundary — the boundary pull's buffer (the new track's first frames)
-      is held and replays when the schedule rotates back, so no fragment
-      of the next track is heard ahead of a jingle and tracks never
-      resume mid-track; a boundary inside a multi-track turn (weight > 1)
-      keeps the child current. Without this, the wrapper saw two label
-      changes ~0.1 s apart at every handover (the next track's first
-      buffer then the jingle), starting a fresh fade each time — the
+      *between* whatever the child produces instead: the output trails the
+      input by the fade duration through a delay ring, so when the child's
+      label changes the outgoing track's final seconds are *not yet heard*.
+      The fade-out plays that ring tail exactly once, the read jumps past
+      the unplayed trailing silence, and the incoming track ramps in over
+      a tenth of the fade — nothing is ever replayed and no dead air is
+      output. The window is sized per fade to the ring's audible tail
+      (last frame above −66 dBFS, floored at 0.15 s, capped by the
+      outgoing track's last quarter), so tracks that end in trailing
+      silence (the songs/jingles have 1.5–2.3 s) don't fade over dead air.
+      Startup latency equals the fade duration (3 s in the live config —
+      fine for broadcast; Icecast now-playing metadata runs that far
+      ahead, cosmetic). New `playlist({..., crossfade = false})` returns a
+      plain sequential source (no preload/mixer) for rotate children.
+      Acceptance met: unit tests (tail played exactly once with no replay
+      on exhaustion, mid-fade drain, trailing-silence skip, dead-air
+      floor, zero-duration passthrough, equal-power curve dip) and script
+      tests (gapless two-tone sequence with the fade-duration startup,
+      plain playlist labels+total, and the full rotate-composition recipe
+      with crossfade on top). The `crabsoup.lua` and example configs use
+      the recipe; docs (README, ARCHITECTURE, dsp.md) updated.
+      Soak-test follow-up: `rotate`/`switch` now hand over at the *exact*
+      track boundary — the boundary pull's buffer (the new track's first
+      frames) is held and replays when the schedule rotates back, so no
+      fragment of the next track is heard ahead of a jingle and tracks
+      never resume mid-track; a boundary inside a multi-track turn
+      (weight > 1) keeps the child current. Without this, the wrapper saw
+      two label changes ~0.1 s apart at every handover (the next track's
+      first buffer then the jingle), starting a fresh fade each time — the
       "crossfade not felt" and "small segment repeat at the jingle end"
       the soak test heard. Acceptance: `rotate`/`switch` schedule tests
       and the full rotate-composition recipe updated for exact sequences
-      (342 tests pass).
+      (342 tests pass). Second soak-test follow-up: the fade window is now
+      sized per fade to the ring's audible tail (last frame above −66 dBFS,
+      floored at 0.15 s, capped by the outgoing track's last quarter) —
+      the songs/jingles end in 1.5–2.3 s of trailing silence, so the old
+      fixed window spent most of the fade over dead air: "song drained to
+      the end, then the jingle starts" and the "repeat" was the tail
+      replay framed by the gap. Now the next track reaches full level
+      exactly when the previous one stops being audible. Acceptance:
+      window-trim unit tests (partial audible tail, full dead air → 0.15 s
+      floor) and a real-file diagnosis rerun showing windows of 0.5–3.0 s
+      with no silence after boundaries (345 tests pass). Third soak-test
+      follow-up: the ring *replay* itself was the remaining "jingle ending
+      repeats" — the tail was heard as passthrough and again as the fade.
+      `OverlapSource` is now a true delayed ring: the output trails the
+      input by the fade window, the fade-out plays the un-heard tail
+      exactly once, the read jumps past the trailing silence, and the
+      incoming track ramps in over 10% of the fade (startup = the fade
+      duration of silence while the ring fills). Acceptance: rewritten
+      overlap unit tests (tail played exactly once, no replay after
+      exhaustion, mid-fade drain, silence skip, dead-air floor) and the
+      gapless script test updated for the fade-duration startup (345 tests
+      pass).
 - [x] **G3.8 — `append`/`prepend` followers (`annotated`)**: the new
       `annotated(src, {append = "stinger.mp3", prepend = "intro.mp3"})`
       operator wraps any source and plays the followers after/before every

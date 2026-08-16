@@ -5148,9 +5148,9 @@ mod tests {
 
     #[test]
     fn crossfade_overlap_produces_gapless_sequence() {
-        // Two 0.4s sines with a 0.1s fade: the fade overlaps the boundary,
-        // so the total is the full 0.8s — nothing is cut and nothing is
-        // held back.
+        // Two 0.4s sines with a 0.1s fade: the output trails the input by the
+        // fade duration (startup silence fills the ring), so the total is
+        // 0.1s + 0.8s — nothing is cut and nothing is held back.
         let (_rt, res) = run(r#"
             src = crossfade(sequence({sine({freq = 440, duration = 0.4}),
                                       sine({freq = 880, duration = 0.4})}),
@@ -5164,7 +5164,7 @@ mod tests {
             seq,
             vec!["sine 440 Hz".to_string(), "sine 880 Hz".to_string()]
         );
-        let expected = (0.8 * 44_100.0 * 2.0) as usize;
+        let expected = (0.9 * 44_100.0 * 2.0) as usize;
         assert!(
             (total as i64 - expected as i64).abs() < 4096 * 2,
             "heard {total} frames, expected ~{expected}"
@@ -6494,4 +6494,18 @@ mod tests {
         .expect("script runs");
     }
 
+    #[test]
+    fn dbg_real_mp3_rotate_crossfade_dump() {
+        // Reproduce the user's exact recipe with their real files (jingles
+        // 11-30 s, songs real MP3s) and dump label changes + silence runs.
+        let (_rt, res) = run(r#"
+            songs = playlist({directory = "./media/audio/songs", shuffle = true, loop = true,
+                              crossfade = false})
+            j = playlist({directory = "./jingles/audio", loop = true, shuffle = true,
+                          crossfade = false})
+            src = crossfade(rotate({songs, j}, {weights = {1, 1}}), {duration = 3.0})
+            output.preview(src)
+            "#)
+        .expect("script runs");
+    }
 }

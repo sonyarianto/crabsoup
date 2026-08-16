@@ -193,13 +193,21 @@ One engine thread plus one thread per output:
   sees the boundary, and the abandoned child freezes mid-fade while the
   scheduler pulls another child (the "leak" heard live). `OverlapSource`
   instead fades *between* whatever the child produces: a delay ring
-  (`fade_frames * channels`) is written continuously but read only when
-  the child's label changes — then the ring's tail (the outgoing track's
-  last `duration` seconds) is mixed with the fresh head over the window
-  (`out = tail * curve(1-t) + fresh * curve(t)`, the mixer's curve
-  shape). The output is a passthrough otherwise, so there is no start
-  delay and the ring is never replayed; a child ending mid-fade drains
-  its unplayed tail (bounded by the window). `playlist({crossfade = false})`
+  (`fade_frames * channels`) is written continuously and the output
+  trails the input by the fade duration, so the outgoing track's final
+  `duration` seconds are *not yet heard* when the child's label changes.
+  The fade-out then plays that ring tail exactly once (`tail *
+  curve(1-t)`, the mixer's curve shape), the read jumps past the unplayed
+  trailing silence, and the incoming track ramps in over a tenth of the
+  fade (`fresh * curve(t)`). Nothing is ever replayed and the fade never
+  drags over dead air: the window is sized per fade to the ring's audible
+  tail (the last frame above −66 dBFS, floored at 0.15 s and capped by
+  the outgoing track's last quarter). The first `fade_frames` output
+  frames are silence while the ring fills (startup latency equals the
+  fade duration — 3 s in the live config, fine for broadcast; Icecast
+  now-playing metadata runs that far ahead, cosmetic). A child ending
+  mid-fade drains its unplayed tail, and a stream ending without a fade
+  in progress ramps the held ring out. `playlist({crossfade = false})`
   returns the plain `PlaylistSource` (`src/source/playlist.rs`) — a
   sequential bridge over the `Playlist` provider with no preload — for
   exactly this composition; the recipe is
