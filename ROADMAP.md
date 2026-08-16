@@ -15,9 +15,10 @@
       the unplayed trailing silence, and the incoming track ramps in over
       a tenth of the fade — nothing is ever replayed and no dead air is
       output. The window is sized per fade to the ring's audible tail
-      (last frame above −66 dBFS, floored at 0.15 s, capped by the
+      (BS.1770-style gate: 50 ms/10 ms mean-square windows at −70 dBFS,
+      then 10 LU below the gated mean; floored at 0.15 s, capped by the
       outgoing track's last quarter), so tracks that end in trailing
-      silence (the songs/jingles have 1.5–2.3 s) don't fade over dead air.
+      silence or a decaying tail don't fade over dead air.
       Startup latency equals the fade duration (3 s in the live config —
       fine for broadcast; Icecast now-playing metadata runs that far
       ahead, cosmetic). New `playlist({..., crossfade = false})` returns a
@@ -41,10 +42,12 @@
       the soak test heard. Acceptance: `rotate`/`switch` schedule tests
       and the full rotate-composition recipe updated for exact sequences
       (342 tests pass). Second soak-test follow-up: the fade window is now
-      sized per fade to the ring's audible tail (last frame above −66 dBFS,
-      floored at 0.15 s, capped by the outgoing track's last quarter) —
-      the songs/jingles end in 1.5–2.3 s of trailing silence, so the old
-      fixed window spent most of the fade over dead air: "song drained to
+      sized per fade to the ring's audible tail (BS.1770-style gate:
+      50 ms/10 ms mean-square windows at −70 dBFS, then 10 LU below the
+      gated mean; floored at 0.15 s, capped by the outgoing track's last
+      quarter) — the songs/jingles end in trailing silence/decay, so the
+      old fixed window spent most of the fade over dead air: "song
+      drained to
       the end, then the jingle starts" and the "repeat" was the tail
       replay framed by the gap. Now the next track reaches full level
       exactly when the previous one stops being audible. Acceptance:
@@ -61,7 +64,19 @@
       overlap unit tests (tail played exactly once, no replay after
       exhaustion, mid-fade drain, silence skip, dead-air floor) and the
       gapless script test updated for the fade-duration startup (345 tests
-      pass).
+      pass). Fourth follow-up (branch `feat/gated-fade-point`): the fade
+      point is found with a loudness gate instead of a fixed −66 dBFS
+      sample threshold, so the track's own level decides its silence:
+      noise floors and single-sample clicks never stretch the fade,
+      tracks as quiet as −68 dBFS still fade to their music, and dead
+      silence falls back to the 0.15 s floor. Acceptance: unit tests
+      (noise floor, click in the tail, quiet track, all-silence fallback)
+      on top of the untouched window-trim tests, and a real-file
+      cross-check against ffmpeg `silencedetect` at the gate level —
+      boundaries agree within 50 ms on steep decays and end *before* the
+      peak-based reference on slow decays (the skipped remainder is ≥10 LU
+      below the ring's own mean, inaudible); four songs' silence exceeds
+      the 3 s ring and correctly floor the fade (349 tests pass).
 - [x] **G3.8 — `append`/`prepend` followers (`annotated`)**: the new
       `annotated(src, {append = "stinger.mp3", prepend = "intro.mp3"})`
       operator wraps any source and plays the followers after/before every

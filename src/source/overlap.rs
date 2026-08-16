@@ -31,10 +31,17 @@ use crate::source::AudioSource;
 /// Sampled fade curve resolution, matching `engine::mixer`.
 const CURVE_TABLE_SIZE: usize = 1024;
 
-/// Ring frames with every sample below this level count as silence when
-/// sizing the fade window, so a fade never spends its window over a
-/// track's trailing silence.
-const AUDIBLE_THRESHOLD: f32 = 0.0005;
+/// RMS window and hop for the fade-point scan.
+const RMS_WINDOW_SECONDS: f64 = 0.05;
+const RMS_HOP_SECONDS: f64 = 0.01;
+
+/// BS.1770/EBU R128 loudness gates: windows whose mean-square is below
+/// −70 dBFS are absolute silence, and a window counts as audible only if
+/// it is also within `GATE_RELATIVE_LU` LU of the mean of the windows
+/// that pass the absolute gate — the track's own loudness defines its
+/// audibility floor, so quiet tracks are handled as well as loud ones.
+const GATE_ABSOLUTE_DB: f32 = -70.0;
+const GATE_RELATIVE_LU: f32 = 10.0;
 
 /// Shortest allowed fade-out window in seconds: below this a cut would
 /// click, above it a fade over near-silence just delays the next track.
@@ -80,6 +87,10 @@ pub struct OverlapSource {
     /// Reusable pull buffer, sized on demand so `next_buffer` never
     /// allocates on the hot path.
     scratch: Vec<f32>,
+    /// Per-hop mean-square sums and per-window energies for the fade-point
+    /// gate scan, sized on demand like `scratch`.
+    hop_energy: Vec<f32>,
+    block_energy: Vec<f32>,
     /// True once the child has produced its first buffer.
     primed: bool,
     last_label: Option<String>,
@@ -121,6 +132,8 @@ impl OverlapSource {
                 .collect(),
             channels,
             scratch: Vec::new(),
+            hop_energy: Vec::new(),
+            block_energy: Vec::new(),
             primed: false,
             last_label: None,
             track_frames: 0,
@@ -148,15 +161,9 @@ impl OverlapSource {
     /// actually held — so the fade never drags over trailing silence and
     /// the rest of the ring (silence) is skipped at the fade-out's end.
     fn start_fade(&mut self) {
-        let chans = self.channels;
         let cap = self.fade_frames;
         let span = self.filled.min(self.track_frames);
-        let last_audible = (0..span).rfind(|&i| {
-            let base = ((self.write_pos + cap - self.filled + i) % cap) * chans;
-            self.ring[base..base + chans]
-                .iter()
-                .any(|s| s.abs() >= AUDIBLE_THRESHOLD)
-        });
+        let last_audible = self.gated_last_audible(span);
         let win_cap = cap.min(self.track_frames.max(1) / 4).max(1);
         let min_win = (MIN_FADE_SECONDS * self.sample_rate as f64).round() as usize;
         let window = last_audible
@@ -175,6 +182,83 @@ impl OverlapSource {
         self.fade_write_start = self.write_pos;
         self.filling = false;
         self.track_frames = 0;
+    }
+
+    /// Index of the last audible frame in the ring's unread span, found
+    /// with BS.1770-style gating instead of a bare amplitude floor, so a
+    /// track's own loudness — not a fixed −66 dBFS constant — decides what
+    /// is silence: short-time mean-square windows (50 ms, 10 ms hop) are
+    /// gated at −70 dBFS, then again 10 LU below the mean of the windows
+    /// that passed. The last passing window is refined sample-by-sample
+    /// against that gate level. `None` means nothing passed: the fade falls
+    /// back to its floor.
+    fn gated_last_audible(&mut self, span: usize) -> Option<usize> {
+        if span == 0 {
+            return None;
+        }
+        let chans = self.channels;
+        let cap = self.fade_frames;
+        let rate = self.sample_rate as f64;
+        let hop = ((RMS_HOP_SECONDS * rate).round() as usize).max(1);
+        let win = ((RMS_WINDOW_SECONDS * rate).round() as usize).max(hop);
+        let hops_per_win = (win / hop).max(1);
+        let nwin = span.div_ceil(hop);
+        if self.hop_energy.len() != nwin {
+            self.hop_energy.resize(nwin, 0.0);
+            self.block_energy.resize(nwin, 0.0);
+        }
+        let abs_floor = 10f32.powf(GATE_ABSOLUTE_DB / 10.0);
+        let mut sliding = 0.0f32;
+        let mut gated_mean_sum = 0.0f32;
+        let mut gated_count = 0usize;
+        for k in 0..nwin {
+            let start = k * hop;
+            let end = ((k + 1) * hop).min(span);
+            let mut sum = 0.0f32;
+            for i in start..end {
+                let base = ((self.write_pos + cap - self.filled + i) % cap) * chans;
+                let s0 = self.ring[base];
+                let s1 = self.ring[base + 1];
+                sum += s0 * s0 + s1 * s1;
+            }
+            self.hop_energy[k] = sum;
+            sliding += sum;
+            if k >= hops_per_win {
+                sliding -= self.hop_energy[k - hops_per_win];
+            }
+            let win_start = (k + 1).saturating_sub(hops_per_win) * hop;
+            let win_end = ((k + 1) * hop).min(span);
+            let energy = sliding / (2.0 * (win_end - win_start) as f32);
+            self.block_energy[k] = energy;
+            if energy > abs_floor {
+                gated_mean_sum += energy;
+                gated_count += 1;
+            }
+        }
+        if gated_count == 0 {
+            return None;
+        }
+        let rel_floor = gated_mean_sum / gated_count as f32 / 10f32.powf(GATE_RELATIVE_LU / 10.0);
+        let gate = rel_floor.max(abs_floor);
+        let sample_floor = gate.sqrt();
+        for k in (0..nwin).rev() {
+            if self.block_energy[k] <= gate {
+                continue;
+            }
+            let win_start = (k + 1).saturating_sub(hops_per_win) * hop;
+            let win_end = ((k + 1) * hop).min(span);
+            for i in (win_start..win_end).rev() {
+                let base = ((self.write_pos + cap - self.filled + i) % cap) * chans;
+                if self.ring[base..base + chans]
+                    .iter()
+                    .any(|s| s.abs() >= sample_floor)
+                {
+                    return Some(i);
+                }
+            }
+            return Some(win_end - 1);
+        }
+        None
     }
 
     /// Mix one pull. Each input frame is written to the ring; each output
@@ -384,6 +468,9 @@ mod tests {
         pos_frames: usize,
         label: String,
         silence_tail_frames: usize,
+        floor: f32,
+        click_at: Option<usize>,
+        click_amp: f32,
     }
 
     impl FakeSource {
@@ -394,11 +481,29 @@ mod tests {
                 pos_frames: 0,
                 label: label.to_string(),
                 silence_tail_frames: 0,
+                floor: 0.0,
+                click_at: None,
+                click_amp: 0.0,
             }
         }
 
         fn with_silence_tail(mut self, frames: usize) -> Self {
             self.silence_tail_frames = frames;
+            self
+        }
+
+        /// The silence tail carries a constant `floor` instead of zero,
+        /// like a quiet noise floor below the music.
+        fn with_floor(mut self, floor: f32) -> Self {
+            self.floor = floor;
+            self
+        }
+
+        /// A single `amp`-sized sample deep in the silence tail, like a
+        /// click or an artifact.
+        fn with_click(mut self, at_frame: usize, amp: f32) -> Self {
+            self.click_at = Some(at_frame);
+            self.click_amp = amp;
             self
         }
     }
@@ -411,11 +516,17 @@ mod tests {
             let n = n_frames * CHANS;
             let silent_from = self.total_frames.saturating_sub(self.silence_tail_frames);
             for f in 0..n_frames {
-                buffer[f * CHANS..(f + 1) * CHANS].fill(if self.pos_frames + f >= silent_from {
-                    0.0
+                let frame = self.pos_frames + f;
+                let v = if frame >= silent_from {
+                    if self.click_at == Some(frame) {
+                        self.click_amp
+                    } else {
+                        self.floor
+                    }
                 } else {
                     self.value
-                });
+                };
+                buffer[f * CHANS..(f + 1) * CHANS].fill(v);
             }
             self.pos_frames += n_frames;
             n
@@ -617,14 +728,124 @@ mod tests {
         let mut src = OverlapSource::new(Box::new(src), 2.0, 1.0, RATE as u32, CHANS);
         let amps = pull(&mut src, 800, 10);
         assert_eq!(amps.len(), 200 + 350 + 50, "B passes, then the ring drains");
-        for (i, a) in amps.iter().enumerate().skip(345).take(60) {
-            eprintln!("dbg[{i}] = {a}");
-        }
         assert_eq!(amps[349], 1.0, "A's last audible frame, delayed");
         assert!((amps[399] - 0.02).abs() < 1e-6, "fade end was {}", amps[399]);
         assert_eq!(amps[400], 0.0, "B ramps in at the fade end, never after dead air");
         assert_eq!(amps[420], 0.5, "B at full level once the 20-frame ramp ends");
         assert_eq!(amps[549], 0.5, "B's last frame passes at full level");
         assert!((amps[599] - 0.01).abs() < 1e-6, "drain end was {}", amps[599]);
+    }
+
+    #[test]
+    fn crossfade_ignores_a_noise_floor_below_the_music() {
+        // A: 6.5s loud + 1.5s of a −66 dBFS noise floor. A fixed −66 dB
+        // sample threshold would count the floor as audio and drag the
+        // fade through it; the loudness gate (10 LU below the track's own
+        // mean) treats it as silence, so the fade stops at the music.
+        let src = PairSource::from_sources(
+            FakeSource::new(1.0, 800, "a").with_silence_tail(150).with_floor(0.0005),
+            FakeSource::new(0.5, 400, "b"),
+        );
+        let mut src = OverlapSource::new(Box::new(src), 2.0, 1.0, RATE as u32, CHANS);
+        let amps = pull(&mut src, 1300, 10);
+        assert_eq!(amps.len(), 800 + 400 + 50, "B passes, then the ring drains");
+        assert_eq!(amps[800], 1.0, "fade-out starts at A's last audible part");
+        assert!((amps[849] - 1.0 / 50.0).abs() < 1e-6, "fade end was {}", amps[849]);
+        assert_eq!(amps[850], 0.0, "B ramps in at the fade end, not after the floor");
+        assert_eq!(amps[870], 0.5, "B at full level once the 20-frame ramp ends");
+        assert_eq!(amps[1199], 0.5, "B's last frame passes at full level");
+        assert!((amps[1249] - 0.5 / 50.0).abs() < 1e-6, "drain end was {}", amps[1249]);
+    }
+
+    #[test]
+    fn crossfade_ignores_a_click_in_the_trailing_silence() {
+        // A: 2.0s loud + 1.5s silence with a single −6 dB click in the
+        // middle of it. A sample threshold would anchor the fade to the
+        // click and drag it 1.0s past the music; the windowed gate
+        // smooths the click away, so the fade still ends at the music.
+        let src = PairSource::from_sources(
+            FakeSource::new(1.0, 350, "a")
+                .with_silence_tail(150)
+                .with_click(300, 0.5),
+            FakeSource::new(0.5, 400, "b"),
+        );
+        let mut src = OverlapSource::new(Box::new(src), 2.0, 1.0, RATE as u32, CHANS);
+        let amps = pull(&mut src, 900, 10);
+        assert_eq!(amps.len(), 350 + 400 + 50, "B passes, then the ring drains");
+        assert!((amps[399] - 1.0 / 50.0).abs() < 1e-6, "fade end was {}", amps[399]);
+        assert_eq!(amps[400], 0.0, "B ramps in at the fade end, never at the click");
+        assert_eq!(amps[500], 0.5, "the click's output slot holds B at full level");
+        assert!((amps[799] - 0.5 / 50.0).abs() < 1e-6, "drain end was {}", amps[799]);
+    }
+
+    #[test]
+    fn crossfade_fades_out_a_quiet_track_by_its_own_level() {
+        // A: 2.0s at −68 dBFS + 1.5s silence. The absolute gate (−70 dBFS)
+        // still counts the quiet music as audio, so the fade spans it; a
+        // fixed −66 dB threshold would have heard nothing and floored the
+        // fade at 15 frames.
+        let src = PairSource::from_sources(
+            FakeSource::new(0.0004, 350, "a").with_silence_tail(150),
+            FakeSource::new(0.5, 200, "b"),
+        );
+        let mut src = OverlapSource::new(Box::new(src), 2.0, 1.0, RATE as u32, CHANS);
+        let amps = pull(&mut src, 700, 10);
+        assert_eq!(amps.len(), 350 + 200 + 50, "B passes, then the ring drains");
+        assert!((amps[399] - 0.0004 / 50.0).abs() < 1e-10, "fade end was {}", amps[399]);
+        assert_eq!(amps[400], 0.0, "B ramps in at the fade end");
+        assert_eq!(amps[420], 0.5, "B at full level once the 20-frame ramp ends");
+        assert!((amps[599] - 0.5 / 50.0).abs() < 1e-6, "drain end was {}", amps[599]);
+    }
+
+    #[test]
+    fn crossfade_falls_back_to_the_floor_when_nothing_is_audible() {
+        // A is entirely silent: nothing passes the gate, so the fade is
+        // floored at MIN_FADE_SECONDS and B still ramps in on time.
+        let src = PairSource::from_sources(
+            FakeSource::new(0.0, 200, "a"),
+            FakeSource::new(0.5, 200, "b"),
+        );
+        let mut src = OverlapSource::new(Box::new(src), 2.0, 1.0, RATE as u32, CHANS);
+        let amps = pull(&mut src, 500, 10);
+        assert_eq!(amps.len(), 200 + 200 + 15, "B passes, then the ring drains");
+        assert_eq!(amps[214], 0.0, "fade-out end, all silence");
+        assert_eq!(amps[215], 0.0, "B ramps in at the fade end");
+        assert_eq!(amps[235], 0.5, "B at full level once the 20-frame ramp ends");
+        assert!((amps[414] - 0.5 / 15.0).abs() < 1e-6, "drain end was {}", amps[414]);
+    }
+
+    #[test]
+    fn crossfade_duration_shorter_than_the_floor_uses_the_whole_ring() {
+        // crossfade_seconds below MIN_FADE_SECONDS: the floor can't exceed
+        // the ring, so the fade covers the entire (small) ring and the
+        // next track still ramps in — no overrun, no dead air.
+        let mut src = wrap(Box::new(PairSource::new(1.0, 200, 0.5, 400)), 0.05);
+        let amps = pull(&mut src, 700, 10);
+        assert_eq!(amps.len(), 200 + 400 + 5, "A, B, and the tiny ring's tail");
+        assert_eq!(amps[199], 1.0, "A's last frame before the fade, delayed by 5");
+        assert!((amps[204] - 0.2).abs() < 1e-6, "fade end was {}", amps[204]);
+        assert_eq!(amps[205], 0.0, "B ramps in on a single frame");
+        assert_eq!(amps[206], 0.5, "B at full level right after the 1-frame ramp");
+        assert_eq!(amps[599], 0.5, "B's last full-level frame");
+        assert!((amps[604] - 0.1).abs() < 1e-6, "drain end was {}", amps[604]);
+    }
+
+    #[test]
+    fn crossfade_long_duration_caps_the_window_to_the_track() {
+        // crossfade_seconds far longer than the track: the ring never fills
+        // (A is shorter than 30 s), so the output is startup silence until
+        // the boundary, and the fade window is capped by the outgoing
+        // track's last quarter — a short track under a huge crossfade still
+        // fades sanely and B comes in on time.
+        let mut src = wrap(Box::new(PairSource::new(1.0, 200, 0.5, 400)), 30.0);
+        let amps = pull(&mut src, 4000, 10);
+        assert_eq!(amps.len(), 200 + 400 + 50, "A, B, and the capped window's tail");
+        assert_eq!(amps[199], 0.0, "ring never fills — still startup silence");
+        assert_eq!(amps[200], 1.0, "fade-out starts on A's head (unheard in the fill)");
+        assert!((amps[249] - 0.02).abs() < 1e-6, "fade end was {}", amps[249]);
+        assert_eq!(amps[250], 0.0, "B ramps in over the 300-frame fade-in");
+        assert_eq!(amps[550], 0.5, "B at full level once the fade-in ends");
+        assert_eq!(amps[599], 0.5, "B's last full-level frame");
+        assert!((amps[649] - 0.01).abs() < 1e-6, "drain end was {}", amps[649]);
     }
 }

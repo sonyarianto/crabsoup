@@ -201,8 +201,15 @@ One engine thread plus one thread per output:
   trailing silence, and the incoming track ramps in over a tenth of the
   fade (`fresh * curve(t)`). Nothing is ever replayed and the fade never
   drags over dead air: the window is sized per fade to the ring's audible
-  tail (the last frame above −66 dBFS, floored at 0.15 s and capped by
-  the outgoing track's last quarter). The first `fade_frames` output
+  tail, found with a BS.1770-style loudness gate instead of a fixed
+  amplitude floor — short-time mean-square windows (50 ms, 10 ms hop)
+  are gated at −70 dBFS, then at 10 LU below the mean of the windows
+  that passed, and the last passing window is refined sample-by-sample
+  against that level. A track's own loudness defines its silence, so a
+  −66 dBFS noise floor or a click in the tail never stretches the fade,
+  a quiet track (−68 dBFS) is still faded to its music, and the window
+  is floored at 0.15 s and capped by the outgoing track's last quarter
+  when nothing passes. The first `fade_frames` output
   frames are silence while the ring fills (startup latency equals the
   fade duration — 3 s in the live config, fine for broadcast; Icecast
   now-playing metadata runs that far ahead, cosmetic). A child ending
