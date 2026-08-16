@@ -167,9 +167,12 @@ shows live-DJ state as a `live: true|false` line.
 `GET /status`, `GET /uptime`, `GET /queue`, `GET /jingles`, and
 `POST /cmd` with `{"command": "..."}` — same JSON envelope, 400 on
 `{"ok": false}`, 404/405 for bad routes and methods.
-`examples/control_api.py` is a worked backend using both transports. See
-[the control-port guide](website/guide/control-port.md) for the full field
-table.
+`server.telnet({ws_port = N})` serves them over WebSocket (RFC 6455):
+each text frame is one command (bare `status` or `{"command": "..."}`)
+and the reply is the JSON envelope — browsers and `wscat` work as-is.
+`examples/control_api.py` is a worked backend using all three transports.
+See [the control-port guide](website/guide/control-port.md) for the full
+field table.
 
 ## Source and DSP reference
 

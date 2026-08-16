@@ -129,6 +129,19 @@ fn main() -> crabsoup::Result<()> {
             let http = crabsoup::control::ControlHttpServer::new(
                 ctl_cfg.host.clone(),
                 http_port,
+                jingles.clone(),
+                queue.clone(),
+                tx.clone(),
+                status.clone(),
+                custom.clone(),
+                event_tx.clone(),
+            );
+            rt.spawn(async move { http.run().await });
+        }
+        if let Some(ws_port) = ctl_cfg.ws_port {
+            let ws = crabsoup::control::ControlWsServer::new(
+                ctl_cfg.host.clone(),
+                ws_port,
                 jingles,
                 queue,
                 tx.clone(),
@@ -136,7 +149,7 @@ fn main() -> crabsoup::Result<()> {
                 custom,
                 event_tx,
             );
-            rt.spawn(async move { http.run().await });
+            rt.spawn(async move { ws.run().await });
         }
     }
 

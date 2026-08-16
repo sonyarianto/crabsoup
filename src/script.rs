@@ -3113,6 +3113,7 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
             port: opts.get("port").unwrap_or(1234),
             banner: opts.get("banner").unwrap_or(true),
             http_port: opts.get("http_port").ok().flatten(),
+            ws_port: opts.get("ws_port").ok().flatten(),
         };
         telnet_state.borrow_mut().control = Some(cfg);
         Ok(())

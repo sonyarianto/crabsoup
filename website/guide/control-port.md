@@ -101,6 +101,37 @@ HTTP status codes: 200 for `{"ok": true}`, 400 for `{"ok": false}`
 405 for wrong methods. See `examples/control_api.py` for a worked
 Crabcast-style backend using both transports.
 
+## WebSocket endpoint
+
+`server.telnet({ws_port = N})` serves the same command surface over
+WebSocket (RFC 6455) on the same host — no telnet framing, no banner,
+persistent request/reply over one connection.
+
+```lua
+server.telnet({port = 1234, ws_port = 8081})
+```
+
+Each text frame is one command, either a bare line (`status`) or the
+HTTP-style JSON `{"command": "..."}`; the reply is the JSON envelope as
+the next text frame. `ping` gets a `pong`; sending `exit`, `quit`, or a
+WebSocket `close` closes the connection.
+
+```sh
+# wscat (npm install -g wscat)
+wscat -c ws://localhost:8081
+> status
+< {"ok":true,"playing":"Some track.mp3","uptime_seconds":123,"harbor_connected":false}
+> {"command":"jingles.play trance"}
+< {"ok":true,"playing":"internal/jingles/b-sting.wav"}
+```
+
+A browser can use it directly: `new WebSocket("ws://localhost:8081")`,
+`ws.send("status")`, and read `{"ok": true, ...}` envelopes off
+`ws.onmessage`. Replies are always the JSON envelope — there is no banner
+or plain-text mode to parse around.
+
+## Custom commands
+
 ## Custom commands
 
 Register your own handlers in the script with

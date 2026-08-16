@@ -117,6 +117,10 @@ live = input.harbor({host = "0.0.0.0", port = 8005,
                      mount = "/live", password = "dj"})
 
 -- Telnet control port (jingles.list / jingles.play / shutdown / ...).
+-- http_port and ws_port serve the same commands over HTTP and WebSocket
+-- (each WS text frame is one command, replies are the JSON envelope):
+-- server.telnet({host = "127.0.0.1", port = 1234, http_port = 8080,
+--                ws_port = 8081})
 server.telnet({host = "127.0.0.1", port = 1234})
 
 -- The broadcast: `format` is "mp3" or "opus". The first source argument is

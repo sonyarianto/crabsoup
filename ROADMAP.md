@@ -1311,8 +1311,9 @@ its own confined module per the Part H convention note.
 
 - [ ] **J1 — SRT output** (`srt-sys` or pure-Rust), **J2 — UDP/RTP**
       (AAC/MP3 over UDP).
-- [ ] **J3 — WebSocket control** channel alongside the telnet/HTTP control
-      ports, **J4 — MQTT** metadata/status publish.
+- [x] **J3 — WebSocket control** channel alongside the telnet/HTTP control
+      ports: landed as `server.telnet({ws_port = N})` (see Done section).
+      **J4 — MQTT** metadata/status publish (still open).
 - [ ] **J5 — JACK / ALSA / PulseAudio** dedicated I/O (cpal covers basics;
       JACK adds multi-client, Pulse adds system integration).
 - [ ] **J6 — database webhooks** (`sqlx`, PostgreSQL/MySQL metadata logging).
@@ -1352,6 +1353,24 @@ API reference + 5 tutorials; ≥100 stars and ≥20 contributors; green CI +
 load tests + fuzzing.
 
 ## Done (cont.)
+- [x] J3 (WebSocket control channel): `server.telnet({ws_port = N})` serves
+      the same command surface as telnet/HTTP over WebSocket (RFC 6455) on
+      the same host. Hand-rolled framing (`ControlWsServer` in
+      `src/control.rs` + a `sha1` dep for the accept key): SHA-1
+      `Sec-WebSocket-Accept` handshake (guarded by the RFC 6455 §1.3 test
+      vector), a masked-frame codec (7/16/64-bit lengths, unmasking,
+      ping→pong, close-echo, RSV/oversize/fragmented-control violations
+      closed with the RFC's codes), and a connection loop where each text
+      frame is one command — either a bare line (`status`) or the
+      HTTP-style JSON `{"command": "..."}` — answered with the JSON
+      envelope as the next frame. `exit`/`quit` and a client `close` end
+      the connection (close 1000). Browsers and `wscat` work as-is;
+      `examples/control_api.py` documents the three transports. Tests:
+      RFC accept vector, frame round-trips (masked + extended lengths +
+      violation close codes), bare-vs-JSON command parsing, and a
+      real-socket end-to-end (101 handshake with the correct accept,
+      `status` → JSON envelope, ping→pong, `exit` → close 1000). 366
+      tests pass, clippy clean; 405 with the `video` feature.
 - [x] G3.3 (multi-rendition HLS + variant master playlist): the last open
       G3 backlog candidate. `output.hls` now accepts
       `renditions = {{bitrate = 64000, name = "64k"}, ...}` — one AAC

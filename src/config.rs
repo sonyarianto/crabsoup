@@ -311,7 +311,8 @@ impl JingleConfig {
 }
 
 /// Liquidsoap-style telnet control port, plus the optional HTTP
-/// status/control endpoint (`http_port`) and the text welcome banner.
+/// (`http_port`) and WebSocket (`ws_port`) status/control endpoints and
+/// the text welcome banner.
 #[derive(Debug, Clone)]
 pub struct ControlConfig {
     pub host: String,
@@ -322,6 +323,10 @@ pub struct ControlConfig {
     /// Port for the HTTP endpoint (`GET /status`, `POST /cmd`, ...) on the
     /// same `host`; `None` disables it.
     pub http_port: Option<u16>,
+    /// Port for the WebSocket control endpoint on the same `host`; each
+    /// text frame is a command, replies are the JSON envelope. `None`
+    /// disables it.
+    pub ws_port: Option<u16>,
 }
 
 impl Default for ControlConfig {
@@ -331,6 +336,7 @@ impl Default for ControlConfig {
             port: 1234,
             banner: true,
             http_port: None,
+            ws_port: None,
         }
     }
 }

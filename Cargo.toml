@@ -50,6 +50,9 @@ ffmpeg-next = { version = "7.1", optional = true }
 # Pitch-preserved time-stretch (WSOLA), pure Rust, no C — the Part I1
 # `stretch`/`pitch` effects (in-process DSP, no system dependency).
 wsola = "0.1"
+# SHA-1 for the WebSocket control-channel handshake (Part J3):
+# `Sec-WebSocket-Accept = base64(SHA1(key + GUID))`. Pure Rust.
+sha1 = "0.10"
 
 [features]
 # Video support (Part H): off by default so core builds stay libav-free.

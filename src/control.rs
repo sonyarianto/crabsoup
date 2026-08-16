@@ -27,14 +27,24 @@
 //! over HTTP on the same host: `GET /status`, `GET /uptime`, `GET /queue`,
 //! `GET /jingles`, and `POST /cmd` with a JSON body
 //! `{"command": "..."}`. Every response reuses the JSON envelope above.
+//!
+//! `server.telnet({ws_port = N})` serves it over WebSocket (RFC 6455) on
+//! the same host: each text frame is one command (either a bare command
+//! line like `status` or the HTTP-style JSON `{"command": "..."}`), the
+//! reply is the JSON envelope as the next text frame, and `ping` gets a
+//! `pong`. Hand-rolled framing (SHA-1 handshake + masked frame codec) so
+//! the control surface stays dependency-free; browsers and `wscat` work
+//! as-is.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
 
+use base64::Engine as _;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
+use sha1::{Digest, Sha1};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -235,11 +245,12 @@ async fn handle_http(
     write_http(&mut socket, code, &body).await
 }
 
-/// Read a full request (header block + Content-Length body). Returns
-/// `(method, path, body)` or the HTTP error response to send.
-async fn read_http_request(
-    socket: &mut TcpStream,
-) -> Result<(String, String, String), (u16, String)> {
+/// Read a raw request head (up to and including `\r\n\r\n`). Returns the
+/// head text and any bytes already read past it (the start of the body),
+/// or the HTTP error response to send.
+async fn read_head_block<S: tokio::io::AsyncRead + Unpin>(
+    socket: &mut S,
+) -> Result<(String, Vec<u8>), (u16, String)> {
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 2048];
     let head_end = loop {
@@ -259,16 +270,25 @@ async fn read_http_request(
         buf.extend_from_slice(&chunk[..n]);
     };
     let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+    Ok((head, buf[head_end + 4..].to_vec()))
+}
+
+/// Read a full request (header block + Content-Length body). Returns
+/// `(method, path, body)` or the HTTP error response to send.
+async fn read_http_request(
+    socket: &mut TcpStream,
+) -> Result<(String, String, String), (u16, String)> {
+    let (head, mut body) = read_head_block(socket).await?;
     let (method, path) = match parse_request_head(&head) {
         Ok(p) => p,
         Err((code, msg)) => return Err((code, http_error(&msg))),
     };
-    let mut body = buf[head_end + 4..].to_vec();
     if let Some(len) = content_length(&head) {
         if len > MAX_HTTP_BODY {
             return Err((413, http_error("request body too large")));
         }
         while body.len() < len {
+            let mut chunk = [0u8; 2048];
             let n = socket
                 .read(&mut chunk)
                 .await
@@ -369,6 +389,343 @@ async fn write_http(socket: &mut TcpStream, code: u16, body: &str) -> Result<(),
         .write_all(body.as_bytes())
         .await
         .map_err(|e| format!("write: {e}"))
+}
+
+/// WebSocket (RFC 6455) control endpoint on the same host as the telnet
+/// port (`server.telnet({ws_port = N})`). Each text frame is one command —
+/// either a bare command line (`status`) or the HTTP-style JSON
+/// `{"command": "..."}` — and the reply is the JSON envelope as the next
+/// text frame. Handshake + frame codec are hand-rolled (SHA-1 accept key,
+/// masked client frames) so the control surface stays dependency-free.
+pub struct ControlWsServer {
+    host: String,
+    port: u16,
+    jingles: Vec<PathBuf>,
+    queue: Option<Arc<RequestQueue>>,
+    tx: mpsc::Sender<MixCommand>,
+    status: StatusHandle,
+    custom_commands: Arc<Vec<String>>,
+    event_tx: mpsc::Sender<ScriptEvent>,
+}
+
+impl ControlWsServer {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        host: String,
+        port: u16,
+        jingles: Vec<PathBuf>,
+        queue: Option<Arc<RequestQueue>>,
+        tx: mpsc::Sender<MixCommand>,
+        status: StatusHandle,
+        custom_commands: Arc<Vec<String>>,
+        event_tx: mpsc::Sender<ScriptEvent>,
+    ) -> Self {
+        Self {
+            host,
+            port,
+            jingles,
+            queue,
+            tx,
+            status,
+            custom_commands,
+            event_tx,
+        }
+    }
+
+    /// Run the accept loop forever. Must be spawned onto a tokio runtime.
+    pub async fn run(self) {
+        let addr = format!("{}:{}", self.host, self.port);
+        let listener = match TcpListener::bind(&addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                log::error!("control ws: failed to bind {addr}: {e}");
+                return;
+            }
+        };
+        log::info!("control ws listening on {addr}");
+
+        loop {
+            let (socket, peer) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    log::warn!("control ws: accept failed: {e}");
+                    continue;
+                }
+            };
+            let jingles = self.jingles.clone();
+            let queue = self.queue.clone();
+            let tx = self.tx.clone();
+            let status = self.status.clone();
+            let custom = self.custom_commands.clone();
+            let event_tx = self.event_tx.clone();
+            tokio::spawn(async move {
+                if let Err(e) = handle_ws_connection(
+                    socket, &jingles, queue, tx, &status, &custom, &event_tx,
+                )
+                .await
+                {
+                    log::warn!("control ws ({peer}): {e}");
+                }
+            });
+        }
+    }
+}
+
+/// RFC 6455 GUID appended to the key before SHA-1 for `Sec-WebSocket-Accept`.
+const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+/// Reply to a WebSocket `close` with the same code (1000 = normal).
+const WS_CLOSE_NORMAL: u16 = 1000;
+/// A control command and its reply are tiny; cap frames at the HTTP body
+/// limit so a misbehaving client cannot make us buffer unboundedly.
+const MAX_WS_FRAME: usize = MAX_HTTP_BODY;
+
+/// `Sec-WebSocket-Accept` for a handshake key (RFC 6455 §4.2.2):
+/// `base64(SHA1(key + WS_GUID))`.
+fn ws_accept(key: &str) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(key.as_bytes());
+    hasher.update(WS_GUID.as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
+}
+
+/// Case-insensitive header lookup in a request head block.
+fn ws_header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().skip(1).find_map(|l| {
+        let (n, v) = l.split_once(':')?;
+        n.trim().eq_ignore_ascii_case(name).then(|| v.trim())
+    })
+}
+
+/// Encode a server->client frame (server frames are never masked).
+fn encode_ws_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(payload.len() + 10);
+    out.push(0x80 | opcode); // FIN + opcode
+    let len = payload.len();
+    if len < 126 {
+        out.push(len as u8);
+    } else if len <= 0xFFFF {
+        out.push(126);
+        out.extend_from_slice(&(len as u16).to_be_bytes());
+    } else {
+        out.push(127);
+        out.extend_from_slice(&(len as u64).to_be_bytes());
+    }
+    out.extend_from_slice(payload);
+    out
+}
+
+/// One parsed frame: `(opcode, fin, unmasked payload, bytes consumed)`.
+type WsFrame = (u8, bool, Vec<u8>, usize);
+
+/// Parse one frame off the front of `buf`. `Ok(None)` = need more bytes;
+/// `Err(code)` = protocol violation (close with that code). Client frames
+/// must be masked and are unmasked here; control frames may not be
+/// fragmented.
+fn parse_ws_frame(buf: &[u8]) -> Result<Option<WsFrame>, u16> {
+    if buf.len() < 2 {
+        return Ok(None);
+    }
+    let b0 = buf[0];
+    let b1 = buf[1];
+    if b0 & 0x70 != 0 {
+        return Err(1002); // RSV bits set, no extensions negotiated
+    }
+    let fin = b0 & 0x80 != 0;
+    let opcode = b0 & 0x0F;
+    let masked = b1 & 0x80 != 0;
+    let len7 = (b1 & 0x7F) as usize;
+    if opcode >= 0x8 && (len7 > 125 || !fin) {
+        return Err(1002); // control frames are short and unfragmented
+    }
+    let mut idx = 2;
+    let len = match len7 {
+        0..=125 => len7,
+        126 => {
+            if buf.len() < 4 {
+                return Ok(None);
+            }
+            let l = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+            idx = 4;
+            l
+        }
+        127 => {
+            if buf.len() < 10 {
+                return Ok(None);
+            }
+            let l = u64::from_be_bytes(buf[2..10].try_into().unwrap());
+            idx = 10;
+            usize::try_from(l).map_err(|_| 1009u16)?
+        }
+        _ => unreachable!(),
+    };
+    if len > MAX_WS_FRAME {
+        return Err(1009);
+    }
+    let key_len = if masked { 4 } else { 0 };
+    let total = idx + key_len + len;
+    if buf.len() < total {
+        return Ok(None);
+    }
+    let mut payload = buf[idx + key_len..total].to_vec();
+    if masked {
+        let key = &buf[idx..idx + 4];
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b ^= key[i % 4];
+        }
+    }
+    Ok(Some((opcode, fin, payload, total)))
+}
+
+/// One text frame is one command: a bare line (`status`) or the HTTP-style
+/// JSON `{"command": "..."}`.
+fn ws_command(payload: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload)
+        && let Some(c) = v.get("command").and_then(serde_json::Value::as_str)
+    {
+        return c.to_string();
+    }
+    payload.trim().to_string()
+}
+
+/// Send a `close` frame with `code` and finish the connection.
+async fn ws_close(socket: &mut TcpStream, code: u16) -> Result<(), String> {
+    socket
+        .write_all(&encode_ws_frame(0x8, &code.to_be_bytes()))
+        .await
+        .map_err(|e| format!("write: {e}"))
+}
+
+/// Serve one WebSocket connection: handshake, then a frame loop where each
+/// text frame is dispatched like a telnet line and answered with the JSON
+/// envelope. `exit`/`quit` and a client `close` end the connection.
+async fn handle_ws_connection(
+    mut socket: TcpStream,
+    jingles: &[PathBuf],
+    queue: Option<Arc<RequestQueue>>,
+    tx: mpsc::Sender<MixCommand>,
+    status: &StatusHandle,
+    custom: &[String],
+    event_tx: &mpsc::Sender<ScriptEvent>,
+) -> Result<(), String> {
+    let (head, rest) = match read_head_block(&mut socket).await {
+        Ok(h) => h,
+        Err((code, body)) => {
+            write_http(&mut socket, code, &body).await?;
+            return Ok(());
+        }
+    };
+    if !head.starts_with("GET ") {
+        write_http(&mut socket, 405, &http_error("websocket upgrade must be GET")).await?;
+        return Ok(());
+    }
+    if !ws_header(&head, "Upgrade").is_some_and(|v| v.eq_ignore_ascii_case("websocket")) {
+        write_http(&mut socket, 400, &http_error("missing Upgrade: websocket")).await?;
+        return Ok(());
+    }
+    let key = match ws_header(&head, "Sec-WebSocket-Key") {
+        Some(k) => k.to_string(),
+        None => {
+            write_http(&mut socket, 400, &http_error("missing Sec-WebSocket-Key")).await?;
+            return Ok(());
+        }
+    };
+    let accept = ws_accept(&key);
+    let resp = format!(
+        "HTTP/1.1 101 Switching Protocols\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Accept: {accept}\r\n\r\n"
+    );
+    socket
+        .write_all(resp.as_bytes())
+        .await
+        .map_err(|e| format!("write: {e}"))?;
+
+    let mut rng = SmallRng::from_entropy();
+    // A client may pipeline its first frame right after the handshake in
+    // the same TCP segment; those bytes came back from `read_head_block`.
+    let mut buf = rest;
+    let mut chunk = [0u8; 4096];
+    loop {
+        match parse_ws_frame(&buf) {
+            Ok(Some((opcode, fin, payload, consumed))) => {
+                buf.drain(..consumed);
+                match opcode {
+                    0x8 => {
+                        let code = if payload.len() >= 2 {
+                            u16::from_be_bytes([payload[0], payload[1]])
+                        } else {
+                            WS_CLOSE_NORMAL
+                        };
+                        ws_close(&mut socket, code).await?;
+                        return Ok(());
+                    }
+                    0x9 => {
+                        socket
+                            .write_all(&encode_ws_frame(0xA, &payload))
+                            .await
+                            .map_err(|e| format!("write: {e}"))?;
+                    }
+                    0xA => {}
+                    0x1 => {
+                        if !fin {
+                            ws_close(&mut socket, 1003).await?;
+                            return Ok(());
+                        }
+                        let command = ws_command(&String::from_utf8_lossy(&payload));
+                        if command.is_empty() {
+                            let reply = CommandReply::Err("usage: <command>".into()).json();
+                            socket
+                                .write_all(&encode_ws_frame(0x1, reply.as_bytes()))
+                                .await
+                                .map_err(|e| format!("write: {e}"))?;
+                            continue;
+                        }
+                        let ctx = DispatchCtx {
+                            jingles,
+                            queue: queue.as_deref(),
+                            tx: &tx,
+                            status,
+                            custom,
+                            event_tx,
+                        };
+                        match dispatch(&command, &ctx, &mut rng) {
+                            CommandResult::Reply(r) => {
+                                let reply = r.json();
+                                socket
+                                    .write_all(&encode_ws_frame(0x1, reply.as_bytes()))
+                                    .await
+                                    .map_err(|e| format!("write: {e}"))?;
+                            }
+                            CommandResult::Exit => {
+                                ws_close(&mut socket, WS_CLOSE_NORMAL).await?;
+                                return Ok(());
+                            }
+                        }
+                    }
+                    // continuation or binary: a control channel is text-only.
+                    _ => {
+                        ws_close(&mut socket, 1003).await?;
+                        return Ok(());
+                    }
+                }
+            }
+            Ok(None) => {
+                let n = socket
+                    .read(&mut chunk)
+                    .await
+                    .map_err(|e| format!("read: {e}"))?;
+                if n == 0 {
+                    return Ok(());
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            Err(code) => {
+                ws_close(&mut socket, code).await?;
+                return Ok(());
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1200,5 +1557,193 @@ mod tests {
         let (code, body) = http_route("POST", "/cmd", r#"{"command":"exit"}"#, &ctx, &mut rng);
         assert_eq!(code, 200);
         assert!(body.contains("bye"));
+    }
+
+    #[test]
+    fn ws_accept_matches_rfc_vector() {
+        // RFC 6455 §1.3 worked example.
+        assert_eq!(
+            ws_accept("dGhlIHNhbXBsZSBub25jZQ=="),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        );
+    }
+
+    #[test]
+    fn ws_frame_roundtrip_and_masking() {
+        // Unmasked server->client frame round-trips.
+        let bytes = encode_ws_frame(0x1, b"{\"ok\":true}");
+        assert_eq!(bytes[0], 0x81, "FIN + text opcode");
+        assert_eq!(bytes[1], 11, "payload len 11, no mask bit");
+        match parse_ws_frame(&bytes).unwrap() {
+            Some((opcode, fin, payload, consumed)) => {
+                assert_eq!(opcode, 0x1);
+                assert!(fin);
+                assert_eq!(payload, b"{\"ok\":true}");
+                assert_eq!(consumed, bytes.len());
+            }
+            None => panic!("complete frame must parse"),
+        }
+
+        // A masked client frame is unmasked on parse. Hand-build one: mask
+        // bit set, 4-byte key `0x11 0x22 0x33 0x44`, payload xor the key.
+        let payload = b"status";
+        let key = [0x11, 0x22, 0x33, 0x44];
+        let mut masked = vec![0x81, 0x80 | payload.len() as u8];
+        masked.extend_from_slice(&key);
+        masked.extend(payload.iter().enumerate().map(|(i, b)| b ^ key[i % 4]));
+        match parse_ws_frame(&masked).unwrap() {
+            Some((0x1, true, out, consumed)) => {
+                assert_eq!(out, payload);
+                assert_eq!(consumed, masked.len());
+            }
+            _ => panic!("masked frame must parse unmasked"),
+        }
+    }
+
+    #[test]
+    fn ws_frame_extended_lengths_and_control_limits() {
+        // 126-byte payload uses the 16-bit extended length.
+        let big = vec![b'x'; 126];
+        let bytes = encode_ws_frame(0x1, &big);
+        assert_eq!(bytes[1], 126);
+        match parse_ws_frame(&bytes).unwrap() {
+            Some((0x1, true, out, _)) => assert_eq!(out, big),
+            _ => panic!("126-len frame must parse"),
+        }
+
+        // 65536-byte payload uses the 64-bit extended length.
+        let huge = vec![b'y'; 65_536];
+        let bytes = encode_ws_frame(0x1, &huge);
+        assert_eq!(bytes[1], 127);
+        match parse_ws_frame(&bytes).unwrap() {
+            Some((0x1, true, out, _)) => assert_eq!(out, huge),
+            _ => panic!("64-bit-len frame must parse"),
+        }
+
+        // Control frames must be short and unfragmented; RSV bits are a
+        // protocol error (close 1002). Fragmented *data* frames parse fine
+        // at the codec level (the connection loop closes 1003 on them).
+        let mut bad = vec![0x81, 0x05]; // len 5 is fine but RSV1 set
+        bad[0] |= 0x40;
+        assert_eq!(parse_ws_frame(&bad).unwrap_err(), 1002);
+        let mut fragmented_ping = vec![0x09, 0x02]; // ping, FIN=0
+        fragmented_ping.extend_from_slice(b"hi");
+        assert_eq!(parse_ws_frame(&fragmented_ping).unwrap_err(), 1002);
+        let mut fragmented_text = vec![0x01, 0x05]; // text, FIN=0
+        fragmented_text.extend_from_slice(b"hello");
+        assert!(parse_ws_frame(&fragmented_text).unwrap().is_some());
+        // Oversized frame -> close 1009.
+        let mut huge_len = vec![0x81, 127, 0, 0, 0, 0, 0, 0, 0, 0];
+        let _ = &mut huge_len[..0];
+        let bytes = encode_ws_frame(0x1, &vec![0u8; MAX_WS_FRAME + 1]);
+        // 64-bit length header declares the real size; parsing it alone
+        // reports 1009 before needing the payload.
+        let header = &bytes[..10];
+        assert_eq!(parse_ws_frame(header).unwrap_err(), 1009);
+    }
+
+    #[test]
+    fn ws_command_accepts_bare_and_json() {
+        assert_eq!(ws_command("status"), "status");
+        assert_eq!(ws_command("  skip  "), "skip");
+        assert_eq!(ws_command(r#"{"command":"status"}"#), "status");
+        assert_eq!(ws_command(r#"{"command":"jingles.play 0"}"#), "jingles.play 0");
+        // Bare text that happens to be JSON (e.g. a malformed envelope)
+        // falls through to the raw line.
+        assert_eq!(ws_command("not json"), "not json");
+    }
+
+    #[test]
+    fn ws_end_to_end_dispatch() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (tx, _rx) = mpsc::channel();
+            let status = StatusHandle::new();
+            status.set_current("ws track");
+            let jingles = jingles();
+            let custom: Vec<String> = vec![];
+            let (event_tx, _event_rx) = mpsc::channel();
+            let server = tokio::spawn(async move {
+                let (socket, _peer) = listener.accept().await.unwrap();
+                handle_ws_connection(socket, &jingles, None, tx, &status, &custom, &event_tx)
+                    .await
+            });
+
+            let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            // Handshake with a masked `status` frame pipelined in the same
+            // segment (the reply must still arrive after the 101).
+            let payload = b"status";
+            let key = [0xde, 0xad, 0xbe, 0xef];
+            let mut frame = vec![0x81, 0x80 | payload.len() as u8];
+            frame.extend_from_slice(&key);
+            frame.extend(payload.iter().enumerate().map(|(i, b)| b ^ key[i % 4]));
+            let mut handshake = b"GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n\
+                                Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                                Sec-WebSocket-Version: 13\r\n\r\n"
+                .to_vec();
+            handshake.extend_from_slice(&frame);
+            client.write_all(&handshake).await.unwrap();
+
+            let mut head = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = client.read(&mut chunk).await.unwrap();
+                head.extend_from_slice(&chunk[..n]);
+            }
+            let resp = String::from_utf8_lossy(&head);
+            assert!(resp.starts_with("HTTP/1.1 101"), "{resp}");
+            assert!(
+                resp.contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="),
+                "{resp}"
+            );
+
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 512];
+            let reply = loop {
+                if let Ok(Some((0x1, true, payload, _))) = parse_ws_frame(&buf) {
+                    break payload;
+                }
+                let n = client.read(&mut chunk).await.unwrap();
+                buf.extend_from_slice(&chunk[..n]);
+            };
+            let v: serde_json::Value = serde_json::from_slice(&reply).unwrap();
+            assert_eq!(v["ok"], true);
+            assert_eq!(v["playing"], "ws track");
+
+            // Ping -> pong keeps the connection alive; `exit` closes it.
+            client.write_all(&encode_ws_frame(0x9, b"ping")).await.unwrap();
+            let mut pong = Vec::new();
+            let got_pong = loop {
+                if let Ok(Some((0xA, true, p, _))) = parse_ws_frame(&pong) {
+                    break p;
+                }
+                let n = client.read(&mut chunk).await.unwrap();
+                pong.extend_from_slice(&chunk[..n]);
+            };
+            assert_eq!(got_pong, b"ping");
+
+            client
+                .write_all(&encode_ws_frame(0x1, b"exit"))
+                .await
+                .unwrap();
+            let mut close_buf = Vec::new();
+            let closed = loop {
+                if let Ok(Some((0x8, true, p, _))) = parse_ws_frame(&close_buf) {
+                    break p;
+                }
+                let n = client.read(&mut chunk).await.unwrap();
+                close_buf.extend_from_slice(&chunk[..n]);
+            };
+            assert_eq!(closed, WS_CLOSE_NORMAL.to_be_bytes());
+            server.await.unwrap().unwrap();
+        });
     }
 }
