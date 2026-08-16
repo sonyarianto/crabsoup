@@ -43,7 +43,7 @@ use crate::config::{
 use crate::config::{collect_images, collect_video};
 use crate::engine::effects::{Agc, Amplify, Compressor, Echo, EffectSource};
 use crate::engine::eq::{Eq, EqBand, EqType};
-use crate::engine::mixer::{CrossfadeMixer, SmartFade};
+use crate::engine::mixer::CrossfadeMixer;
 use crate::engine::pitch::{PitchMode, PitchSource};
 use crate::engine::reverb::{ConvReverb, load_ir};
 use crate::engine::stereo::{Stereo, VocalRemover};
@@ -2055,43 +2055,6 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
                 Box::new(PlaylistSource::new(playlist))
             };
             Ok(LuaSource::new(src))
-        })?,
-    )?;
-
-    // ---- smart crossfade (Liquidsoap `smart_crossfade`) ---------------------
-    // A `playlist` whose per-transition window is chosen by the outgoing
-    // track's measured tail level: a loud tail gets a full `fade_out`
-    // crossfade, a quiet tail only a short `fade_mid` fade. `fade_out`
-    // defaults to the global `crossfade_seconds`; `fade_mid` to half of it;
-    // `threshold` (dBFS, default -30) decides "quiet".
-    let smart_state = state.clone();
-    globals.set(
-        "smart_crossfade",
-        lua.create_function(move |_, opts: Table| {
-            let requests = playlist_requests(&opts)?;
-            let shuffle: bool = opts.get("shuffle").unwrap_or(false);
-            // Option-bool: mlua converts a missing key to Ok(false), so a
-            // plain unwrap_or(true) would default to *not* looping.
-            let loop_playlist: bool = opts.get("loop").ok().flatten().unwrap_or(true);
-            let global = smart_state.borrow().mixer.crossfade_seconds;
-            let fade_out: f64 = opts.get::<Option<f64>>("fade_out")?.unwrap_or(global);
-            let fade_mid: f64 = opts
-                .get::<Option<f64>>("fade_mid")?
-                .unwrap_or(fade_out / 2.0);
-            let threshold_db: f32 = opts.get("threshold").unwrap_or(-30.0);
-            let (spec, fpb) = bus(&smart_state);
-            let chans = spec.channels.count();
-            let mixer_cfg = smart_state.borrow().mixer.clone();
-            let request = smart_state.borrow().request;
-            let playlist =
-                Playlist::new(requests, shuffle, loop_playlist, request, spec, fpb, None);
-            let mixer = CrossfadeMixer::new(Box::new(playlist), &mixer_cfg, spec.rate, chans)
-                .with_smart_fade(SmartFade {
-                    fade_out,
-                    fade_mid,
-                    threshold_db,
-                });
-            Ok(LuaSource::new(Box::new(mixer)))
         })?,
     )?;
 
@@ -4583,41 +4546,6 @@ mod tests {
             }),
             "annotate fades must reach the mixer"
         );
-    }
-
-    #[test]
-    fn smart_crossfade_plays_a_real_directory_with_level_aware_fades() {
-        // Real media dir; skipped when absent, like the other real-file
-        // tests. The operator builds a level-aware crossfading playlist
-        // that must produce audio (non-silent) and exhaust with the files.
-        // `loop = false` keeps the drain bounded (playlists default to
-        // looping).
-        let media = PathBuf::from("media");
-        if !media.exists() {
-            return;
-        }
-        let (_rt, res) = run(r#"
-            output.preview(smart_crossfade({directory = "./media",
-                                            fade_out = 1.0, fade_mid = 0.2,
-                                            loop = false}))
-            "#)
-        .expect("script runs");
-        let mut root = res.preview.expect("preview source");
-        let mut buf = vec![0f32; 4096 * 2];
-        let mut total = 0usize;
-        let mut non_silent = 0usize;
-        while !root.is_exhausted() {
-            let n = root.next_buffer(&mut buf);
-            if n == 0 {
-                break;
-            }
-            total += n;
-            if buf[..n].iter().any(|&s| s.abs() > 0.01) {
-                non_silent += n;
-            }
-        }
-        assert!(total > 0, "smart_crossfade produced no audio ({total})");
-        assert!(non_silent > 0, "smart_crossfade output was silent");
     }
 
     #[test]

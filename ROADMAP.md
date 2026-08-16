@@ -291,8 +291,6 @@ anchors for later phases.
 |---|---|---|
 | mixers/crossfade/passthrough | 1.2 µs | 0.001 % |
 | mixers/crossfade/mixing (worst case: always crossfading) | 107 µs | 0.12 % |
-| smart_crossfade/passthrough+measuring | 9.3 µs | 0.01 % |
-| smart_crossfade/mixing (always crossfading) | 103 µs | 0.11 % |
 | mixers/priority/passthrough | 7 µs | 0.008 % |
 | mixers/priority/ducking (SetLive per buffer) | 9 µs | 0.01 % |
 | effects/compressor+agc+amplify | 604 µs | 0.65 % |
@@ -303,14 +301,6 @@ anchors for later phases.
 | encode/mp3 (192 kbps) | 501 µs | 0.54 % |
 | encode/opus (128 kbps) | 1114 µs | 1.20 % |
 | encode/aac (128 kbps) | 269 µs | 0.29 % |
-
-The D5 level-aware rows (recorded in the session that landed `smart_crossfade`,
-so compare against the plain rows *within* that session's variance):
-`passthrough+measuring` is 9.3 µs vs the plain passthrough's 1.2 µs — the
-rolling tail-level accumulation (sum of squares + VecDeque eviction) costs
-~8 µs per buffer, ~0.009 % of a core, and the always-mixing smart row (103 µs)
-is statistically identical to the plain mixing row (107 µs) because the
-measurement pauses while a fade is in progress.
 
 Pitch/tempo rows (Part I1, recorded in the session that landed `stretch`/`pitch`):
 the `ffi/noop_per_buffer` row is one foreign call per 4096-frame buffer — the
@@ -1115,7 +1105,7 @@ ships its inline tests and a `benches/` row.
       sidebar), `examples/crabsoup.video.lua`, a Video path section in
       `docs/ARCHITECTURE.md`, and video notes in `crabsoup.lua.example` +
       README. Side fix: mlua maps missing bool keys to `false`, so
-      `playlist`/`smart_crossfade`'s documented `loop = true` default was
+      `playlist`'s documented `loop = true` default was
       actually `false` — read as `Option<bool>` now (audio + video).
 
 Acceptance: file → RTMP and file → HLS(video) verified end-to-end (live);
@@ -1648,6 +1638,14 @@ load tests + fuzzing.
       collapses to the 10-frame `fade_mid` window (complete a full buffer
       earlier), and a script-level `smart_crossfade({directory = "./media"})`
       plays a real directory with audio (skips when `media/` absent).
+      **Later removed** (see the overlap-source follow-ups): the BS.1770
+      gate in the `crossfade` operator ends fades at the audible tail
+      with the track's own loudness floor, superseding the fixed
+      `threshold_db` window choice — the `smart_crossfade` operator,
+      `SmartFade`, and the tail-level measurement were deleted; the
+      `CrossfadeMixer` engine stays for `playlist(crossfade = true)` and
+      `jingles` (instant start, per-track `fade_in`/`fade_out`/`start_next`
+      overrides).
 - [x] D4 (`request.dynamic`): `src/script.rs` — `DynamicRequestSource`
       plays requests returned by a Lua callback, one ahead of the current
       track. The callback runs on the Lua-owning event loop through the A2

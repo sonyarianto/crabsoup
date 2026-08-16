@@ -219,12 +219,6 @@ Named options are Lua tables; most have defaults. `format` is `"mp3"`,
 - `request.dynamic(function() return uri_or_nil end)` — plays whatever the
   callback returns, one request ahead of the current track (nil ends the
   source) — a live-programming scheduler without a playlist file
-- `smart_crossfade({directory, ...})` — a `playlist` whose transition window
-  is chosen by the outgoing track's measured tail level: a loud tail gets a
-  full `fade_out` crossfade, a quiet tail only a short `fade_mid` fade.
-  `fade_out` defaults to `crossfade_seconds`, `fade_mid` to half of it,
-  `threshold` (dBFS, default -30) decides "quiet". Per-track
-  `annotate:`/`cue_cut` fade overrides still win.
 - `crossfade(src, {duration, curve})` — a top-level overlap crossfade over
   the consecutive tracks of any source (Liquidsoap's `crossfade`): a delay
   ring holds the outgoing track's tail and blends it with the incoming
@@ -233,7 +227,11 @@ Named options are Lua tables; most have defaults. `format` is `"mp3"`,
   `rotate`/`fallback` for the classic radio recipe:
   `crossfade(rotate({songs, jingles}, {weights = {3, 1}}), {duration = 3})`.
   No start delay and no tail replay; `duration` defaults to
-  `crossfade_seconds`, `curve` to `fade_curve`.
+  `crossfade_seconds`, `curve` to `fade_curve`. The fade window ends at the
+  outgoing track's audible tail, found with BS.1770-style gating (absolute
+  −70 dBFS, then −10 LU below the track's own gated loudness) so quiet
+  tracks and encoder-noise decays fade exactly where they stop being
+  audible (replaces the removed `smart_crossfade` operator).
 
 **DSP** (run inline in the pull chain):
 
@@ -300,7 +298,6 @@ shipped and verified; the status of the rest of the project is tracked in
 | per-track gain (`amplify`) | `annotate:amplify="0.7":...` (linear) or `annotate:amplify="-8.2 dB":...` — scales a single track |
 | earlier next-track start (`start_next`) | `annotate:start_next="5":...` — the next track begins 5 s before this one ends |
 | per-track followers (`append`/`prepend`) | `annotate:append="stinger.mp3":...` (or `"false"` to inhibit); or `annotated(src, {append = ..., prepend = ...})` for every track |
-| `smart_crossfade` (level-aware transitions) | `smart_crossfade({directory, fade_out, fade_mid, threshold})` — outgoing tail loudness picks the fade window |
 | `pipe(process, src)` (external processor) | `pipe({process = "...", format = "s16le"\|"s24le", restart_backoff = 500}, src)` — stdin/stdout raw PCM bridge; bypass + restart on death |
 | `blank.detect(src)` (dead-air detection) | `blank.detect(src, {threshold = -40, duration = 2, restart = 1, on_blank = fn})` — silence -> blank + exhausted so `fallback` hands over |
 | `map_metadata(f, src)` (title rewrite) | `map_metadata(src, function(m) return {title = ...} end)` — rewritten title reaches the output; original kept on nil/error |

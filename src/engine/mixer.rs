@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -23,23 +22,6 @@ struct Tail {
 /// interpolation is smooth enough for any fade curve and replaces the two
 /// `powf` calls per sample that made the mixing path ~200x the copy path.
 const CURVE_TABLE_SIZE: usize = 2048;
-
-/// Level-aware crossfade settings (Liquidsoap `smart_crossfade`): the
-/// outgoing track's measured tail level picks the transition window — a
-/// loud tail gets a full `fade_out` crossfade, a quiet tail only a short
-/// `fade_mid` fade (no point dragging a crossfade over silence). A
-/// `fade_mid` longer than `fade_out` is accepted (not rejected) and just
-/// degrades into the existing tail ramp.
-#[derive(Clone, Copy, Debug)]
-pub struct SmartFade {
-    /// Crossfade window (and preload margin) when the outgoing tail is
-    /// loud, in seconds.
-    pub fade_out: f64,
-    /// Shorter window used when the outgoing tail is quiet, in seconds.
-    pub fade_mid: f64,
-    /// RMS level (dBFS) below which an outgoing tail counts as quiet.
-    pub threshold_db: f32,
-}
 
 /// A gapless track-to-track crossfade mixer.
 ///
@@ -71,14 +53,6 @@ pub struct CrossfadeMixer {
     fade_pos: usize,
     tail: Option<Tail>,
     started: bool,
-    /// Level-aware fade selection (smart mode); `None` = plain crossfade.
-    smart: Option<SmartFade>,
-    /// Rolling sum of squares of the active track's recent audio, trimmed
-    /// to the last `fade_out` seconds (the tail-level measurement).
-    tail_sum_sq: f64,
-    tail_samples: f64,
-    /// Per-buffer energy chunks backing the rolling window.
-    tail_chunks: VecDeque<(f64, f64)>,
     /// Reusable scratch buffers, sized on demand so `next_buffer` never
     /// allocates on the hot path.
     scratch_a: Vec<f32>,
@@ -112,86 +86,19 @@ impl CrossfadeMixer {
             fade_pos: 0,
             tail: None,
             started: false,
-            smart: None,
-            tail_sum_sq: 0.0,
-            tail_samples: 0.0,
-            tail_chunks: VecDeque::new(),
             scratch_a: Vec::new(),
             scratch_b: Vec::new(),
         }
     }
 
-    /// Enable level-aware fade selection (smart mode).
-    pub fn with_smart_fade(mut self, smart: SmartFade) -> Self {
-        self.smart = Some(smart);
-        self
-    }
-
     /// Seconds before the active track's end at which the next track must be
     /// preloaded: the active track's `start_next` override, else its
-    /// `fade_out` override, else the global window (or the smart `fade_out`
-    /// margin in smart mode).
+    /// `fade_out` override, else the global window.
     fn preload_margin(&self) -> f64 {
         self.active
             .crossfade_overrides()
             .and_then(|c| c.start_next.or(c.fade_out))
-            .unwrap_or_else(|| {
-                self.smart
-                    .map(|s| s.fade_out)
-                    .unwrap_or(self.crossfade_seconds)
-            })
-    }
-
-    /// Fold the active track's latest buffer into the rolling tail-level
-    /// window (the last `fade_out` seconds of audio). Runs only in smart
-    /// mode and only between transitions (the caller guards on `next` being
-    /// None; the tail ramp after a mid-fade promotion is fine to measure
-    /// too — the active track is the promoted one by then). If a single
-    /// buffer exceeds the whole window (huge `frames_per_buffer` or tiny
-    /// `fade_out`), each push immediately evicts itself and the reading
-    /// falls back to "assume loud" — safe, but the quiet path never
-    /// engages in that configuration.
-    fn accumulate_tail(&mut self, sum_sq: f64, count: f64) {
-        let Some(smart) = self.smart else {
-            return;
-        };
-        self.tail_chunks.push_back((sum_sq, count));
-        self.tail_sum_sq += sum_sq;
-        self.tail_samples += count;
-        let window = (smart.fade_out * self.sample_rate as f64 * self.channels as f64).max(1.0);
-        while self.tail_samples > window {
-            let (sq, n) = self.tail_chunks.pop_front().expect("chunks non-empty");
-            self.tail_sum_sq -= sq;
-            self.tail_samples -= n;
-        }
-    }
-
-    /// RMS level (dBFS) of the active track's tail window.
-    fn tail_level_db(&self) -> Option<f32> {
-        if self.tail_samples <= 0.0 {
-            return None;
-        }
-        let rms = (self.tail_sum_sq / self.tail_samples).sqrt();
-        Some(20.0 * rms.max(1e-9).log10() as f32)
-    }
-
-    /// The level-aware outgoing window: a quiet tail gets a short `fade_mid`
-    /// fade, a loud tail the full `fade_out`. `None` outside smart mode;
-    /// with no measurement yet, assume loud (full window).
-    fn smart_window(&self) -> Option<f64> {
-        let smart = self.smart?;
-        let loud = self
-            .tail_level_db()
-            .map(|db| db >= smart.threshold_db)
-            .unwrap_or(true);
-        Some(if loud { smart.fade_out } else { smart.fade_mid })
-    }
-
-    /// Drop the tail-level window (a new track became active).
-    fn reset_tail(&mut self) {
-        self.tail_chunks.clear();
-        self.tail_sum_sq = 0.0;
-        self.tail_samples = 0.0;
+            .unwrap_or(self.crossfade_seconds)
     }
 
     fn ensure_started(&mut self) {
@@ -203,7 +110,6 @@ impl CrossfadeMixer {
             let (src, label) = self.provider.next_source();
             self.active = src;
             self.active_label = label;
-            self.reset_tail();
         }
     }
     fn preload_next(&mut self) {
@@ -211,19 +117,14 @@ impl CrossfadeMixer {
             let (src, label) = self.provider.next_source();
             log::info!("crossfade: preloading next track");
             // Per-track fade override: the incoming track's `fade_in` wins,
-            // then the outgoing track's `fade_out` (or, in smart mode, the
-            // level-chosen window), then the global window. An explicit
-            // `start_next` on the outgoing track also caps the window to
-            // the margin it forces (the fade fits the shorter duration).
+            // then the outgoing track's `fade_out`, then the global window.
+            // An explicit `start_next` on the outgoing track also caps the
+            // window to the margin it forces (the fade fits the shorter
+            // duration).
             let window = src
                 .crossfade_overrides()
                 .and_then(|c| c.fade_in)
-                .or_else(|| {
-                    self.active
-                        .crossfade_overrides()
-                        .and_then(|c| c.fade_out)
-                        .or_else(|| self.smart_window())
-                })
+                .or_else(|| self.active.crossfade_overrides().and_then(|c| c.fade_out))
                 .unwrap_or(self.crossfade_seconds);
             let window = if self
                 .active
@@ -292,24 +193,9 @@ impl AudioSource for CrossfadeMixer {
                     log::info!("crossfade: track ended early, advancing to {label}");
                     self.active = src;
                     self.active_label = label;
-                    self.reset_tail();
                     continue;
                 }
                 return 0;
-            }
-
-            // Level-aware tail measurement (smart mode): fold the active
-            // track's latest audio into the rolling window while no fade is
-            // in progress.
-            if self.smart.is_some() && self.next.is_none() && n_a > 0 {
-                let (sum_sq, count) = {
-                    let samples = &self.scratch_a[..n_a];
-                    (
-                        samples.iter().map(|&s| s as f64 * s as f64).sum::<f64>(),
-                        samples.len() as f64,
-                    )
-                };
-                self.accumulate_tail(sum_sq, count);
             }
 
             // Tail ramp: a crossfade was promoted mid-way; keep fading the
@@ -363,7 +249,6 @@ impl AudioSource for CrossfadeMixer {
                     let promoted = self.next.take().expect("next must exist");
                     self.active = promoted;
                     self.active_label = self.next_label.take().unwrap_or_default();
-                    self.reset_tail();
                     if self.fade_pos < self.fade_frames {
                         let remaining = self.fade_frames - self.fade_pos;
                         let t_end = self.fade_pos as f64 / cf;
@@ -417,13 +302,11 @@ impl AudioSource for CrossfadeMixer {
             let promoted = self.next.take().expect("next must exist");
             self.active = promoted;
             self.active_label = self.next_label.take().unwrap_or_default();
-            self.reset_tail();
         } else if self.provider.has_next() {
             let (src, label) = self.provider.next_source();
             log::info!("crossfade: skip to {label}");
             self.active = src;
             self.active_label = label;
-            self.reset_tail();
         } else {
             log::info!("crossfade: skip ignored, nothing next");
             return;
@@ -1037,41 +920,6 @@ mod tests {
     }
 
     #[test]
-    fn loud_tail_gets_the_full_smart_crossfade_window() {
-        // Track A is loud (0 dBFS): the tail measurement picks the full
-        // `fade_out` window (0.4s = 40 frames at RATE 100), not `fade_mid`.
-        let provider = Box::new(FakeProvider::new(vec![(1.0, 1000), (2.0, 1000)]));
-        let cfg = mixer_config(0.2);
-        let mix = CrossfadeMixer::new(provider, &cfg, RATE as u32, CHANS);
-        let mut mix = mix.with_smart_fade(SmartFade {
-            fade_out: 0.4,
-            fade_mid: 0.1,
-            threshold_db: -30.0,
-        });
-
-        let mut buf = vec![0f32; 10 * CHANS];
-        // Buffers 1..=96: A has more than 0.4s left -> passthrough.
-        for _ in 0..96 {
-            mix.next_buffer(&mut buf);
-            assert!((buf[0] - 1.0).abs() < 1e-6);
-        }
-        // Buffer 97: A has 0.4s left -> preload, fade begins (t=0). The
-        // loud tail picked the full 40-frame window, so the ramp matches
-        // the explicit fade_out=0.4 override case exactly.
-        mix.next_buffer(&mut buf);
-        assert!((buf[0] - 1.0).abs() < 1e-6);
-        mix.next_buffer(&mut buf);
-        assert!((buf[0] - 1.25).abs() < 1e-6);
-        mix.next_buffer(&mut buf);
-        assert!((buf[0] - 1.5).abs() < 1e-6);
-        mix.next_buffer(&mut buf);
-        assert!((buf[0] - 1.75).abs() < 1e-6);
-        // Buffer 101: fade complete (40 frames), B at full gain.
-        mix.next_buffer(&mut buf);
-        assert!((buf[0] - 2.0).abs() < 1e-6);
-    }
-
-    #[test]
     fn start_next_override_starts_the_next_track_early() {
         // Global window is 0.2s. Track A overrides `start_next` to 0.4s:
         // the next track is preloaded 0.4s early (not 0.2s), but the fade
@@ -1153,38 +1001,6 @@ mod tests {
         mix.next_buffer(&mut buf);
         assert!((buf[0] - 1.5).abs() < 1e-6);
         // Buffer 101: fade complete, A exhausted, B at full gain.
-        mix.next_buffer(&mut buf);
-        assert!((buf[0] - 2.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn quiet_tail_shortens_to_the_smart_fade_mid_window() {
-        // Track A is quiet (-40 dBFS): the fade window collapses to
-        // `fade_mid` (0.1s = 10 frames) even though the preload margin
-        // stays at `fade_out` (0.4s), so the transition is done a full
-        // buffer earlier than a loud tail would give.
-        let provider = Box::new(FakeProvider::new(vec![(0.01, 1000), (2.0, 1000)]));
-        let cfg = mixer_config(0.2);
-        let mix = CrossfadeMixer::new(provider, &cfg, RATE as u32, CHANS);
-        let mut mix = mix.with_smart_fade(SmartFade {
-            fade_out: 0.4,
-            fade_mid: 0.1,
-            threshold_db: -30.0,
-        });
-
-        let mut buf = vec![0f32; 10 * CHANS];
-        for _ in 0..96 {
-            mix.next_buffer(&mut buf);
-            assert!((buf[0] - 0.01).abs() < 1e-6);
-        }
-        // Buffer 97: preload fires at the 0.4s margin, but the quiet tail
-        // means the fade spans only 10 frames: t ramps 0 -> 1 in this one
-        // buffer.
-        mix.next_buffer(&mut buf);
-        assert!((buf[0] - 0.01).abs() < 1e-6); // t=0: A only
-        assert!((buf[18] - 1.801).abs() < 1e-4); // t=0.9: 0.1*A + 0.9*B
-        // Buffer 98: fade complete -> B at full gain (a loud tail would
-        // still be at t=0.25 -> 0.25*0.01 + 0.75*2.0 = 1.5025 here).
         mix.next_buffer(&mut buf);
         assert!((buf[0] - 2.0).abs() < 1e-6);
     }

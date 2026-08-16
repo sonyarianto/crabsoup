@@ -34,7 +34,7 @@ One engine thread plus one thread per output:
 ## Script layer (`src/script.rs`)
 
 - Registers the Liquidsoap-flavoured Lua stdlib: `playlist`,
-  `smart_crossfade`, `single`, `blank` (+ `blank.detect`), `sine`,
+  `single`, `blank` (+ `blank.detect`), `sine`,
   `amplify`, `compress`, `normalize`, `replaygain`, `stretch`, `pitch`,
   `echo`, `reverb`, `eq`, `filter`, `stereo` (+ `stereo.pan`, `stereo.widen`),
   `vocalremover`, `bpm`, `key`, `pipe`, `jingles`,
@@ -413,20 +413,10 @@ One engine thread plus one thread per output:
   outgoing track's `fade_out` too, so an annotated track starts its fade
   early enough; a `fade_in` longer than the margin degrades into the tail
   ramp, same as a track ending mid-fade. No override ⇒ global window,
-  byte-identical to before.
-- `smart_crossfade(opts)` enables level-aware window selection via
-  `CrossfadeMixer::with_smart_fade(SmartFade { fade_out, fade_mid,
-  threshold_db })`. While no fade is in progress the mixer folds each
-  buffer into a rolling running sum of squares covering the active track's
-  last `fade_out` seconds (chunked `VecDeque`, trimmed per buffer — no
-  allocation), and at preload the RMS dBFS reading picks the window: a
-  loud tail (≥ `threshold_db`, default -30) gets the full `fade_out`, a
-  quiet one the short `fade_mid` (no point dragging a crossfade over
-  silence). Per-track `fade_in`/`fade_out` overrides still win over the
-  smart window, and the preload margin stays at `fade_out`, so a
-  quiet-tail fade simply completes early — the loud and quiet paths are
-  both exact integer-frame fades, covered by mixer tests that mirror the
-  override-case sample values.
+  byte-identical to before. (Liquidsoap's level-aware `smart_crossfade`
+  variant is intentionally not reproduced: the overlap source's BS.1770
+  gate — see "Overlap source" — already ends fades at the audible tail,
+  so a threshold-chosen window adds nothing on top of it.)
 - `MixCommand` is the mixer control channel (`SetLive`, `ClearLive`,
   `PlayJingle(PathBuf)`, `Skip`, `Shutdown`) over `std::sync::mpsc`; the
   harbor and control port send into it. `Skip` calls `AudioSource::skip()`
