@@ -688,8 +688,9 @@ is a 5x rate but a small perceptual step), yet still the standard way to
 cover weak networks without degrading good ones.
 
 Backlog candidates (acceptance sketched, sized for the Phase 2/3
-window of Parts I–K):
-- [ ] **G3.1 — playlist source watch-reload (file *and* directory).**
+window of Parts I–K). G3.1–G3.8 are resolved (done or cancelled — see
+Done section); **G3.3 is the only remaining candidate.**
+- [x] **G3.1 — playlist source watch-reload (file *and* directory).**
       The playlist's list of tracks is read once at script start; a
       running station cannot pick up changes without a restart. Two
       production cases share one hook ("the source list can change at
@@ -713,14 +714,17 @@ window of Parts I–K):
       source, with shuffle/loop continuity preserved.
       Interim workaround for the station: `request.dynamic` re-reading
       the file / re-scanning the directory each call.
-- [ ] **G3.2 — next-track metadata hook.** `on_next_metadata(src, fn)`:
+      — **cancelled**: the `request.dynamic` workaround stays; live list
+      changes are not planned for now.
+- [x] **G3.2 — next-track metadata hook.** `on_next_metadata(src, fn)`:
       fires when the engine preloads the upcoming track (the preload
       already happens for crossfades — this just reports its metadata).
       Acceptance: `next-playing.txt` written before the track starts, on
       both crossfade and queue paths. — **done**: `AudioSource::next_label`
       (crossfade preload and the next queued request), `on_next_metadata`
       registering a wrapper that fires on label change (see Done section).
-- [ ] **G3.3 — multi-rendition HLS + variant master playlist.**
+- [ ] **G3.3 — multi-rendition HLS + variant master playlist** (the last
+      open G3 candidate).
       `output.hls({renditions = {{bitrate = 64000, ...}, ...}, ...})`
       fanning one tap into N AAC encodes and emitting a master `m3u8`
       (EXT-X-MEDIA / EXT-X-STREAM-INF) alongside the per-rendition
@@ -731,19 +735,19 @@ window of Parts I–K):
       the master playlist and decodes a window of each rendition; killing
       crabsoup mid-segment and restarting produces a playlist without
       gap/drift.
-- [ ] **G3.4 — HE-AACv2 (MPEG-4 PS) encoder profile.** The encoder has
+- [x] **G3.4 — HE-AACv2 (MPEG-4 PS) encoder profile.** The encoder has
       LC and HE (SBR); 64 kbit/s stereo needs PS (SBR + parametric
       stereo, `AOT = 29`). Acceptance: a 64 kbit/s HE-AACv2 ADTS stream
       decodes at 44.1 kHz stereo via ffprobe. — **done**: `aac_profile`
       output option (`lc`/`he`/`heaacv2`; Shoutcast v2 defaults to `he`),
       PS verified by ADTS mono core + sync extensions (see Done section).
-- [ ] **G3.5 — `json.stringify` in the Lua sandbox.** A stdlib function
+- [x] **G3.5 — `json.stringify` in the Lua sandbox.** A stdlib function
       (plus `json.parse`) so side-file writers (now/next-playing.txt) and
       telnet handlers emit machine-readable output without hand-rolled
       string building. Acceptance: `json.stringify({title = "x"})`
       round-trips through `json.parse`. — **done**: `json` table with
       `stringify`/`parse` (see Done section).
-- [ ] **G3.6 — per-track `amplify` annotation.** Crabsoup's own annotation
+- [x] **G3.6 — per-track `amplify` annotation.** Crabsoup's own annotation
       vocabulary (see the annotation-rename note below), with
       AzuraCast-style semantics: `amplify` overrides the per-track gain
       (linear float, or dB with the `dB` suffix — e.g. `-8.2 dB`). The
