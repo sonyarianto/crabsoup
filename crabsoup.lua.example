@@ -60,6 +60,20 @@ pl = playlist({directory = "./media", shuffle = false, loop = true})
 -- One-shot jingles, playable from the telnet control port (`jingles.play`).
 j = jingles({directory = "./jingles"})
 
+-- Automatic jingle rotation (the Liquidsoap `rotate` radio recipe):
+-- every N tracks a jingle plays, forever, picked at random. The jingle
+-- child loops and re-shuffles each cycle, so each pick is a fresh random
+-- jingle; `weights = {4, 1}` means 4 songs, 1 jingle, strictly
+-- alternating at track boundaries (Liquidsoap's rotate picks randomly
+-- per track instead). Use the rotate source in place of `pl` (and `j`):
+--   jr = rotate({pl, playlist({directory = "./jingles",
+--                              loop = true, shuffle = true})},
+--               {weights = {4, 1}})
+--   output.icecast({host = ..., mount = "/crabsoup.opus", ...},
+--                  fallback({live, jr}))
+-- Per-track followers (`annotated(src, {append = "jingles/x.mp3"})`) are
+-- the fixed-jingle variant: the same track after every song, no rotation.
+
 -- Live DJ harbor (Icecast source protocol): DJs PUT to this mount and the
 -- playlist is ducked while they are live. The value composes as a marker.
 -- `extra_passwords = {"alice", "bob"}` adds per-streamer (DJ) passwords
