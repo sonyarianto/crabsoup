@@ -27,6 +27,10 @@ output.icecast({host = "localhost", port = 8000,
 ```
 
 - `format` is `"mp3"`, `"opus"`, or `"aac"`; `bitrate` is in bits/s.
+- For AAC, `aac_profile` selects the fdk-aac profile: `"lc"` (default for
+  Icecast/Icy), `"he"` (SBR, the "AAC+" that SHOUTcast v2 uses by default),
+  or `"heaacv2"` (SBR + parametric stereo — the efficient 64 kbit/s
+  stereo option; stereo input only).
 - Opus is always encoded at 48 kHz (the bus rate is never fed directly).
 - The encoder writes one Ogg page per 20 ms Opus packet so audio reaches
   Icecast promptly.

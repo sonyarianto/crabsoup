@@ -340,6 +340,7 @@ const AACENC_TRANSMUX: c_uint = 0x0300;
 // Parameter values.
 const AOT_AAC_LC: c_uint = 2;
 const AOT_AAC_HE: c_uint = 5; // MPEG-4 HE-AAC (AAC-LC core + SBR, "AAC+")
+const AOT_AAC_HEV2: c_uint = 29; // MPEG-4 HE-AAC v2 (SBR + parametric stereo)
 const MODE_1: c_uint = 1; // mono
 const MODE_2: c_uint = 2; // stereo
 const TT_MP4_ADTS: c_uint = 2;
@@ -423,6 +424,19 @@ impl AacEncoder {
     /// `audio/aacp` sources.
     pub fn new_he_aac(sample_rate: u32, channels: u16, bitrate: u32) -> Result<Self> {
         Self::new_with(sample_rate, channels, bitrate, AOT_AAC_HE, TT_MP4_ADTS)
+    }
+
+    /// HE-AAC v2 ("AAC+ v2", SBR + parametric stereo) — the 64 kbit/s
+    /// stereo profile: the core is half-rate *mono* and the decoder
+    /// regenerates the stereo image from PS side data. Stereo only.
+    pub fn new_he_aac_v2(sample_rate: u32, channels: u16, bitrate: u32) -> Result<Self> {
+        if channels != 2 {
+            return Err(
+                "HE-AAC v2 requires stereo input (parametric stereo regenerates the image from a mono core)"
+                    .into(),
+            );
+        }
+        Self::new_with(sample_rate, channels, bitrate, AOT_AAC_HEV2, TT_MP4_ADTS)
     }
 
     /// AAC-LC with raw transport (no ADTS framing): FLV/RTMP publishing.
@@ -772,6 +786,72 @@ mod tests {
         );
     }
 
+    #[test]
+    fn he_aac_v2_stream_carries_sbr_parametric_stereo_and_decodes() {
+        // HE-AAC v2 is AAC-LC plus SBR plus parametric stereo (PS). Its
+        // signature in ADTS: a half-rate *mono* core (sf_index 7, channel
+        // configuration 1) — PS regenerates the stereo image at decode
+        // time, so ffmpeg decodes the 64 kbit/s stream back at 44.1 kHz
+        // stereo. Requires ffmpeg; skipped when absent.
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let mut enc = AacEncoder::new_he_aac_v2(44100, 2, 64_000).unwrap();
+        let mut pcm = vec![0f32; 44100 * 2]; // 1 second
+        for (i, s) in pcm.iter_mut().enumerate() {
+            let t = i as f64 / 44100.0;
+            *s = (2.0 * std::f64::consts::PI * 440.0 * t).sin() as f32 * 0.5;
+        }
+        let mut bytes = enc.encode(&pcm);
+        bytes.extend_from_slice(&enc.finish());
+        assert!(!bytes.is_empty());
+
+        // ADTS fixed header: byte[2] = profile(2)|sf_index(4)|priv(1)|cc(1),
+        // byte[3] = cc(2)|orig(1)|home(1)|...
+        let sf_index = (bytes[2] >> 2) & 0x0F;
+        assert_eq!(
+            sf_index, 7,
+            "HE-AAC v2 ADTS must signal the 22050 Hz core (index 7), got {sf_index}"
+        );
+        let cc = ((bytes[2] & 0x01) << 2) | (bytes[3] >> 6);
+        assert_eq!(
+            cc, 1,
+            "HE-AAC v2 ADTS must signal a mono core (channel config 1, PS downmix), got {cc}"
+        );
+
+        let path = std::env::temp_dir().join("crabsoup_he_aac_v2_test.aac");
+        let _ = std::fs::write(&path, &bytes);
+        let out = std::process::Command::new("ffmpeg")
+            .args(["-v", "info", "-i"])
+            .arg(&path)
+            .args(["-f", "null", "-"])
+            .output()
+            .expect("ffmpeg runs");
+        let _ = std::fs::remove_file(&path);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "HE-AAC v2 stream failed to decode: {stderr}"
+        );
+        assert!(
+            stderr.contains("44100 Hz, stereo"),
+            "stream must decode at 44.1 kHz stereo (PS synthesis), got: {stderr}"
+        );
+    }
+
+    #[test]
+    fn he_aac_v2_rejects_mono_input() {
+        let err = match AacEncoder::new_he_aac_v2(44100, 1, 64_000) {
+            Ok(_) => panic!("mono HE-AAC v2 must be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("stereo"), "{err}");
+    }
+
     fn split_pages(bytes: &[u8]) -> Vec<Vec<u8>> {
         let mut pages = Vec::new();
         let mut i = 0;
@@ -839,3 +919,4 @@ fn opus_streams_a_real_48k_mp3_file() {
         std::fs::write(out, &all).unwrap();
     }
 }
+

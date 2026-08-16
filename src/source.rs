@@ -36,6 +36,13 @@ pub trait AudioSource: Send {
         None
     }
 
+    /// Label of the *upcoming* track, if the source already knows it: the
+    /// crossfade mixer has preloaded the next track, or a request queue has
+    /// one waiting. `on_next_metadata` reports this before the track starts.
+    fn next_label(&self) -> Option<String> {
+        None
+    }
+
     /// Per-track ReplayGain baseline in dB (from `REPLAYGAIN_TRACK_GAIN` /
     /// `REPLAYGAIN_ALBUM_GAIN` tags), if the source can determine one.
     /// `None` = no tags (0 dB applied). Read once per track, at

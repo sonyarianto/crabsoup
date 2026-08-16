@@ -4,7 +4,7 @@ use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 use crate::Result;
-use crate::config::{OutputConfig, OutputFormat, OutputProtocol};
+use crate::config::{AacProfile, OutputConfig, OutputFormat, OutputProtocol};
 use crate::engine::mixer::StatusHandle;
 use crate::engine::tap::{AudioFrame, interruptible_sleep, recv_frame_or_shutdown};
 use crate::output::encoder::{AacEncoder, Encoder, create_encoder};
@@ -70,14 +70,30 @@ impl IcecastOutput {
 
     /// Establish the initial source connection (caller decides retry policy).
     pub fn connect(&mut self) -> Result<()> {
-        self.encoder = Some(match (self.config.protocol, self.config.format) {
+        self.encoder = Some(match self.config.format {
             // SHOUTcast v2 exposes AAC as "AAC+" (`audio/aacp`): HE-AAC with
             // SBR rather than the plain AAC-LC used for Icecast and HLS.
-            (OutputProtocol::ShoutcastV2, OutputFormat::Aac) => Box::new(AacEncoder::new_he_aac(
-                self.sample_rate,
-                self.chans as u16,
-                self.config.bitrate,
-            )?),
+            // `aac_profile = "heaacv2"` upgrades it to SBR + parametric
+            // stereo — the profile for 64 kbit/s stereo.
+            OutputFormat::Aac => match self.config.aac_profile {
+                AacProfile::Lc => create_encoder(
+                    self.config.format,
+                    self.sample_rate,
+                    self.chans as u16,
+                    self.config.bitrate,
+                    &self.config.name,
+                )?,
+                AacProfile::He => Box::new(AacEncoder::new_he_aac(
+                    self.sample_rate,
+                    self.chans as u16,
+                    self.config.bitrate,
+                )?),
+                AacProfile::HeV2 => Box::new(AacEncoder::new_he_aac_v2(
+                    self.sample_rate,
+                    self.chans as u16,
+                    self.config.bitrate,
+                )?),
+            },
             _ => create_encoder(
                 self.config.format,
                 self.sample_rate,
@@ -104,13 +120,14 @@ impl IcecastOutput {
     }
 
     fn format_name(&self) -> &'static str {
-        match (self.config.protocol, self.config.format) {
-            (OutputProtocol::ShoutcastV1 | OutputProtocol::ShoutcastV2, OutputFormat::Aac) => {
-                "AAC+ (HE-AAC)"
-            }
-            (_, OutputFormat::Mp3) => "MP3",
-            (_, OutputFormat::Opus) => "Ogg/Opus",
-            (_, OutputFormat::Aac) => "AAC",
+        match self.config.format {
+            OutputFormat::Aac => match self.config.aac_profile {
+                AacProfile::Lc => "AAC",
+                AacProfile::He => "AAC+ (HE-AAC)",
+                AacProfile::HeV2 => "AAC+ v2 (HE-AACv2)",
+            },
+            OutputFormat::Mp3 => "MP3",
+            OutputFormat::Opus => "Ogg/Opus",
         }
     }
 

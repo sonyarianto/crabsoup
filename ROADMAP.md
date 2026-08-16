@@ -1,6 +1,27 @@
 # Crabsoup roadmap
 
 ## Done (verified end-to-end)
+- [x] **G3.5 — `json.stringify`/`json.parse` in the Lua sandbox**: the
+      `json` table converts Lua values both ways (integers stay integers,
+      tables/arrays preserved); telnet handlers and side-file writers can
+      now emit machine-readable output without hand-rolled strings.
+      Acceptance met: a script-level round-trip test through the sandbox
+      (`json.parse(json.stringify({title = "x"}))`).
+- [x] **G3.4 — HE-AACv2 (MPEG-4 PS) encoder profile**: fdk-aac AOT 29 via
+      `output.icecast({..., aac_profile = "heaacv2"})` (also `lc`/`he`,
+      with Shoutcast v2 defaulting to `he` as before). Stereo-only with an
+      explicit rejection of mono input. Acceptance met — but not via
+      ffprobe's profile field, which always reports LC for ADTS: the test
+      asserts the ADTS `channel_configuration` bits (HEv2 downmixes to a
+      mono SBR core, HE keeps a stereo core) plus ffmpeg decoding at
+      44.1 kHz stereo. See the test's comment for the bit layout.
+- [x] **G3.2 — next-track metadata hook**: `AudioSource::next_label()`
+      reports the upcoming track the engine already knows about (crossfade
+      preload in `CrossfadeMixer`, next queued request in
+      `RequestQueueSource`); `on_next_metadata(src, fn)` wraps a source and
+      fires with the upcoming title before the track starts, on both
+      paths. Acceptance met: both a crossfade and a queue test see the
+      next title while the current track still plays.
 - [x] **Ctrl-C shutdown deadlock fixed**: consumer loops blocked forever in
       `rx.recv()` once the puller stopped publishing frames, so `main` hung
       on `handle.join()` and the process never exited after SIGINT. All six
@@ -661,7 +682,9 @@ window of Parts I–K):
       fires when the engine preloads the upcoming track (the preload
       already happens for crossfades — this just reports its metadata).
       Acceptance: `next-playing.txt` written before the track starts, on
-      both crossfade and queue paths.
+      both crossfade and queue paths. — **done**: `AudioSource::next_label`
+      (crossfade preload and the next queued request), `on_next_metadata`
+      registering a wrapper that fires on label change (see Done section).
 - [ ] **G3.3 — multi-rendition HLS + variant master playlist.**
       `output.hls({renditions = {{bitrate = 64000, ...}, ...}, ...})`
       fanning one tap into N AAC encodes and emitting a master `m3u8`
@@ -676,12 +699,15 @@ window of Parts I–K):
 - [ ] **G3.4 — HE-AACv2 (MPEG-4 PS) encoder profile.** The encoder has
       LC and HE (SBR); 64 kbit/s stereo needs PS (SBR + parametric
       stereo, `AOT = 29`). Acceptance: a 64 kbit/s HE-AACv2 ADTS stream
-      decodes at 44.1 kHz stereo via ffprobe.
+      decodes at 44.1 kHz stereo via ffprobe. — **done**: `aac_profile`
+      output option (`lc`/`he`/`heaacv2`; Shoutcast v2 defaults to `he`),
+      PS verified by ADTS mono core + sync extensions (see Done section).
 - [ ] **G3.5 — `json.stringify` in the Lua sandbox.** A stdlib function
       (plus `json.parse`) so side-file writers (now/next-playing.txt) and
       telnet handlers emit machine-readable output without hand-rolled
       string building. Acceptance: `json.stringify({title = "x"})`
-      round-trips through `json.parse`.
+      round-trips through `json.parse`. — **done**: `json` table with
+      `stringify`/`parse` (see Done section).
 
 ### Suggested execution order
 

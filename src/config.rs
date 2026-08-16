@@ -74,6 +74,8 @@ pub struct OutputConfig {
     /// Which source protocol the output speaks.
     pub protocol: OutputProtocol,
     pub format: OutputFormat,
+    /// Which AAC object type an AAC-format output encodes with.
+    pub aac_profile: AacProfile,
     /// Encoder bitrate in bits per second.
     pub bitrate: u32,
     pub name: String,
@@ -81,6 +83,19 @@ pub struct OutputConfig {
     pub genre: String,
     /// Seconds to wait between failed reconnect attempts.
     pub reconnect_seconds: u64,
+}
+
+/// AAC object types the encoder can emit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AacProfile {
+    /// AAC-LC — Icecast and HLS.
+    #[default]
+    Lc,
+    /// HE-AAC (SBR, "AAC+") — what SHOUTcast v2 expects from `audio/aacp`.
+    He,
+    /// HE-AAC v2 (SBR + parametric stereo, "AAC+ v2") — the 64 kbit/s
+    /// stereo profile.
+    HeV2,
 }
 
 /// Config for `output.file`: encode the tap to a local file.
@@ -166,6 +181,7 @@ impl Default for OutputConfig {
             source_password: "hackme".into(),
             protocol: OutputProtocol::Icecast,
             format: OutputFormat::Mp3,
+            aac_profile: AacProfile::Lc,
             bitrate: 192_000,
             name: "Crabsoup".into(),
             description: "Crabsoup stream".into(),

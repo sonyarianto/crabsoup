@@ -43,7 +43,8 @@ One engine thread plus one thread per output:
   `input.harbor`, `input.soundcard`, `input.http`, `output.icecast`,
   `output.file`,
   `output.preview`, `output.soundcard`, `output.hls`, `server.telnet`,
-  `server.register`, `on_metadata`, `on_track`, `http_post`, `set`, `log`.
+  `server.register`, `on_metadata`, `on_track`, `on_next_metadata`, `json`
+  (`stringify`/`parse`), `http_post`, `set`, `log`.
 - `blank` is a *callable table* (a `__call` metamethod) so it can carry
   `blank.detect`; Lua calls a table's `__call` as `f(self, args...)`, so
   the closure takes a leading `_self` parameter.
@@ -113,6 +114,13 @@ One engine thread plus one thread per output:
   *any* track boundary: label change (even to `None`) or a resume after a
   non-exhausted silence — both hook registries are separate vectors, so a
   `Track` event never reaches an `on_metadata` callback.
+- `on_next_metadata` wraps in `OnNextMetadataSource` (the `ScriptEvent::
+  NextMetadata { hook_id, title }` event) and reports the *upcoming* track
+  via the `AudioSource::next_label` trait method (default `None`): the
+  crossfade mixer knows its preloaded track, the request queue its next
+  queued URI — both available before the track starts. The wrapper fires
+  on label change like `OnMetadataSource`, and re-exposes `next_label` so
+  hook compositions stay transparent.
 - `request.dynamic(fn)` extends the same event-loop pattern to live
   request scheduling: `DynamicRequestSource` asks the Lua-owning thread for
   the next request URI via `ScriptEvent::NextRequest { index, reply }` and

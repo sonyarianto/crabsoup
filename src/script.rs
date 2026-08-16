@@ -36,8 +36,8 @@ use rand::{Rng, SeedableRng};
 use symphonia::core::audio::SignalSpec;
 
 use crate::config::{
-    ControlConfig, FileOutputConfig, HlsOutputConfig, LiveConfig, MixerConfig, OutputConfig,
-    OutputFormat, OutputProtocol, SoundcardOutputConfig, StreamConfig, collect_audio,
+    AacProfile, ControlConfig, FileOutputConfig, HlsOutputConfig, LiveConfig, MixerConfig,
+    OutputConfig, OutputFormat, OutputProtocol, SoundcardOutputConfig, StreamConfig, collect_audio,
 };
 #[cfg(feature = "video")]
 use crate::config::{collect_images, collect_video};
@@ -145,6 +145,9 @@ struct ScriptState {
     /// separate from `metadata_hooks` so a `Track` event never calls an
     /// `on_metadata` callback (and vice versa).
     track_hooks: Vec<mlua::Function>,
+    /// Lua callbacks registered by `on_next_metadata`; indexed by hook id,
+    /// fired with the preloaded upcoming track's title.
+    next_metadata_hooks: Vec<mlua::Function>,
     /// Lua callbacks registered by `request.dynamic`; indexed by hook id.
     /// Each returns the next request URI or nil to end the source.
     dynamic_hooks: Vec<mlua::Function>,
@@ -164,6 +167,9 @@ pub enum ScriptEvent {
     /// A source wrapped by `on_track` started a new track (boundary
     /// detected, metadata not required).
     Track { hook_id: usize },
+    /// A source wrapped by `on_next_metadata` saw the upcoming track's
+    /// label (preloaded for a crossfade, or next in a request queue).
+    NextMetadata { hook_id: usize, title: String },
     /// A telnet `server.register` command: run the Lua handler with `args`
     /// and send the reply back to the control port (which blocks on it).
     Custom {
@@ -201,6 +207,7 @@ pub struct ScriptRuntime {
     event_tx: mpsc::Sender<ScriptEvent>,
     metadata_hooks: Vec<mlua::Function>,
     track_hooks: Vec<mlua::Function>,
+    next_metadata_hooks: Vec<mlua::Function>,
     custom_commands: Vec<(String, mlua::Function)>,
     dynamic_hooks: Vec<mlua::Function>,
     blank_hooks: Vec<mlua::Function>,
@@ -271,6 +278,25 @@ impl ScriptRuntime {
                 };
                 if let Err(e) = cb.call::<()>(()) {
                     log::warn!("on_track callback error: {e}");
+                }
+            }
+            ScriptEvent::NextMetadata { hook_id, title } => {
+                let Some(cb) = self.next_metadata_hooks.get(hook_id) else {
+                    return;
+                };
+                let table = match self.lua.create_table() {
+                    Ok(t) => t,
+                    Err(e) => {
+                        log::warn!("on_next_metadata callback: table error: {e}");
+                        return;
+                    }
+                };
+                if let Err(e) = table.set("title", title.as_str()) {
+                    log::warn!("on_next_metadata callback: {e}");
+                    return;
+                }
+                if let Err(e) = cb.call::<()>(table) {
+                    log::warn!("on_next_metadata callback error: {e}");
                 }
             }
             ScriptEvent::Custom { index, args, reply } => {
@@ -470,6 +496,72 @@ impl AudioSource for OnTrackSource {
 
     fn label(&self) -> Option<String> {
         self.child.label()
+    }
+
+    fn replaygain_db(&self) -> Option<f32> {
+        self.child.replaygain_db()
+    }
+
+    fn crossfade_overrides(&self) -> Option<(Option<f64>, Option<f64>)> {
+        self.child.crossfade_overrides()
+    }
+
+    fn skip(&mut self) {
+        self.child.skip();
+    }
+}
+
+/// Wrapper source that emits [`ScriptEvent::NextMetadata`] when its child
+/// reports a new upcoming track (crossfade preload, or the next queued
+/// request). Like [`OnMetadataSource`], only the label crosses the channel.
+struct OnNextMetadataSource {
+    child: Box<dyn AudioSource>,
+    tx: mpsc::Sender<ScriptEvent>,
+    hook_id: usize,
+    last_next: Option<String>,
+}
+
+impl OnNextMetadataSource {
+    fn new(child: Box<dyn AudioSource>, tx: mpsc::Sender<ScriptEvent>, hook_id: usize) -> Self {
+        Self {
+            child,
+            tx,
+            hook_id,
+            last_next: None,
+        }
+    }
+}
+
+impl AudioSource for OnNextMetadataSource {
+    fn next_buffer(&mut self, buffer: &mut [f32]) -> usize {
+        let n = self.child.next_buffer(buffer);
+        let next = self.child.next_label();
+        if next != self.last_next {
+            if let Some(title) = &next {
+                let _ = self.tx.send(ScriptEvent::NextMetadata {
+                    hook_id: self.hook_id,
+                    title: title.clone(),
+                });
+            }
+            self.last_next = next;
+        }
+        n
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.child.is_exhausted()
+    }
+
+    fn remaining_seconds(&self) -> Option<f64> {
+        self.child.remaining_seconds()
+    }
+
+    fn label(&self) -> Option<String> {
+        self.child.label()
+    }
+
+    fn next_label(&self) -> Option<String> {
+        self.child.next_label()
     }
 
     fn replaygain_db(&self) -> Option<f32> {
@@ -1783,9 +1875,38 @@ fn value_to_json(v: &mlua::Value) -> Result<serde_json::Value, String> {
         mlua::Value::Table(t) => table_to_json(t)?,
         other => {
             return Err(format!(
-                "unsupported Lua value in http_post payload: {}",
+                "unsupported Lua value for JSON: {}",
                 other.type_name()
             ));
+        }
+    })
+}
+
+fn json_to_value(lua: &mlua::Lua, v: &serde_json::Value) -> mlua::Result<mlua::Value> {
+    Ok(match v {
+        serde_json::Value::Null => mlua::Value::Nil,
+        serde_json::Value::Bool(b) => mlua::Value::Boolean(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                mlua::Value::Integer(i)
+            } else {
+                mlua::Value::Number(n.as_f64().unwrap_or(0.0))
+            }
+        }
+        serde_json::Value::String(s) => mlua::Value::String(lua.create_string(s)?),
+        serde_json::Value::Array(items) => {
+            let t = lua.create_table()?;
+            for (i, item) in items.iter().enumerate() {
+                t.set(i + 1, json_to_value(lua, item)?)?;
+            }
+            mlua::Value::Table(t)
+        }
+        serde_json::Value::Object(map) => {
+            let t = lua.create_table()?;
+            for (k, item) in map {
+                t.set(k.as_str(), json_to_value(lua, item)?)?;
+            }
+            mlua::Value::Table(t)
         }
     })
 }
@@ -1835,6 +1956,29 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
             Ok(())
         })?,
     )?;
+
+    // ---- JSON helpers ------------------------------------------------
+    // `json.stringify` lets side-file writers (now/next-playing.txt) and
+    // telnet handlers emit machine-readable output; `json.parse` reads it
+    // back. Shares the converters http_post uses.
+    let json = lua.create_table()?;
+    json.set(
+        "stringify",
+        lua.create_function(|_, value: mlua::Value| {
+            let v = value_to_json(&value).map_err(mlua::Error::runtime)?;
+            serde_json::to_string(&v)
+                .map_err(|e| mlua::Error::runtime(format!("json.stringify: {e}")))
+        })?,
+    )?;
+    json.set(
+        "parse",
+        lua.create_function(|lua, s: String| {
+            let v: serde_json::Value = serde_json::from_str(&s)
+                .map_err(|e| mlua::Error::runtime(format!("json.parse: {e}")))?;
+            json_to_value(lua, &v)
+        })?,
+    )?;
+    globals.set("json", json)?;
 
     // ---- source constructors -------------------------------------------
     let pl_state = state.clone();
@@ -2910,6 +3054,18 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         }
     }
 
+    /// Parse the AAC encoder profile (`"lc"`, `"he"` or `"heaacv2"`).
+    fn parse_aac_profile(value: &str) -> mlua::Result<AacProfile> {
+        match value {
+            "lc" => Ok(AacProfile::Lc),
+            "he" | "aac+" => Ok(AacProfile::He),
+            "heaacv2" | "he-v2" | "aac+v2" => Ok(AacProfile::HeV2),
+            other => Err(mlua::Error::runtime(format!(
+                "unknown aac_profile {other:?} (use \"lc\", \"he\" or \"heaacv2\")"
+            ))),
+        }
+    }
+
     /// First output call wins the shared root; later calls must pass the
     /// same source graph (`Arc::ptr_eq`).
     fn claim_root(s: &mut ScriptState, source: &mut LuaSource) -> mlua::Result<()> {
@@ -2933,18 +3089,30 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
             .map(|f| parse_format(&f))
             .transpose()?
             .unwrap_or(OutputFormat::Mp3);
+        let protocol = opts
+            .get::<Option<String>>("protocol")?
+            .map(|p| parse_protocol(&p))
+            .transpose()?
+            .unwrap_or_default();
+        // Default profile keeps the historical behavior: SHOUTcast v2 AAC is
+        // "AAC+" (HE-AAC), everything else is AAC-LC. `aac_profile` opts out.
+        let aac_profile = opts
+            .get::<Option<String>>("aac_profile")?
+            .map(|p| parse_aac_profile(&p))
+            .transpose()?
+            .unwrap_or(match protocol {
+                OutputProtocol::ShoutcastV2 => AacProfile::He,
+                _ => AacProfile::Lc,
+            });
         let cfg = OutputConfig {
             host: opts.get("host").unwrap_or_else(|_| "localhost".into()),
             port: opts.get("port").unwrap_or(8000),
             mount: opts.get("mount").unwrap_or_else(|_| "/crabsoup.mp3".into()),
             source_user: opts.get("user").unwrap_or_else(|_| "source".into()),
             source_password: opts.get("password").unwrap_or_else(|_| "hackme".into()),
-            protocol: opts
-                .get::<Option<String>>("protocol")?
-                .map(|p| parse_protocol(&p))
-                .transpose()?
-                .unwrap_or_default(),
+            protocol,
             format,
+            aac_profile,
             bitrate: opts.get("bitrate").unwrap_or(192_000),
             name: opts.get("name").unwrap_or_else(|_| "Crabsoup".into()),
             description: opts
@@ -3184,6 +3352,21 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         )?,
     )?;
 
+    let next_state = state.clone();
+    let next_tx = event_tx.clone();
+    globals.set(
+        "on_next_metadata",
+        lua.create_function(
+            move |_, (mut source, callback): (LuaSource, mlua::Function)| {
+                let hook_id = next_state.borrow().next_metadata_hooks.len();
+                let child = source.take();
+                next_state.borrow_mut().next_metadata_hooks.push(callback);
+                let wrapped = OnNextMetadataSource::new(child, next_tx.clone(), hook_id);
+                Ok(LuaSource::new(Box::new(wrapped)))
+            },
+        )?,
+    )?;
+
     // ---- metadata rewrite (Liquidsoap `map_metadata`) ---------------------
     // Unlike `on_metadata`, the callback's return value *reaches the output*:
     // the wrapped source asks for a rewrite when the child's label changes
@@ -3245,6 +3428,7 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         event_tx,
         metadata_hooks: std::mem::take(&mut s.metadata_hooks),
         track_hooks: std::mem::take(&mut s.track_hooks),
+        next_metadata_hooks: std::mem::take(&mut s.next_metadata_hooks),
         custom_commands: std::mem::take(&mut s.custom_commands),
         dynamic_hooks: std::mem::take(&mut s.dynamic_hooks),
         blank_hooks: std::mem::take(&mut s.blank_hooks),
@@ -4495,6 +4679,98 @@ mod tests {
         _rt.drain_metadata();
         let tracks: u64 = _rt.global("tracks").expect("tracks counter");
         assert_eq!(tracks, 2, "one event per track start");
+    }
+
+    // ---- G3.2: on_next_metadata ----------------------------------------
+
+    #[test]
+    fn on_next_metadata_reports_the_preloaded_crossfade_track() {
+        let dir = "jingles/audio";
+        if !std::path::Path::new(dir).is_dir() {
+            return;
+        }
+        let (_rt, res) = run(&format!(r#"
+            set("crossfade_seconds", 2)
+            next_seen = nil
+            src = on_next_metadata(playlist({{directory = "{dir}"}}),
+                                   function(m) next_seen = m.title end)
+            output.preview(src)
+            "#))
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        let mut first = None;
+        let mut at_preload = None;
+        for _ in 0..4000 {
+            root.next_buffer(&mut buf);
+            _rt.drain_metadata();
+            let next_seen: Option<String> = _rt
+                .global("next_seen")
+                .expect("next_seen readable");
+            if first.is_none() && next_seen.is_none() {
+                first = root.label();
+            } else if at_preload.is_none() && next_seen.is_some() {
+                at_preload = Some((next_seen, root.label()));
+                if root.label() != first {
+                    break;
+                }
+            } else if at_preload
+                .as_ref()
+                .is_some_and(|(title, _)| root.label().as_deref() == title.as_deref())
+            {
+                break;
+            }
+        }
+        let (next_seen, label_at_preload) = at_preload
+            .expect("preload must fire while the first track still plays");
+        assert_eq!(label_at_preload, first, "hook fires before the next track starts");
+        assert_ne!(next_seen, first, "next label is the *upcoming* track");
+    }
+
+    #[test]
+    fn on_next_metadata_reports_the_next_queued_request() {
+        let jingle = std::path::Path::new("jingles/audio/mrwashingt0n-radio-for-all-505928.mp3");
+        if !jingle.exists() {
+            return;
+        }
+        let (_rt, res) = run(r#"
+            next_seen = nil
+            q = request.queue()
+            q = on_next_metadata(q, function(m) next_seen = m.title end)
+            output.preview(q)
+            "#)
+        .expect("script runs");
+        let queue = res.request_queue.expect("request queue");
+        let first = "jingles/audio/mrwashingt0n-simple-radio-jingle-501090.mp3";
+        let second = "jingles/audio/mrwashingt0n-radio-for-all-505928.mp3";
+        queue.push(RequestUri::new(first));
+        queue.push(RequestUri::new(second));
+        let first_stem = "mrwashingt0n-simple-radio-jingle-501090";
+        let second_stem = "mrwashingt0n-radio-for-all-505928";
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        let mut started = None;
+        for _ in 0..4000 {
+            root.next_buffer(&mut buf);
+            _rt.drain_metadata();
+            let next_seen: Option<String> = _rt
+                .global("next_seen")
+                .expect("next_seen readable");
+            if started.is_none() && root.label().is_some() {
+                started = root.label();
+                continue;
+            }
+            if next_seen.as_deref() == Some(second_stem) && root.label() == started {
+                break;
+            }
+        }
+        assert_eq!(
+            root.label().as_deref(),
+            Some(first_stem),
+            "next metadata fires while the queued request is still pending"
+        );
+        let next_seen: Option<String> = _rt.global("next_seen").expect("next_seen readable");
+        assert_eq!(next_seen.as_deref(), Some(second_stem));
     }
 
     #[test]
@@ -5750,5 +6026,22 @@ mod tests {
         let lua = Lua::new();
         let t: mlua::Table = lua.load("return {fn = function() end}").eval().unwrap();
         assert!(table_to_json(&t).is_err());
+    }
+
+    #[test]
+    fn json_stringify_parse_round_trips_through_the_sandbox() {
+        let (_rt, _res) = run(
+            r#"
+            local s = json.stringify({title = "Some track.mp3", bitrate = 128, tags = {"a", "b"}, done = false})
+            local back = json.parse(s)
+            assert(back.title == "Some track.mp3")
+            assert(back.bitrate == 128)
+            assert(back.tags[1] == "a" and back.tags[2] == "b")
+            assert(back.done == false)
+            assert(type(json.stringify({n = 1.5})) == "string")
+            output.preview(sine({freq = 440, duration = 0.1}))
+            "#,
+        )
+        .expect("script runs");
     }
 }

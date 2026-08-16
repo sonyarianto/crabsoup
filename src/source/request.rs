@@ -60,6 +60,11 @@ impl RequestQueue {
             .collect()
     }
 
+    /// The request that will play next, without popping it.
+    pub fn peek(&self) -> Option<RequestUri> {
+        self.inner.lock().unwrap().requests.front().cloned()
+    }
+
     /// Drop every queued request (a playing track is unaffected).
     pub fn clear(&self) {
         self.inner.lock().unwrap().requests.clear();
@@ -182,6 +187,10 @@ impl AudioSource for RequestQueueSource {
 
     fn label(&self) -> Option<String> {
         self.current_uri.as_ref().map(|uri| uri.display())
+    }
+
+    fn next_label(&self) -> Option<String> {
+        self.queue.peek().map(|uri| uri.display())
     }
 
     fn replaygain_db(&self) -> Option<f32> {

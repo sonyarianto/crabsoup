@@ -280,7 +280,7 @@ shipped and verified; the status of the rest of the project is tracked in
 | one-shot jingles (`switch` + request scheduling) | `jingles({directory})` + telnet `jingles.play` |
 | `request.queue` + telnet `queue.push` | same |
 | `switch` (dayparting), `rotate` | `switch({ {when = {days, from, to}, src = ...}, {src = default} })`, `rotate({...}, {weights = ...})` |
-| `on_metadata` / `on_track` | `on_metadata(src, fn)` (title table), `on_track(src, fn)` (boundary, no args) |
+| `on_metadata` / `on_track` / `on_next_metadata` | `on_metadata(src, fn)` (title table), `on_track(src, fn)` (boundary, no args), `on_next_metadata(src, fn)` (upcoming title, preload/queue) |
 | `http://` / `https://` request resolution | `single("http(s)://...")`, `playlist(entries)`, `queue.push <url>` — download-then-play with retry/timeout, temp files auto-removed; HTTPS via rustls (redirects may cross scheme) |
 | `server.register` custom telnet commands | `server.register("name", function(args) return reply end)` |
 | `mksafe(src)` | `mksafe(src)` — composes `fallback({src, blank()})` |

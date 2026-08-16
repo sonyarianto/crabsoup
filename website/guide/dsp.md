@@ -144,10 +144,28 @@ output — the original is kept on nil/error/timeout:
 map_metadata(src, function(m) return {title = "Artist - " .. m.title} end)
 ```
 
-## `on_metadata(src, fn)` / `on_track(src, fn)`
+## `on_metadata(src, fn)` / `on_track(src, fn)` / `on_next_metadata(src, fn)`
 
 Fire-and-forget Lua hooks: `on_metadata` gets the track's title table;
-`on_track` fires at any track boundary.
+`on_track` fires at any track boundary. `on_next_metadata` gets the
+*upcoming* track's title table before it starts — the engine already knows
+it from the crossfade preload or the next queued request:
+
+```lua
+on_next_metadata(src, function(m) print("up next: " .. m.title) end)
+```
+
+## Lua `json` helpers
+
+`json.stringify(value)` / `json.parse(text)` convert between Lua values and
+JSON — handy for machine-readable side files (now/next-playing.txt) and
+telnet handlers:
+
+```lua
+on_metadata(src, function(m)
+    json.stringify({title = m.title, next = next_title})
+end)
+```
 
 ## Request URIs: `annotate:` and `http(s)://`
 

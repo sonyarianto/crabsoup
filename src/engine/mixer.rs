@@ -385,6 +385,10 @@ impl AudioSource for CrossfadeMixer {
         Some(self.active_label.clone())
     }
 
+    fn next_label(&self) -> Option<String> {
+        self.next_label.clone()
+    }
+
     fn replaygain_db(&self) -> Option<f32> {
         self.active.replaygain_db()
     }
