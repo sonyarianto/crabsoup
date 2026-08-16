@@ -991,6 +991,7 @@ mod gate_tests {
     }
 
     #[test]
+    #[allow(clippy::excessive_precision)]
     fn k_weighting_biquads_reproduce_the_published_48_khz_coefficients() {
         // ITU-R BS.1770-4 Tables 1 and 2 (fs = 48 kHz). The De Man
         // sections reproduce the stage-2 high-pass exactly (a's to 1e-11)
