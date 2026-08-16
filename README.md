@@ -4,10 +4,11 @@
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 [![CI](https://github.com/sonyarianto/crabsoup/actions/workflows/ci.yml/badge.svg)](https://github.com/sonyarianto/crabsoup/actions/workflows/ci.yml)
 
-A radio station in a single Rust binary. You describe your station in a Lua
-script (Liquidsoap-flavoured, real Lua), and Crabsoup decodes the files,
-mixes in live DJ input and one-shot jingles with crossfades, and broadcasts
-the result — MP3, Opus or AAC — to an Icecast server.
+An audio/video streaming engine in a single Rust binary. You describe your
+station in a Lua script (Liquidsoap-flavoured, real Lua), and Crabsoup decodes
+the files, mixes in live DJ input and one-shot jingles with crossfades, and
+broadcasts the result — MP3, Opus or AAC to an Icecast server, or H.264 + AAC
+to HLS, RTMP or MP4 with video on the same script.
 
 It was written as a replacement for a Liquidsoap stack: same workflow, no
 OCaml. The script language will feel familiar if you know Liquidsoap.
