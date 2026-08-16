@@ -15,9 +15,9 @@ hero:
 
 features:
   - title: .lua scripting
-    details: Real Lua with Liquidsoap-style functions — playlist, smart_crossfade, fallback, switch, rotate, jingles, mksafe, add, cue_cut, pipe and more.
+    details: Real Lua with Liquidsoap-style functions — playlist, single, fallback, switch, rotate, jingles, mksafe, add, cue_cut, pipe and more.
   - title: Gapless crossfades
-    details: Track-to-track overlap with configurable window and fade curve, plus a level-aware smart_crossfade that picks the window from the outgoing track's tail.
+    details: Track-to-track overlap with configurable window and fade curve, ending each fade at the track's audible tail via a BS.1770-gated fade point.
   - title: Live DJ ducking
     details: An Icecast source-protocol harbor (PUT /live). While a DJ is live the playlist ducks out, then fades back in on disconnect.
   - title: Jingles & control

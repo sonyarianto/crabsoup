@@ -9,7 +9,7 @@ soundcard.
 ## Features
 
 - **`.lua` scripting**: real Lua with Liquidsoap-style functions —
-  `playlist`, `smart_crossfade`, `single`, `blank`, `sine`, `amplify`,
+  `playlist`, `single`, `blank`, `sine`, `amplify`,
   `compress`, `normalize`, `pipe`, `fallback`, `sequence`, `random`, `switch`,
   `rotate`, `jingles`, `mksafe`, `add`, `cue_cut`, `request.queue`,
   `request.dynamic`, `blank.detect`, `map_metadata`, `input.harbor`,
@@ -17,7 +17,8 @@ soundcard.
   `server.telnet`, `set`, `log`
 - **Playlist scheduling**: recursive directory scan, explicit file lists,
   loop and shuffle
-- **Gapless crossfades** with configurable overlap and fade curve
+- **Gapless crossfades** with configurable overlap and fade curve, ending at
+  each track's audible tail (BS.1770-gated fade point)
 - **Live DJ harbor**: an Icecast source-protocol listener (`PUT /live`); the
   playlist ducks out while a DJ is live and fades back in on disconnect
 - **Jingles**: one-shot clips played over the music, triggered from a

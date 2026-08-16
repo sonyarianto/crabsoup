@@ -6426,7 +6426,7 @@ mod tests {
     fn dbg_real_mp3_rotate_crossfade_dump() {
         // Reproduce the user's exact recipe with their real files (jingles
         // 11-30 s, songs real MP3s) and dump label changes + silence runs.
-        let (_rt, res) = run(r#"
+        let (_rt, _res) = run(r#"
             songs = playlist({directory = "./media/audio/songs", shuffle = true, loop = true,
                               crossfade = false})
             j = playlist({directory = "./jingles/audio", loop = true, shuffle = true,

@@ -133,20 +133,25 @@ overnight" shape, with no script-side handling. `reconnect_backoff` is the
 milliseconds between attempts (default 500). The connection timeout follows
 `set("request_timeout", N)` (default 30 s).
 
-## `smart_crossfade({...})`
+## `crossfade(src, {duration, curve})`
 
-A `playlist` whose transition window is chosen by the outgoing track's
-measured tail level: a loud tail gets a full `fade_out` crossfade, a quiet
-tail only a short `fade_mid` fade (no point dragging a crossfade over
-silence; per-track `annotate:`/`cue_cut` fade overrides still win):
+A top-level overlap crossfade over the consecutive tracks of any source
+(Liquidsoap's `crossfade`): a delay ring holds the outgoing track's tail and
+blends it with the incoming track's head at every label change. Pair with
+plain children — `playlist({..., crossfade = false})` (no internal
+fade/preload) — inside `rotate`/`fallback` for the classic radio recipe:
 
 ```lua
-smart_crossfade({directory = "./media",
-                 fade_out = 3.0, fade_mid = 1.5, threshold = -30})
+output.preview(crossfade(rotate({songs, jingles}, {weights = {3, 1}}),
+                         {duration = 3.0}))
 ```
 
-`fade_out` defaults to `crossfade_seconds`, `fade_mid` to half of it,
-`threshold` (dBFS, default -30) decides "quiet".
+No start delay and no tail replay; `duration` defaults to
+`crossfade_seconds`, `curve` to `fade_curve`. The fade window ends at the
+outgoing track's audible tail, found with BS.1770-style gating (absolute
+−70 dBFS, then −10 LU below the track's own gated loudness), so quiet
+tracks and encoder-noise decays fade exactly where they stop being audible —
+this replaces the level-aware `smart_crossfade` operator, which was removed.
 
 ## `add({a, b}, {weights = {0.5, 1.0}})`
 
