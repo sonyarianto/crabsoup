@@ -208,7 +208,9 @@ leak the next track across it (and the abandoned child would freeze
 mid-fade). Instead, wrap the whole rotation in one top-level crossfade:
 it blends the outgoing track's tail with the incoming track's head at
 every label change (song->song, song->jingle, jingle->jingle), with no
-start delay and no repeated audio:
+start delay and no repeated audio. The rotation itself hands over at the
+exact track boundary — the next track's first buffer is held until the
+schedule rotates back, so nothing bleeds across the handover:
 
 ```
 songs = playlist({directory = "./media", shuffle = true, crossfade = false})

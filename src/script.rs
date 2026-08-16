@@ -1290,10 +1290,12 @@ enum ScheduleKind {
 /// `label` changes, or it exhausts). With `track_sensitive = false` the
 /// schedule is re-evaluated on every pull and children are cut abruptly.
 ///
-/// Boundary detection is sample-accurate enough for scheduling: a label
-/// change is noticed on the pull that returns the new track's first buffer,
-/// so the re-pick happens on the following pull (at most one buffer of the
-/// next track comes from the old child).
+/// Boundaries are sample-exact: the pull that returns a new track's first
+/// buffer (label change) hands over immediately, holding that buffer so
+/// the track plays complete when the schedule rotates back to the child
+/// (never heard as a fragment ahead of the handover, never resumed
+/// mid-track). A boundary inside a multi-track turn keeps the child
+/// current. A `skip()` re-picks at the next pull.
 struct ScheduleSource {
     children: Vec<LuaSource>,
     kind: ScheduleKind,
@@ -1304,6 +1306,13 @@ struct ScheduleSource {
     /// treating it as a boundary.
     primed: bool,
     last_label: Option<String>,
+    /// First buffer of the child we rotated away from at the last track
+    /// boundary (the child had already advanced one buffer into its next
+    /// track). Returned when we rotate back to that child so the track
+    /// plays complete and the switch is sample-exact instead of one pull
+    /// late. Stores the owning child index, the held samples and their
+    /// label.
+    staged: Option<(usize, Vec<f32>, Option<String>)>,
     track_sensitive: bool,
     /// Injectable wall clock for tests.
     now: Box<dyn Fn() -> LocalTime + Send + Sync>,
@@ -1318,6 +1327,7 @@ impl ScheduleSource {
             pending: true,
             primed: false,
             last_label: None,
+            staged: None,
             track_sensitive,
             now: Box::new(LocalTime::now),
         }
@@ -1404,6 +1414,18 @@ impl AudioSource for ScheduleSource {
     fn next_buffer(&mut self, buffer: &mut [f32]) -> usize {
         self.choose();
         for _ in 0..self.children.len() {
+            // Back on the child whose first buffer we held at a boundary:
+            // play the held buffer before resuming the child mid-track so
+            // every track plays complete.
+            if let Some((idx, _, _)) = &self.staged
+                && *idx == self.current
+            {
+                let (_, held, held_label) = self.staged.take().unwrap();
+                buffer[..held.len()].copy_from_slice(&held);
+                self.last_label = held_label;
+                self.primed = true;
+                return held.len();
+            }
             if !self.track_sensitive {
                 // Immediate scheduling: switch children mid-track as soon as
                 // the predicates change.
@@ -1430,9 +1452,38 @@ impl AudioSource for ScheduleSource {
             };
             if n > 0 {
                 if ended {
-                    // A new track started inside this buffer; re-pick at the
-                    // next pull so the next buffer comes from the right child.
-                    self.pending = true;
+                    // Exact boundary: the child advanced to its next track
+                    // inside this buffer. If the schedule hands over to a
+                    // different child, hold this buffer (the new track's
+                    // first frames) and return the buffer we held at the
+                    // previous handover — the track we rotated away from
+                    // then — so the switch is sample-exact and no track is
+                    // ever cut or repeated.
+                    let before = self.current;
+                    let boundary_label = self.last_label.clone();
+                    self.select();
+                    let switched = self.current != before;
+                    self.pending = false;
+                    if switched {
+                        let held = self.staged.replace((
+                            before,
+                            buffer[..n].to_vec(),
+                            boundary_label,
+                        ));
+                        if let Some((idx, held_buf, held_label)) = held
+                            && idx == self.current
+                        {
+                            buffer[..held_buf.len()].copy_from_slice(&held_buf);
+                            self.last_label = held_label;
+                            self.primed = true;
+                            return held_buf.len();
+                        }
+                        // No held buffer for the new child: pull it now so
+                        // the handover happens in this pull.
+                        continue;
+                    }
+                    // The child stays current (a weight of >1 keeps it for
+                    // more tracks): its next track plays straight through.
                 }
                 return n;
             }
@@ -5160,19 +5211,15 @@ mod tests {
              j1 = j1.display(), j2 = j2.display()))
         .expect("script runs");
         let mut root = res.preview.expect("preview source");
-        // The rotate switches at label changes, so each child plays its
-        // full tracks plus the first buffer of the next one before handing
-        // over; the interrupted tracks resume (frozen mid-track) when the
-        // child is picked again. All four tracks play in full, so the total
-        // is the sum of the durations.
+        // rotate switches at the exact track boundary: the next track's
+        // first buffer is held and replayed when the child is picked again,
+        // so every track plays complete, alternating song -> jingle -> song.
         let (seq, total) = drain_labels_and_frames(&mut *root);
         assert_eq!(
             seq,
             vec![
                 stem(&s1),
-                stem(&s2),
                 stem(&j1),
-                stem(&j2),
                 stem(&s2),
                 stem(&j2)
             ]
@@ -6098,13 +6145,16 @@ mod tests {
         assert_eq!(src.next_buffer(&mut buf), fpb);
         assert!(buf.iter().all(|&s| s == 0.25));
         // After the window closes, A's next track boundary hands over to B.
+        // The switch is exact: the handover happens inside the boundary
+        // pull itself (the fake's label leads the content by one pull, so
+        // the first B audio is already labeled b2).
         clock.lock().unwrap().minutes = 18 * 60;
         for _ in 0..3 {
             src.next_buffer(&mut buf);
         }
         assert!(src.next_buffer(&mut buf) > 0);
         assert!(buf.iter().all(|&s| s == 0.75), "expected the default child");
-        assert_eq!(src.label().as_deref(), Some("b1"));
+        assert_eq!(src.label().as_deref(), Some("b2"));
     }
 
     #[test]
@@ -6137,15 +6187,17 @@ mod tests {
         fake_clock(&mut src, clock.clone());
 
         let mut buf = vec![0f32; fpb];
-        // Two pulls inside the window, then the window closes mid-track.
-        src.next_buffer(&mut buf);
+        // One pull inside the window, then the window closes mid-track.
         src.next_buffer(&mut buf);
         clock.lock().unwrap().minutes = 10 * 60 + 1;
-        // The third track still plays out from A (0.25) despite the window
-        // having closed — track-sensitive.
+        // The next pull still plays A (0.25) despite the window having
+        // closed — track-sensitive.
         src.next_buffer(&mut buf);
         assert!(buf.iter().all(|&s| s == 0.25));
-        // Boundary after A's track (3 pulls = 300 frames = one track): B now.
+        // A's track boundary (300 frames = one track) hands over to B
+        // exactly inside the boundary pull; a switch never returns to A,
+        // so the held first buffer of A's next track stays unplayed.
+        src.next_buffer(&mut buf);
         src.next_buffer(&mut buf);
         assert!(buf.iter().all(|&s| s == 0.75));
     }
@@ -6209,11 +6261,13 @@ mod tests {
             src.next_buffer(&mut buf);
             seen.push(buf[0]);
         }
-        // One track = 300 frames = 3 pulls: A, A, A, B, B, B, A, ...
+        // One track = 300 frames = 3 pulls, rotated exactly at each track
+        // boundary (the fake's label leads the content by one pull, so the
+        // held first buffer of the handed-over track replays on return).
         assert_eq!(
             seen,
             vec![
-                0.25, 0.25, 0.25, 0.75, 0.75, 0.75, 0.25, 0.25, 0.25, 0.75, 0.75, 0.75
+                0.25, 0.25, 0.75, 0.75, 0.25, 0.25, 0.25, 0.75, 0.75, 0.75, 0.25, 0.25
             ]
         );
     }
@@ -6239,12 +6293,14 @@ mod tests {
             src.next_buffer(&mut buf);
             seen.push(buf[0]);
         }
-        // 1x A, 2x B: A A A, B B B, B B B, A A A, B B B, B B B, A A A.
+        // 1x A, 2x B: the track boundary inside B's second track keeps B
+        // current (no handover, no staging), so A's held first buffer
+        // survives until B's turn ends.
         assert_eq!(
             seen,
             vec![
-                0.25, 0.25, 0.25, 0.75, 0.75, 0.75, 0.75, 0.75, 0.75, 0.25, 0.25, 0.25, 0.75, 0.75,
-                0.75,
+                0.25, 0.25, 0.75, 0.75, 0.75, 0.75, 0.75, 0.25, 0.25, 0.25, 0.75, 0.75, 0.75,
+                0.75, 0.75,
             ]
         );
     }
@@ -6437,4 +6493,5 @@ mod tests {
         )
         .expect("script runs");
     }
+
 }

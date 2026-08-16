@@ -20,7 +20,19 @@
       curve dip) and script tests (gapless two-tone sequence, plain
       playlist labels+total, and the full rotate-composition recipe with
       crossfade on top). The `crabsoup.lua` and example configs use the
-      recipe; docs (README, ARCHITECTURE, dsp.md) updated.
+      recipe; docs (README, ARCHITECTURE, dsp.md) updated. Soak-test
+      follow-up: `rotate`/`switch` now hand over at the *exact* track
+      boundary — the boundary pull's buffer (the new track's first frames)
+      is held and replays when the schedule rotates back, so no fragment
+      of the next track is heard ahead of a jingle and tracks never
+      resume mid-track; a boundary inside a multi-track turn (weight > 1)
+      keeps the child current. Without this, the wrapper saw two label
+      changes ~0.1 s apart at every handover (the next track's first
+      buffer then the jingle), starting a fresh fade each time — the
+      "crossfade not felt" and "small segment repeat at the jingle end"
+      the soak test heard. Acceptance: `rotate`/`switch` schedule tests
+      and the full rotate-composition recipe updated for exact sequences
+      (342 tests pass).
 - [x] **G3.8 — `append`/`prepend` followers (`annotated`)**: the new
       `annotated(src, {append = "stinger.mp3", prepend = "intro.mp3"})`
       operator wraps any source and plays the followers after/before every

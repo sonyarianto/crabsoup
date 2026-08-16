@@ -204,6 +204,15 @@ One engine thread plus one thread per output:
   sequential bridge over the `Playlist` provider with no preload — for
   exactly this composition; the recipe is
   `crossfade(rotate({songs, jingles}, {weights = {3, 1}}))`.
+- `ScheduleSource` (`rotate`/`switch` in `src/script.rs`) switches
+  children at the *exact* track boundary: when a child's label changes
+  mid-pull (the next track started inside that buffer), the buffer is
+  held and the next child is selected immediately; the held first buffer
+  plays when the schedule rotates back to that child, so every track
+  plays complete — no first-buffer fragment ahead of the handover, no
+  mid-track resume. A boundary inside a multi-track turn (weight > 1)
+  keeps the child current and plays straight through. A `skip()` still
+  re-picks at the next pull.
 - The HTTP client is hand-rolled on a `Transport` enum — a plain
   `TcpStream` for `http://`, a `rustls::StreamOwned` (ring provider,
   webpki-roots Mozilla store) for `https://` — and the status/header/chunked

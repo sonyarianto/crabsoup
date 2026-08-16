@@ -14,10 +14,10 @@
 //! The output is a passthrough otherwise — the ring is written continuously
 //! but only *read* during a fade — so the stream is never delayed, never
 //! starts with silence, and never replays a track: the tail is heard only
-//! while the next track fades in over it. The one approximation: a child
-//! that changes label *mid-buffer* (a `queue` advancing inside a single
-//! pull) starts the fade at the buffer start, briefly double-voicing the
-//! old track's final frames.
+//! while the next track fades in over it. A `rotate`/`switch` handover is
+//! sample-exact (the scheduler holds the new track's first buffer and
+//! switches at the boundary), so every label change the wrapper sees is a
+//! real track change with a clean head/tail split.
 
 use crate::source::AudioSource;
 
