@@ -33,6 +33,7 @@ features:
 A station is a Lua script. This is the whole thing:
 
 ```lua
+-- crabsoup.lua
 set("sample_rate", 44100)
 set("channels", 2)
 set("crossfade_seconds", 3.0)    -- track-to-track overlap

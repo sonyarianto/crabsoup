@@ -18,6 +18,7 @@ OCaml. The script language will feel familiar if you know Liquidsoap.
 ## What it looks like
 
 ```lua
+-- crabsoup.lua
 set("sample_rate", 44100)
 set("channels", 2)
 set("crossfade_seconds", 3.0)    -- track-to-track overlap
