@@ -933,7 +933,9 @@ mod tests {
     // video subscription; clippy flags the literal.
     #![allow(clippy::unit_arg, clippy::unused_unit)]
     use super::*;
+    use std::path::Path;
     use std::sync::mpsc;
+    #[cfg(feature = "video")]
     use std::time::Duration;
 
     #[cfg(not(feature = "video"))]
@@ -970,6 +972,7 @@ mod tests {
     /// Like [`sine_frames`] but paced at real time — the video-tap consumer
     /// drains on the audio clock, so a burst would overflow the tap's
     /// drop-oldest channel and lose video frames.
+    #[cfg(feature = "video")]
     fn paced_sine_frames(tx: &mpsc::SyncSender<Arc<AudioFrame>>, seconds: f64) {
         let rate = 44_100.0;
         let mut phase = 0.0;
@@ -994,7 +997,7 @@ mod tests {
     }
 
     /// Sequence numbers referenced by a media playlist, in order.
-    fn playlist_seqs(dir: &PathBuf) -> Vec<u64> {
+    fn playlist_seqs(dir: &Path) -> Vec<u64> {
         fs::read_to_string(dir.join(PLAYLIST))
             .unwrap()
             .lines()
