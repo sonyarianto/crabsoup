@@ -612,6 +612,20 @@ Video is a parallel side-channel to the PCM bus, compiled out by default
 (`video = ["dep:ffmpeg-next"]`; all FFmpeg `unsafe` stays inside
 `ffmpeg-next` — no raw FFI in the tree).
 
+**Build/runtime requirement (security floor):** the `video` feature links
+whatever `libav*` is installed on the build machine (ffmpeg-next pulls them
+via pkg-config), and `video.video` decodes whatever the container probe
+selects — there is no codec restriction. FFmpeg **≥ 8.1.2** is therefore a
+stated requirement: CVE-2026-8461 ("PixelSmash", CVSS 8.8, heap
+out-of-bounds write in the MagicYUV decoder — a crafted MagicYUV video fed
+to `video.video` triggers it) plus the same-window MACE6 / RASC /
+vf_hqdn3d decoder CVEs are fixed in 8.1.2. `build.rs` checks
+`pkg-config --modversion libavcodec` when the `video` feature is enabled
+and fails below FFmpeg 8 (libavcodec major < 62). pkg-config cannot
+distinguish patch releases, so ≥ 8.1.2 is the floor regardless of what the
+check reports. Note Debian/Ubuntu stable ships FFmpeg 7.x — backports or
+the FFmpeg release build are needed for the `video` feature.
+
 - **Carrier**: `VideoFrame` (YUV420P planes + `pts_us`) rides its own
   fan-out `VideoTap` (`src/video/tap.rs`, bounded `sync_channel(4)`,
   `try_send` drop-oldest). The audio hot path never sees it.

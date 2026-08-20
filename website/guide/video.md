@@ -12,7 +12,15 @@ publishes it to an RTMP server such as nginx-rtmp. `output.mp4({video =
 ...})` muxes them into a seekable MP4 recording.
 
 Video is compiled in with the `video` cargo feature and needs the FFmpeg
-dev packages at build time (they are pulled via pkg-config):
+dev packages at build time (they are pulled via pkg-config). **FFmpeg
+≥ 8.1.2 is required** — the build fails on older versions. The floor is a
+security boundary, not a convenience: `video.video` decodes whatever
+FFmpeg's container probing selects for a file, and FFmpeg < 8.1.2 carries
+CVE-2026-8461 ("PixelSmash", a heap out-of-bounds write in the MagicYUV
+decoder) plus the same-window MACE6 / RASC / vf_hqdn3d decoder CVEs.
+`build.rs` checks `pkg-config --modversion libavcodec` (FFmpeg 8.x =
+libavcodec 62.x) and fails below it. Debian/Ubuntu stable ships FFmpeg 7.x
+— use backports or the FFmpeg release build:
 
 ```sh
 sudo apt install libavcodec-dev libavformat-dev libavutil-dev libswscale-dev

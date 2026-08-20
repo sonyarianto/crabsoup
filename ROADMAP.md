@@ -935,6 +935,13 @@ approximates the operator surface, not the language); LADSPA plugin hosting
 (one puller + fan-out first; revisit only if drift between outputs matters in
 practice).
 
+**Backlog — benchmark vs Liquidsoap + a formal soak harness (recommended,
+not urgent):** informal soak runs have driven real fixes (sample-exact
+boundary handover, delayed-ring tail fix, Icecast handshake timing), but
+there is still no repeatable head-to-head benchmark against real
+Liquidsoap and no formal multi-hour/multi-day soak harness anyone can
+re-run. Worth scoping as its own phase; not blocking anything.
+
 ### Part H — video foundation (Phase 1, Q4 2026 – Q1 2027)
 
 **Status: planned — this is the live plan.** From the "Closing the Gap"
@@ -948,6 +955,20 @@ to a dedicated `src/video/ffi.rs` (and any encoder FFI next to
 `src/output/encoder.rs`), per the existing no-unsafe-outside-FFI rule. Hot
 paths stay allocation-free per the performance principles; every new module
 ships its inline tests and a `benches/` row.
+
+**Security floor + decode-surface decision (2026 session):** the `video`
+feature links whatever system `libav*` is installed, and `video.video`
+decodes whatever the container probe selects — so FFmpeg ≥ 8.1.2 is now a
+stated build/runtime requirement (CVE-2026-8461 "PixelSmash", MagicYUV
+heap OOB write, plus the same-window MACE6/RASC/vf_hqdn3d decoder CVEs,
+fixed in 8.1.2), enforced by `build.rs` (`pkg-config --modversion
+libavcodec` < 62 fails the build when the feature is enabled; docs in
+ARCHITECTURE.md and `website/guide/video.md`). **Decode surface:** keep
+the full decoder surface — a codec allowlist in `VideoDecoder::open`
+(checking `stream.parameters().id()` and failing fast) is practical via
+ffmpeg-next's API, but would reject legitimately playable files (VP9,
+MPEG-2, ProRes, …), and the ≥ 8.1.2 floor already bounds decoder CVEs.
+Revisit only if a decoder CVE shows up the floor does not cover.
 
 - [x] **H1 — video file input + frame carrier.** **Decision (locked by
       PoC): parallel `VideoFrame` side-channel, not an extended
@@ -1164,8 +1185,8 @@ rows recorded against the baseline convention.
 
 ### Part I — advanced audio & effects (Phase 2, Q1 – Q2 2027)
 
-**Status: I1–I7 shipped** (see their rows below; I8 onwards still planned).
-The product plan's Phase 2. Effects stay inline in the
+**Status: I1–I7 shipped** (see their rows below; I8 still planned; I9
+demand-gated — see the note in the I7 row). The product plan's Phase 2. Effects stay inline in the
 pull chain (one thread per output, allocation-free hot paths), each landing
 with inline tests and a bench row; FFI-backed DSP (SoundTouch, aubio) gets
 its own confined module per the Part H convention note.
@@ -1282,7 +1303,12 @@ its own confined module per the Part H convention note.
       errors). Bench: `vocalremover/strength1` ~93 µs per 92.9 ms buffer
       (four biquads — half the 4-band EQ chain, as expected).
 - [ ] **I7 — BPM & key detection** (`aubio-rs` or `libvamp`), **I8 — speech
-      synthesis** (`espeak-ng` hook), **I9 — MIDI control input**.
+      synthesis** (`espeak-ng` hook), **I9 — MIDI control input** —
+      demand-gated: a different I/O domain from everything else here
+      (physical control-surface hardware for live/DJ performance control,
+      closer to a DAW than a broadcast automation engine), never confirmed
+      as wanted, so it is not built until explicitly requested — the
+      video-subsystem lesson: don't ship it first and confirm after.
       **Shipped pure-Rust** (`src/analysis.rs`; aubio/libvamp are absent
       from this machine, so — following the I1 benchmark-first precedent —
       no FFI). BPM: Hann-windowed spectral-flux onset envelope at 512-hop
@@ -1307,21 +1333,36 @@ its own confined module per the Part H convention note.
 
 ### Part J — protocols & integrations (Phase 3, Q2 – Q3 2027)
 
-**Status: planned.** The product plan's Phase 3.
+**Status: J3 shipped (see Done); J5/J7 still planned. J1/J2/J4/J8 are
+demand-gated — documented but not built speculatively: they are listed
+without any stated need behind them, the same shape C4 (Shoutcast)
+originally had before it was deferred to "only if a concrete need shows
+up". J6 was rescoped (below) — crabsoup gains no DB client.**
 
 - [ ] **J1 — SRT output** (`srt-sys` or pure-Rust), **J2 — UDP/RTP**
-      (AAC/MP3 over UDP).
+      (AAC/MP3 over UDP). **Demand-gated:** no concrete need stated; do
+      not build speculatively — deferred until a need shows up (the
+      C4/Shoutcast framing).
 - [x] **J3 — WebSocket control** channel alongside the telnet/HTTP control
       ports: landed as `server.telnet({ws_port = N})` (see Done section).
-      **J4 — MQTT** metadata/status publish (still open).
+- [ ] **J4 — MQTT** metadata/status publish. **Demand-gated:** same as
+      J1/J2 — no stated need; deferred until one shows up.
 - [ ] **J5 — JACK / ALSA / PulseAudio** dedicated I/O (cpal covers basics;
       JACK adds multi-client, Pulse adds system integration).
-- [ ] **J6 — database webhooks** (`sqlx`, PostgreSQL/MySQL metadata logging).
+- [ ] **J6 — webhook-payload completeness** (was: "database webhooks").
+      No DB client inside crabsoup: a database is a control-plane concern,
+      and Crabsoup↔Crabcast dependencies stay one-directional — a control
+      plane logs to its own DB from its own webhook receiver, crabsoup
+      never grows SQL awareness. `http_post` (shipped) already covers
+      "notify an external system"; the scoped work is keeping its payload
+      carrying everything such a receiver would need to log to its own DB.
 - [ ] **J7 — MusicBrainz / Last.fm / RadioDNS** enrichment + scrobbling. The
       webhook plumbing already exists (`on_metadata`, `map_metadata`,
       `http_post`, harbor `extra_passwords`) — the gap is the provider
       integrations, not the hooks.
 - [ ] **J8 — SNMP monitoring** agent for enterprise observability.
+      **Demand-gated:** same as J1/J2/J4 — no stated need; deferred until
+      one shows up.
 
 ### Part K — ecosystem & maturity (Phase 4, Q3 2027 – v1.0)
 
