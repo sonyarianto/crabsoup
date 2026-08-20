@@ -93,6 +93,68 @@ the harbor: its thread resamples into a reusable scratch and pushes into a
 ring the device callback drains (silence on underrun). Device and stream open
 at startup, so a missing device fails before the tap pulls.
 
+## `output.hls({directory, segment_seconds, retention, ...}, src)`
+
+Segments the source into an HLS (HTTP Live Streaming) playlist — the
+"station on any device" output: any HLS player (iOS, Android, VLC, hls.js)
+can play it over plain HTTP. Segments are AAC in MPEG-TS, rotated on
+`segment_seconds` (default 5 s) with a sliding window of `retention`
+(default 12) completed segments.
+
+```lua
+output.hls({directory = "/var/www/hls",
+            segment_seconds = 5,
+            retention = 12}, root)
+```
+
+- Each completed `seg-000000.ts` … is appended to `playlist.m3u8`
+  (`#EXT-X-VERSION:3`, sliding `MEDIA-SEQUENCE`); on graceful shutdown the
+  final segment closes and the list ends with `#EXT-X-ENDLIST`.
+- `segment_name` (default `"seg-{n}.ts"`) is a template — `{n}` is the
+  zero-padded sequence number, `{t}` the unix seconds of the segment's
+  start. Timestamped names: `segment_name = "seg-{t}-{n}.ts"`.
+- `persist_at = "/var/lib/crabsoup/hls-state.json"` makes runs resumable:
+  the next segment counter and retained window are written on every
+  rotation, so killing crabsoup mid-segment and restarting continues the
+  playlist (no renumbering, no gap/drift) instead of clearing the
+  directory. Delete the state file to force a fresh start.
+- `fallible = true` keeps the engine alive with silence when the source
+  exhausts (the root is wrapped in `fallback([root, blank()])`), so the
+  playlist stays live instead of ending — the "station never goes off air"
+  switch. Applies to every output sharing the root.
+- Serve the directory with any static file server (nginx, caddy,
+  `python3 -m http.server`) — HLS needs no server-side magic.
+
+### Multi-rendition ABR (`renditions`)
+
+Fan the one tap into several AAC encodes, each in its own subdirectory,
+tied together by a variant master playlist — the 64/128/320 set a live
+station serves so clients pick the rendition their bandwidth can carry:
+
+```lua
+output.hls({
+    directory = "/var/www/hls",
+    segment_seconds = 5,
+    renditions = {
+        {bitrate = 64000,  name = "64k"},
+        {bitrate = 128000, name = "128k"},
+        {bitrate = 320000, name = "320k"},
+    },
+}, root)
+```
+
+- Each rendition gets `<directory>/<name>/` with its own `playlist.m3u8`
+  and segments; `index.m3u8` lists one `#EXT-X-STREAM-INF` per rendition
+  (BANDWIDTH = bitrate + 10 % container overhead, CODECS `mp4a.40.2`,
+  NAME = the rendition name). Point clients at `index.m3u8`. A rendition
+  without an explicit `name` defaults to `<kbps>k`.
+- Add `video_bitrate` (and optionally `width`/`height`) for a rendition
+  with its own H.264 encode — see the [video guide](/guide/video).
+
+Video sources (`video = marker`) and RTMP publishing are covered in the
+[video guide](/guide/video); `output.rtmp`/`output.mp4` are documented
+there too.
+
 ## Live DJ harbor vs. output
 
 The `input.harbor` listener is the *input* side of a live DJ; the fade in and
