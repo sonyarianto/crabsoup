@@ -15,6 +15,45 @@ Compressor: `compress(src, {threshold = -12, ratio = 2})`.
 
 AGC: `normalize(src, {target = -13})`.
 
+## `limiter(source, opts)`
+
+Peak limiter — a ceiling the signal never exceeds, approached through a
+smoothed peak envelope so the reduction is inaudible and recovers at
+`release`:
+
+```lua
+limiter(src, {threshold = 0.0, attack = 0.005, release = 0.25})
+```
+
+`threshold` is in dB (default 0.0 — nothing above full scale). With
+`attack = 0.0` the envelope is sample-accurate: a true brickwall ceiling.
+Put it last in the chain to protect the encoder from overs.
+
+## `strip_blank(source, opts)` / `skip_blank(source, opts)`
+
+Automatic silence handling at track starts (Liquidsoap `strip_blank`,
+`skip_blank`). Both watch track boundaries — label change, or audio
+resuming after silence — and treat a sample below `threshold` dB
+(default -40) as silence:
+
+```lua
+strip_blank(src, {threshold = -40, max_blank = 30})  -- drop each track's leading silence
+skip_blank(src,  {threshold = -40, length = 10})     -- skip tracks that start silent
+```
+
+- `strip_blank` removes the leading silence of each track from the
+  timeline (the dropped seconds are never played, so the track's first
+  sound arrives early). It gives up after `max_blank` seconds so an
+  all-blank track is passed through rather than swallowed.
+- `skip_blank` probes the first `length` seconds of each track in a
+  buffer: if any signal appears within the window the track plays whole
+  (its lead-in included); if the window is pure silence the track is
+  discarded and the next one starts. The probe buffer is capped at
+  `length` seconds, so a large `length` costs memory.
+
+Use `strip_blank` to clean short uploads and jingles; use `skip_blank` to
+drop requests that are dead air up front.
+
 ## `pitch(source, opts)` / `stretch(source, opts)`
 
 Time/pitch effects (Part I, pure-Rust WSOLA — no FFI): `pitch` shifts
@@ -143,6 +182,27 @@ output — the original is kept on nil/error/timeout:
 ```lua
 map_metadata(src, function(m) return {title = "Artist - " .. m.title} end)
 ```
+
+## `insert_metadata(src)`
+
+Runtime metadata override: the returned proxy *is* a source (use it
+directly anywhere a source is expected, or call it as `md()`), and its
+`insert` method sets the current track's title mid-playback — the classic
+"web panel wrote a now-playing title" primitive:
+
+```lua
+md = insert_metadata(src)
+output.icecast({mount = "/live.opus", format = "opus"}, md)
+
+-- later, from a telnet command or webhook:
+md.insert({title = "Artist - Track"})
+```
+
+The override reports as the track's label (Icecast titles, `on_metadata`
+callbacks) until the next track starts, then clears. `insert` returns
+`true` and requires a `title` field; without one it raises an error. The
+label override is the *output* label — `md.insert` does not rewrite the
+child's own label, so track-boundary logic is unaffected.
 
 ## `on_metadata(src, fn)` / `on_track(src, fn)` / `on_next_metadata(src, fn)`
 

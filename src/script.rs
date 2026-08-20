@@ -42,7 +42,7 @@ use crate::config::{
 };
 #[cfg(feature = "video")]
 use crate::config::{collect_images, collect_video};
-use crate::engine::effects::{Agc, Amplify, Compressor, Echo, EffectSource};
+use crate::engine::effects::{db_to_gain, Agc, Amplify, Compressor, Echo, EffectSource, Limiter};
 use crate::engine::eq::{Eq, EqBand, EqType};
 use crate::engine::mixer::CrossfadeMixer;
 use crate::engine::pitch::{PitchMode, PitchSource};
@@ -579,6 +579,330 @@ impl AudioSource for OnNextMetadataSource {
     }
 }
 
+/// `insert_metadata` (Liquidsoap): runtime label override. The Lua side
+/// writes a shared slot via the proxy's `insert({title = ...})`; this wrapper
+/// reports the override as its label and clears it when the child's track
+/// changes (the next pull sees a different child label).
+struct InsertMetadataSource {
+    child: Box<dyn AudioSource>,
+    override_label: Arc<Mutex<Option<String>>>,
+    last_child_label: Option<String>,
+}
+
+impl InsertMetadataSource {
+    fn new(child: Box<dyn AudioSource>, override_label: Arc<Mutex<Option<String>>>) -> Self {
+        Self {
+            child,
+            override_label,
+            last_child_label: None,
+        }
+    }
+}
+
+impl AudioSource for InsertMetadataSource {
+    fn next_buffer(&mut self, buffer: &mut [f32]) -> usize {
+        let n = self.child.next_buffer(buffer);
+        let label = self.child.label();
+        if label != self.last_child_label {
+            *self.override_label.lock().unwrap() = None;
+            self.last_child_label = label;
+        }
+        n
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.child.is_exhausted()
+    }
+
+    fn remaining_seconds(&self) -> Option<f64> {
+        self.child.remaining_seconds()
+    }
+
+    fn label(&self) -> Option<String> {
+        match self.override_label.lock().unwrap().as_ref() {
+            Some(s) => Some(s.clone()),
+            None => self.child.label(),
+        }
+    }
+
+    fn next_label(&self) -> Option<String> {
+        self.child.next_label()
+    }
+
+    fn replaygain_db(&self) -> Option<f32> {
+        self.child.replaygain_db()
+    }
+
+    fn crossfade_overrides(&self) -> Option<crate::source::CrossfadeOverrides> {
+        self.child.crossfade_overrides()
+    }
+
+    fn skip(&mut self) {
+        self.child.skip();
+    }
+}
+
+/// `strip_blank` (Liquidsoap): drops the leading silence of each track. While
+/// stripping, the silence is consumed and the caller is told nothing was
+/// produced — the tap does not advance its clock, so the dead air vanishes
+/// from the timeline. Stripping gives up after `max_blank` seconds so an
+/// all-blank track is passed through rather than swallowed forever.
+struct StripBlankSource {
+    child: Box<dyn AudioSource>,
+    threshold: f32,
+    max_blank_frames: usize,
+    channels: usize,
+    last_label: Option<String>,
+    was_silent: bool,
+    /// False until the first audio has been pulled: the first track has no
+    /// label change to announce it, so its start must be treated as one.
+    started: bool,
+    stripping: bool,
+    stripped_frames: usize,
+}
+
+impl StripBlankSource {
+    fn new(
+        child: Box<dyn AudioSource>,
+        threshold: f32,
+        max_blank_seconds: f64,
+        sample_rate: u32,
+        channels: usize,
+    ) -> Self {
+        Self {
+            child,
+            threshold,
+            max_blank_frames: (max_blank_seconds * sample_rate as f64).max(1.0) as usize,
+            channels,
+            last_label: None,
+            was_silent: false,
+            started: false,
+            stripping: false,
+            stripped_frames: 0,
+        }
+    }
+}
+
+impl AudioSource for StripBlankSource {
+    fn next_buffer(&mut self, buffer: &mut [f32]) -> usize {
+        let n = self.child.next_buffer(buffer);
+        if n == 0 {
+            if !self.child.is_exhausted() {
+                self.was_silent = true;
+            }
+            return 0;
+        }
+        if !self.started || self.was_silent || self.last_label != self.child.label() {
+            self.stripping = true;
+            self.stripped_frames = 0;
+        }
+        self.started = true;
+        self.last_label = self.child.label();
+        self.was_silent = false;
+        if !self.stripping {
+            return n;
+        }
+        match buffer[..n].iter().position(|s| s.abs() >= self.threshold) {
+            Some(i) => {
+                self.stripping = false;
+                buffer.copy_within(i..n, 0);
+                n - i
+            }
+            None => {
+                self.stripped_frames += n / self.channels;
+                if self.stripped_frames >= self.max_blank_frames {
+                    self.stripping = false;
+                    n
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.child.is_exhausted()
+    }
+
+    fn remaining_seconds(&self) -> Option<f64> {
+        self.child.remaining_seconds()
+    }
+
+    fn label(&self) -> Option<String> {
+        self.child.label()
+    }
+
+    fn replaygain_db(&self) -> Option<f32> {
+        self.child.replaygain_db()
+    }
+
+    fn crossfade_overrides(&self) -> Option<crate::source::CrossfadeOverrides> {
+        self.child.crossfade_overrides()
+    }
+
+    fn skip(&mut self) {
+        self.child.skip();
+    }
+}
+
+/// `skip_blank` (Liquidsoap): skips tracks that start with `length` seconds
+/// of silence. The first `length` seconds of each track are probed in a
+/// buffer: if any sample rises above the threshold the track is kept (the
+/// buffered lead-in is replayed first, so the timeline is intact); if the
+/// whole window is silent the track is discarded and the child advanced. A
+/// blank child (pause between sources) does not count toward the window.
+struct SkipBlankSource {
+    child: Box<dyn AudioSource>,
+    threshold: f32,
+    length_frames: usize,
+    channels: usize,
+    last_label: Option<String>,
+    was_silent: bool,
+    /// False until the first audio has been pulled: the first track has no
+    /// label change to announce it, so its start must be treated as one.
+    started: bool,
+    detecting: bool,
+    buffered: Vec<f32>,
+    observed_frames: usize,
+    pending: Vec<f32>,
+}
+
+impl SkipBlankSource {
+    fn new(
+        child: Box<dyn AudioSource>,
+        threshold: f32,
+        length_seconds: f64,
+        sample_rate: u32,
+        channels: usize,
+    ) -> Self {
+        Self {
+            child,
+            threshold,
+            length_frames: (length_seconds * sample_rate as f64).max(1.0) as usize,
+            channels,
+            last_label: None,
+            was_silent: false,
+            started: false,
+            detecting: false,
+            buffered: Vec::new(),
+            observed_frames: 0,
+            pending: Vec::new(),
+        }
+    }
+
+    /// Runs one buffer through the blank-detection window. Returns the
+    /// frames to emit: 0 while the start is still being probed, or the
+    /// buffered lead-in plus the rest of this buffer once signal appears.
+    fn probe(&mut self, buffer: &mut [f32], n: usize) -> usize {
+        self.buffered.extend_from_slice(&buffer[..n]);
+        self.observed_frames += n / self.channels;
+        if self.buffered.iter().any(|s| s.abs() >= self.threshold) {
+            self.detecting = false;
+            self.pending = std::mem::take(&mut self.buffered);
+            let take = buffer.len().min(self.pending.len());
+            buffer[..take].copy_from_slice(&self.pending[..take]);
+            self.pending.drain(..take);
+            take
+        } else if self.observed_frames >= self.length_frames {
+            self.buffered.clear();
+            self.observed_frames = 0;
+            self.child.skip();
+            0
+        } else {
+            0
+        }
+    }
+}
+
+impl AudioSource for SkipBlankSource {
+    fn next_buffer(&mut self, buffer: &mut [f32]) -> usize {
+        if !self.pending.is_empty() {
+            let take = buffer.len().min(self.pending.len());
+            buffer[..take].copy_from_slice(&self.pending[..take]);
+            self.pending.drain(..take);
+            return take;
+        }
+        let n = self.child.next_buffer(buffer);
+        if n == 0 {
+            if !self.child.is_exhausted() {
+                self.was_silent = true;
+            }
+            return 0;
+        }
+        let label = self.child.label();
+        if self.detecting {
+            if self.last_label != label {
+                // The probed track ended before the window closed: it was
+                // short and silent, so it is kept — emit what was probed —
+                // then probe the new track from its first buffer.
+                let ended = std::mem::take(&mut self.buffered);
+                self.observed_frames = 0;
+                self.buffered.extend_from_slice(&buffer[..n]);
+                self.observed_frames += n / self.channels;
+                self.last_label = label;
+                self.pending.extend_from_slice(&ended);
+                if self.buffered.iter().any(|s| s.abs() >= self.threshold) {
+                    self.detecting = false;
+                    let lead = std::mem::take(&mut self.buffered);
+                    self.pending.extend_from_slice(&lead);
+                } else if self.observed_frames >= self.length_frames {
+                    self.buffered.clear();
+                    self.observed_frames = 0;
+                    self.child.skip();
+                }
+                let take = buffer.len().min(self.pending.len());
+                buffer[..take].copy_from_slice(&self.pending[..take]);
+                self.pending.drain(..take);
+                take
+            } else {
+                self.last_label = label;
+                self.probe(buffer, n)
+            }
+        } else {
+            let new_track = !self.started || self.was_silent || self.last_label != label;
+            self.started = true;
+            self.last_label = label;
+            self.was_silent = false;
+            if new_track {
+                self.detecting = true;
+                self.buffered.clear();
+                self.observed_frames = 0;
+                self.probe(buffer, n)
+            } else {
+                n
+            }
+        }
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.child.is_exhausted()
+    }
+
+    fn remaining_seconds(&self) -> Option<f64> {
+        self.child.remaining_seconds()
+    }
+
+    fn label(&self) -> Option<String> {
+        self.child.label()
+    }
+
+    fn next_label(&self) -> Option<String> {
+        self.child.next_label()
+    }
+
+    fn replaygain_db(&self) -> Option<f32> {
+        self.child.replaygain_db()
+    }
+
+    fn crossfade_overrides(&self) -> Option<crate::source::CrossfadeOverrides> {
+        self.child.crossfade_overrides()
+    }
+
+    fn skip(&mut self) {
+        self.child.skip();
+    }
+}
+
 /// Pull budget while a `map_metadata` rewrite is outstanding: at ~92.9 ms
 /// per 4096-frame buffer this is ~0.7 s of wall time, well past the event
 /// loop's 100 ms poll, without ever blocking the audio thread.
@@ -941,6 +1265,9 @@ impl FromLua for LuaSource {
                 .borrow_mut::<LuaSource>()
                 .map(|m| LuaSource(m.0.clone()))
                 .map_err(mlua::Error::runtime),
+            // `insert_metadata` proxies carry a `source` field, so a proxy
+            // can stand in for a source anywhere one is expected.
+            LValue::Table(t) => t.get::<LuaSource>("source"),
             _ => Err(mlua::Error::runtime("expected a source")),
         }
     }
@@ -2217,6 +2544,45 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
     blank.set_metatable(Some(blank_mt));
     globals.set("blank", blank)?;
 
+    // ---- silence trimmers (Liquidsoap `strip_blank`, `skip_blank`) -------
+    let strip_state = state.clone();
+    globals.set(
+        "strip_blank",
+        lua.create_function(move |_, (mut source, opts): (LuaSource, Option<Table>)| {
+            let threshold = opt_f64(&opts, "threshold", -40.0)?;
+            let max_blank = opt_f64(&opts, "max_blank", 30.0)?;
+            let (spec, _) = bus(&strip_state);
+            let child = source.take();
+            let src = StripBlankSource::new(
+                child,
+                db_to_gain(threshold as f32),
+                max_blank,
+                spec.rate,
+                spec.channels.count(),
+            );
+            Ok(LuaSource::new(Box::new(src)))
+        })?,
+    )?;
+
+    let skip_state = state.clone();
+    globals.set(
+        "skip_blank",
+        lua.create_function(move |_, (mut source, opts): (LuaSource, Option<Table>)| {
+            let threshold = opt_f64(&opts, "threshold", -40.0)?;
+            let length = opt_f64(&opts, "length", 10.0)?;
+            let (spec, _) = bus(&skip_state);
+            let child = source.take();
+            let src = SkipBlankSource::new(
+                child,
+                db_to_gain(threshold as f32),
+                length,
+                spec.rate,
+                spec.channels.count(),
+            );
+            Ok(LuaSource::new(Box::new(src)))
+        })?,
+    )?;
+
     let sine_state = state.clone();
     globals.set(
         "sine",
@@ -2245,7 +2611,30 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         })?,
     )?;
 
-    // ---- effects (Liquidsoap `amplify`, `compress`, `normalize`, `replaygain`) ---------
+    // ---- effects (Liquidsoap `amplify`, `compress`, `limiter`, `normalize`, `replaygain`) ----
+    let limiter_state = state.clone();
+    globals.set(
+        "limiter",
+        lua.create_function(move |_, (mut source, opts): (LuaSource, Option<Table>)| {
+            let threshold = opt_f64(&opts, "threshold", 0.0)?;
+            let attack = opt_f64(&opts, "attack", 0.005)?;
+            let release = opt_f64(&opts, "release", 0.25)?;
+            let (spec, _) = bus(&limiter_state);
+            let child = source.take();
+            let fx = Limiter::new(
+                threshold as f32,
+                attack as f32,
+                release as f32,
+                spec.rate,
+            );
+            Ok(LuaSource::new(Box::new(EffectSource::new(
+                child,
+                fx,
+                spec.channels.count(),
+            ))))
+        })?,
+    )?;
+
     globals.set(
         "replaygain",
         lua.create_function(move |_, (mut source, opts): (LuaSource, Option<Table>)| {
@@ -3565,6 +3954,57 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         )?,
     )?;
 
+    // ---- runtime label override (Liquidsoap `insert_metadata`) ------------
+    // Returns a proxy table that *is* a source (usable directly as
+    // `output.icecast(..., md)` via the `source` field, or callable as
+    // `md()`), with `md.insert({title = ...})` overriding the current
+    // track's label until the next track. The override slot is shared with
+    // the wrapped source.
+    globals.set(
+        "insert_metadata",
+        lua.create_function(move |lua, (mut source, _opts): (LuaSource, Option<Table>)| {
+            let child = source.take();
+            let slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+            let wrapped = InsertMetadataSource::new(child, slot.clone());
+            let src = LuaSource::new(Box::new(wrapped));
+            let proxy = lua.create_table()?;
+            proxy.set("source", src.clone())?;
+            let call_src = src.clone();
+            proxy.set(
+                "__call",
+                lua.create_function(move |_, (): ()| Ok(call_src.clone()))?,
+            )?;
+            let ins_slot = slot.clone();
+            proxy.set(
+                "insert",
+                // `md.insert({...})` passes one argument, `md:insert({...})`
+                // two (the proxy first); accept both.
+                lua.create_function(move |_, args: mlua::MultiValue| {
+                    // `md.insert({...})` passes one argument, `md:insert({...})`
+                    // two (the proxy first); accept both.
+                    let meta: Table = match args.front() {
+                        Some(first) => {
+                            let m = if args.len() == 2 { args.get(1).unwrap() } else { first };
+                            m.as_table().cloned()
+                        }
+                        None => None,
+                    }
+                    .ok_or_else(|| {
+                        mlua::Error::runtime("insert: expected a metadata table")
+                    })?;
+                    let title: String = meta.get("title").map_err(|_| {
+                        mlua::Error::runtime(
+                            "insert: the metadata table needs a `title` field",
+                        )
+                    })?;
+                    *ins_slot.lock().unwrap() = Some(title);
+                    Ok(true)
+                })?,
+            )?;
+            Ok(proxy)
+        })?,
+    )?;
+
     // ---- evaluate ---------------------------------------------------------
     lua.load(src).set_name("crabsoup.lua").exec()?;
 
@@ -3633,6 +4073,7 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
 
 #[cfg(test)]
 mod tests {
+    use mlua::ObjectLike;
     use super::*;
 
     #[test]
@@ -4926,6 +5367,170 @@ mod tests {
         _rt.drain_metadata();
         let tracks: u64 = _rt.global("tracks").expect("tracks counter");
         assert_eq!(tracks, 2, "one event per track start");
+    }
+
+    // ---- insert_metadata --------------------------------------------------
+
+    /// Pulls `root` to exhaustion, returning the total frames consumed and
+    /// the first frame index whose magnitude clears `level`.
+    fn pull_stats(
+        root: &mut dyn crate::source::AudioSource,
+        level: f32,
+    ) -> (u64, Option<u64>) {
+        let mut buf = vec![0f32; 4096 * 2];
+        let mut total: u64 = 0;
+        let mut first_audio = None;
+        for _ in 0..2000 {
+            let n = root.next_buffer(&mut buf);
+            if n == 0 {
+                if root.is_exhausted() {
+                    break;
+                }
+                continue;
+            }
+            if first_audio.is_none()
+                && let Some(i) = buf[..n].iter().position(|&s| s.abs() >= level)
+            {
+                first_audio = Some(total + i as u64);
+            }
+            total += (n / 2) as u64;
+        }
+        (total, first_audio)
+    }
+
+    #[test]
+    fn insert_metadata_overrides_the_label_until_the_track_changes() {
+        let (_rt, res) = run(r#"
+            md = insert_metadata(sequence({sine({freq = 440, duration = 0.5}),
+                                            sine({freq = 880, duration = 0.5})}))
+            output.preview(md)
+            "#)
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        // Let the 440 Hz track start, then insert a manual title.
+        root.next_buffer(&mut buf);
+        assert_eq!(root.label().as_deref(), Some("sine 440 Hz"));
+        let md: mlua::Table = _rt.global("md").expect("md proxy");
+        let title = _rt.lua.create_table().expect("table");
+        title.set("title", "Now Playing: Test Track").expect("set");
+        let inserted: bool = md.call_method("insert", (title,)).expect("insert");
+        assert!(inserted);
+        root.next_buffer(&mut buf);
+        assert_eq!(root.label().as_deref(), Some("Now Playing: Test Track"));
+        // The next track clears the override (0.5 s of 440 Hz spans ~5.4
+        // buffers; 4 more pulls cross into the 880 Hz track).
+        for _ in 0..4 {
+            root.next_buffer(&mut buf);
+        }
+        assert_eq!(root.label().as_deref(), Some("sine 880 Hz"));
+    }
+
+    #[test]
+    fn insert_metadata_requires_a_title_field() {
+        let err = run(r#"
+            md = insert_metadata(sine({freq = 440, duration = 0.1}))
+            md.insert({})
+            output.preview(md)
+            "#)
+        .err()
+        .expect("insert without a title fails");
+        assert!(err.to_string().contains("needs a `title` field"), "{err}");
+    }
+
+    // ---- strip_blank / skip_blank ---------------------------------------
+
+    #[test]
+    fn strip_blank_removes_leading_silence_of_each_track() {
+        let (_rt, res) = run(r#"
+            src = strip_blank(sequence({blank({duration = 0.3}),
+                                        sine({freq = 440, duration = 0.3})}))
+            output.preview(src)
+            "#)
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let (total, first_audio) = pull_stats(&mut *root, 0.1);
+        // Only the sine is audible, and it starts immediately: the 0.15 s of
+        // dead air vanished from the timeline.
+        assert!((total as f64 / 44100.0 - 0.3).abs() < 0.1, "total {total}");
+        assert!(first_audio.unwrap_or(u64::MAX) < 4096, "first {first_audio:?}");
+    }
+
+    #[test]
+    fn strip_blank_gives_up_past_max_blank() {
+        let (_rt, res) = run(r#"
+            src = strip_blank(blank({duration = 2.0}), {max_blank = 0.5})
+            output.preview(src)
+            "#)
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let (total, first_audio) = pull_stats(&mut *root, 0.1);
+        // The first ~0.5 s is dropped; the rest passes through as silence.
+        // (Give-up granularity is one 4096-frame buffer, hence the range.)
+        let seconds = total as f64 / 44100.0;
+        assert!((0.35..0.6).contains(&seconds), "total {total}");
+        assert_eq!(first_audio, None);
+    }
+
+    #[test]
+    fn skip_blank_discards_a_track_that_starts_with_silence() {
+        let (_rt, res) = run(r#"
+            src = skip_blank(sequence({blank({duration = 1.2}),
+                                       sine({freq = 440, duration = 0.3})}),
+                             {length = 0.5})
+            output.preview(src)
+            "#)
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let (total, first_audio) = pull_stats(&mut *root, 0.1);
+        // 1.2 samples-units of blank = 0.6 s > the 0.5 s window: the track is
+        // discarded and the next one played.
+        assert!((total as f64 / 44100.0 - 0.3).abs() < 0.1, "total {total}");
+        assert!(first_audio.unwrap_or(u64::MAX) < 4096, "first {first_audio:?}");
+    }
+
+    #[test]
+    fn skip_blank_keeps_a_track_that_starts_within_the_window() {
+        let (_rt, res) = run(r#"
+            src = skip_blank(sequence({blank({duration = 0.2}),
+                                       sine({freq = 440, duration = 0.3})}),
+                             {length = 0.5})
+            output.preview(src)
+            "#)
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let (total, first_audio) = pull_stats(&mut *root, 0.1);
+        // 0.2 samples-units of blank = 0.1 s, shorter than `length`: the
+        // blank track is kept whole (its silence plays), then the sine.
+        assert!((total as f64 / 44100.0 - 0.4).abs() < 0.1, "total {total}");
+        let first = first_audio.expect("signal appears");
+        assert!(
+            (first as f64 / 44100.0 - 0.1).abs() < 0.1,
+            "first audio at {first}"
+        );
+    }
+
+    // ---- limiter ---------------------------------------------------------
+
+    #[test]
+    fn limiter_clamps_the_bus_peak() {
+        let (_rt, res) = run(r#"
+            src = limiter(sine({freq = 440, duration = 0.2, amplitude = 2.0}),
+                          {threshold = 0.0, attack = 0.0})
+            output.preview(src)
+            "#)
+        .expect("script runs");
+        let mut root = res.preview.expect("preview source");
+        let mut buf = vec![0f32; 4096 * 2];
+        let mut peak = 0.0f32;
+        for _ in 0..50 {
+            let n = root.next_buffer(&mut buf);
+            peak = peak.max(buf[..n].iter().fold(0.0, |m, &s| m.max(s.abs())));
+            if n == 0 && root.is_exhausted() {
+                break;
+            }
+        }
+        assert!(peak <= 1.0 + 1e-6, "peak {peak} exceeded the 0 dB ceiling");
     }
 
     // ---- G3.2: on_next_metadata ----------------------------------------

@@ -159,6 +159,50 @@ impl Effect for Compressor {
     }
 }
 
+/// A peak limiter (Liquidsoap `limiter`): a ceiling the signal never
+/// exceeds, approached through a smoothed peak envelope so the reduction is
+/// inaudible and recovers at `release`. With `attack <= 0` the envelope is
+/// sample-accurate — a true brickwall ceiling.
+pub struct Limiter {
+    threshold_db: f32,
+    attack: f32,
+    release: f32,
+    sample_rate: u32,
+    /// Smoothed peak level (envelope follower).
+    peak: f32,
+}
+
+impl Limiter {
+    pub fn new(threshold_db: f32, attack: f32, release: f32, sample_rate: u32) -> Self {
+        Self {
+            threshold_db,
+            attack,
+            release,
+            sample_rate,
+            peak: 0.0,
+        }
+    }
+}
+
+impl Effect for Limiter {
+    fn process(&mut self, buf: &mut [f32], _channels: usize) {
+        let up = env_coef(self.attack, self.sample_rate);
+        let down = env_coef(self.release, self.sample_rate);
+        let ceiling = db_to_gain(self.threshold_db);
+        for s in buf {
+            let level = s.abs();
+            if level > self.peak {
+                self.peak += up * (level - self.peak);
+            } else {
+                self.peak += down * (level - self.peak);
+            }
+            if self.peak > ceiling {
+                *s *= ceiling / self.peak;
+            }
+        }
+    }
+}
+
 /// A live gain rider (Liquidsoap `normalize`).
 ///
 /// Same envelope-follower shape as [`Compressor`], but instead of limiting
@@ -445,6 +489,42 @@ mod tests {
         let n = src.next_buffer(&mut buf);
         fx.process(&mut buf[..n], 1);
         assert!((buf[1] - 0.5 * 10f32.powf(6.0 / 20.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn limiter_brickwalls_above_the_ceiling() {
+        // Instant attack: the envelope follows the signal, so nothing may
+        // exceed the 0 dB ceiling, even on the first loud sample.
+        let mut fx = Limiter::new(0.0, 0.0, 0.1, 100);
+        let mut buf = vec![2.0f32; 8];
+        fx.process(&mut buf, 1);
+        assert!(buf.iter().all(|&s| s.abs() <= 1.0 + 1e-6));
+        assert!((buf[0].abs() - 1.0).abs() < 1e-6, "got {}", buf[0]);
+    }
+
+    #[test]
+    fn limiter_passes_below_the_ceiling_unchanged() {
+        let mut fx = Limiter::new(-3.0, 0.0, 0.1, 100);
+        let mut buf = vec![0.5f32; 8];
+        fx.process(&mut buf, 1);
+        assert_eq!(buf[0], 0.5);
+    }
+
+    #[test]
+    fn limiter_recovers_at_release_after_a_loud_burst() {
+        // After a 2.0 burst, a quiet 0.1 signal is attenuated only until the
+        // slow (1 s) envelope falls back under the ceiling; the tail of the
+        // quiet run must pass untouched.
+        let mut fx = Limiter::new(0.0, 0.0, 1.0, 100);
+        let mut buf = vec![2.0f32; 8];
+        fx.process(&mut buf, 1);
+        assert!((buf[7].abs() - 1.0).abs() < 1e-6, "burst not clamped: {}", buf[7]);
+        let mut buf = vec![0.1f32; 8];
+        fx.process(&mut buf, 1);
+        assert!(buf[0] < 0.1, "attenuation released too fast: {}", buf[0]);
+        let mut buf = vec![0.1f32; 200];
+        fx.process(&mut buf, 1);
+        assert!(buf[199] > 0.1 - 1e-3, "envelope never recovered: {}", buf[199]);
     }
 
     #[test]

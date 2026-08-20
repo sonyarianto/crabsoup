@@ -326,6 +326,7 @@ anchors for later phases.
 | effects/compressor+agc+amplify | 604 µs | 0.65 % |
 | effects/echo/single_tap (0.25 s, ping 0.5, fb 0.5) | 76 µs | 0.08 % |
 | effects/echo/two_tap (0.25 s + 0.5 s) | 86 µs | 0.09 % |
+| effects/limiter (0 dB, instant attack, 0.25 s release) | 211 µs | 0.23 % |
 | resampler/sinc16/44k_to_48k | 831 µs | 0.89 % |
 | resampler/sinc16/48k_to_44k1 | 795 µs | 0.86 % |
 | encode/mp3 (192 kbps) | 501 µs | 0.54 % |
@@ -1178,7 +1179,7 @@ rows recorded against the baseline convention.
 
 ### Part I — advanced audio & effects (Phase 2, Q1 – Q2 2027)
 
-**Status: I1–I7 shipped** (see their rows below; I8 still planned; I9
+**Status: I1–I7 + I10 shipped** (see their rows below; I8 still planned; I9
 demand-gated — see the note in the I7 row). The product plan's Phase 2. Effects stay inline in the
 pull chain (one thread per output, allocation-free hot paths), each landing
 with inline tests and a bench row; FFI-backed DSP (SoundTouch, aubio) gets
@@ -1323,6 +1324,36 @@ its own confined module per the Part H convention note.
       pattern (operators return values read back through
       `ScriptRuntime::global`). Bench: `analysis/bpm_30s` ~34 ms and
       `analysis/key_16s` ~23 ms incl. WAV decode.
+- [x] **I10 — `limiter`, `strip_blank`/`skip_blank`, `insert_metadata`**
+      (the remaining daily Liquidsoap operators, shipped together after
+      I7). `limiter(src, {threshold, attack, release})` — a peak limiter
+      (`src/engine/effects.rs`) with the `Compressor` envelope shape but
+      no ratio: the smoothed peak never exceeds `threshold` dB, instant
+      attack is a sample-accurate brickwall, `release` recovers the
+      envelope. Allocation-free; tests (brickwall ceiling, below-ceiling
+      passthrough, release recovery); bench `effects/limiter` ~211 µs per
+      92.9 ms buffer. `strip_blank`/`skip_blank` (source wrappers in
+      `src/script.rs`): track boundaries are label changes or audio
+      resuming after silence (plus the very first track — no label change
+      announces it). `strip_blank(src, {threshold, max_blank})` returns 0
+      while consuming each track's leading silence — the tap clock does
+      not advance, so the dead air vanishes from the timeline — and gives
+      up past `max_blank` so an all-blank track passes through.
+      `skip_blank(src, {threshold, length})` probes the first `length`
+      seconds in a buffer: signal within the window keeps the track
+      (buffered lead-in replayed, timeline intact), a pure-silence window
+      discards it and advances the child; a probed track that ends before
+      the window closes is kept and its silence played (short silent
+      tracks are not skipped). `insert_metadata(src)` — a proxy table
+      that doubles as a source (Lua `__call` plus a `source` field that
+      `FromLua` for `LuaSource` accepts, so `output.icecast(..., md)`
+      works) whose `insert({title = ...})` writes a shared
+      `Arc<Mutex<Option<String>>>` override the wrapper reports as its
+      label (Icecast titles, metadata hooks) until the child's next track
+      clears it. Script tests for all three: strip/skip window boundary
+      behaviour, give-up past `max_blank`, proxy-as-source, override
+      cleared on track change, missing-`title` error. Docs: `dsp.md`
+      (limiter, strip_blank/skip_blank, insert_metadata sections).
 
 ### Part J — protocols & integrations (Phase 3, Q2 – Q3 2027)
 

@@ -15,7 +15,7 @@ use ringbuf::traits::*;
 use symphonia::core::audio::{Channels, SignalSpec};
 
 use crabsoup::config::MixerConfig;
-use crabsoup::engine::effects::{Agc, Amplify, Compressor, Echo, EffectSource};
+use crabsoup::engine::effects::{Agc, Amplify, Compressor, Echo, EffectSource, Limiter};
 use crabsoup::engine::eq::{Eq, EqBand, EqType};
 use crabsoup::engine::mixer::{CrossfadeMixer, PriorityMixer};
 use crabsoup::engine::pitch::{PitchMode, PitchSource};
@@ -253,6 +253,17 @@ fn effects(c: &mut Criterion) {
             CHANS,
         ));
         let mut chain = EffectSource::new(agced, Amplify::new(0.9), CHANS);
+        let mut buf = vec![0.0f32; BUF];
+        b.iter(|| {
+            chain.next_buffer(&mut buf);
+            black_box(&buf);
+        });
+    });
+
+    group.bench_function("limiter", |b| {
+        let child: Box<dyn AudioSource> = Box::new(SineSource::new(440.0, None, 0.5, RATE, CHANS));
+        let mut chain =
+            EffectSource::new(child, Limiter::new(0.0, 0.0, 0.25, RATE), CHANS);
         let mut buf = vec![0.0f32; BUF];
         b.iter(|| {
             chain.next_buffer(&mut buf);
