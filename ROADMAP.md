@@ -935,13 +935,6 @@ approximates the operator surface, not the language); LADSPA plugin hosting
 (one puller + fan-out first; revisit only if drift between outputs matters in
 practice).
 
-**Backlog — benchmark vs Liquidsoap + a formal soak harness (recommended,
-not urgent):** informal soak runs have driven real fixes (sample-exact
-boundary handover, delayed-ring tail fix, Icecast handshake timing), but
-there is still no repeatable head-to-head benchmark against real
-Liquidsoap and no formal multi-hour/multi-day soak harness anyone can
-re-run. Scoped as **Part L** below; not blocking anything.
-
 ### Part H — video foundation (Phase 1, Q4 2026 – Q1 2027)
 
 **Status: planned — this is the live plan.** From the "Closing the Gap"
@@ -1392,48 +1385,6 @@ feature parity; all core video I/O/effects/outputs; ≥80 % of built-in
 effects; ≥80 % of network protocols; 100 % test pass on supported platforms;
 API reference + 5 tutorials; ≥100 stars and ≥20 contributors; green CI +
 load tests + fuzzing.
-
-### Part L — Liquidsoap head-to-head benchmark + formal soak harness (recommended, not urgent)
-
-**Status: scoped, not started.** Recommended repeatedly across the
-project's history, never built as a repeatable harness. Informal soak runs
-*have* driven real fixes (sample-exact boundary handover, delayed-ring tail
-fix, Icecast handshake timing) — proving informal soak testing happens —
-but there is no repeatable comparison against real Liquidsoap and no formal
-multi-hour/multi-day harness anyone can re-run. Independent of Parts H–K;
-can be executed alongside any of them. Two deliverables, each a command
-someone can run on a clean checkout:
-
-**L1 — head-to-head benchmark vs real Liquidsoap.** Port the same production
-shape (the dailymate radio config: playlist + gapless crossfade + Stereo
-Tool `pipe()` + HLS, or a synthetic equivalent) to a `.liq` script and run
-it under both engines on the same machine, measuring:
-- CPU and memory **per concurrent output** (N mounts/renditions live
-  simultaneously), not per instance — the product-plan metric.
-- Worst-case latency jitter across the run (the benchmark harness's
-  `criterion` conventions and the ROADMAP baseline tables are the anchors;
-  record new rows here for both engines in the same table format).
-Acceptance: a `benches/liquidsoap/` script that builds both engines, runs
-the identical program, and emits a comparison table; baseline rows recorded
-in ROADMAP like the existing performance-baseline tables.
-
-**L2 — formal soak harness.** A scripted multi-hour/multi-day run with
-assertions, re-runnable with one command:
-- Audio pipeline: buffer boundaries stay sample-exact (no drift), ring
-  fills stay in band (the G2 clock-drift loop's steady state), zero dropped
-  tap frames over the whole run.
-- Outputs: HLS segment continuity (no gap/drift across restarts, the G3.3
-  `persist_at` resume), Icecast reconnect exercised by bouncing the server
-  on a schedule, title/metadata correctness at every track change.
-- A pass/fail report at the end, and soak-driven findings landed back into
-  the ROADMAP Done section exactly as the informal runs already are.
-Acceptance: a `soak/` script (e.g. `./soak/run.sh 6h`) that runs the
-scenario against a local Icecast + HLS directory, asserts the invariants,
-and exits non-zero on the first violation; one full multi-hour run recorded
-in ROADMAP.
-
-Both stay out of the product plan's critical path — the ask is the harness,
-not a fixed delivery date.
 
 ## Done (cont.)
 - [x] J3 (WebSocket control channel): `server.telnet({ws_port = N})` serves
