@@ -45,8 +45,11 @@ cpal = "0.15"
 # no `send` feature: sources are Rc-based and stay on the main thread.
 mlua = { version = "0.10", default-features = false, features = ["lua54", "vendored"] }
 # Video decode/mux/encode (Part H1): binds to the system FFmpeg via
-# pkg-config, so plain builds skip libav entirely.
-ffmpeg-next = { version = "7.1", optional = true }
+# pkg-config, so plain builds skip libav entirely. 9.x is required: it is
+# the first release with the `ffmpeg_8_0` cfg gate (avcodec_close was
+# removed in FFmpeg 8, so 7.x cannot link against the >= 8.1.2 security
+# floor; the gate auto-activates from ffmpeg-sys-next's version detection).
+ffmpeg-next = { version = "9.0", optional = true }
 # Pitch-preserved time-stretch (WSOLA), pure Rust, no C — the Part I1
 # `stretch`/`pitch` effects (in-process DSP, no system dependency).
 wsola = "0.1"

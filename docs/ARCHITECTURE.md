@@ -623,8 +623,11 @@ vf_hqdn3d decoder CVEs are fixed in 8.1.2. `build.rs` checks
 `pkg-config --modversion libavcodec` when the `video` feature is enabled
 and fails below FFmpeg 8 (libavcodec major < 62). pkg-config cannot
 distinguish patch releases, so ≥ 8.1.2 is the floor regardless of what the
-check reports. Note Debian/Ubuntu stable ships FFmpeg 7.x — backports or
-the FFmpeg release build are needed for the `video` feature.
+check reports. ffmpeg-next must be ≥ 9.0 to link against FFmpeg 8 —
+7.x calls the removed `avcodec_close`; 9.x gates it behind an auto-detected
+`ffmpeg_8_0` cfg. Note Debian/Ubuntu stable ships FFmpeg 7.x — backports or
+the FFmpeg release build (the project's own `make install` into /usr/local,
+the fdk-aac precedent) are needed for the `video` feature.
 
 - **Carrier**: `VideoFrame` (YUV420P planes + `pts_us`) rides its own
   fan-out `VideoTap` (`src/video/tap.rs`, bounded `sync_channel(4)`,
