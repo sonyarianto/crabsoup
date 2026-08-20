@@ -95,10 +95,28 @@ sudo apt install libmp3lame-dev libopus-dev   # Debian/Ubuntu
 cargo build --release
 ```
 
-Video (HLS + RTMP) adds the FFmpeg dev packages and the `video` feature:
+Video (HLS + RTMP) adds FFmpeg and the `video` feature. **FFmpeg ≥ 8.1.2 is
+required** — a security floor enforced by `build.rs` (`pkg-config
+--modversion libavcodec` must report FFmpeg 8 / libavcodec ≥ 62;
+CVE-2026-8461 "PixelSmash" and the same-window decoder CVEs are fixed in
+8.1.2, and `video.video` decodes whatever the container probe selects).
+Debian/Ubuntu stable ships FFmpeg 7.x, so build 8.1.2 from source into
+/usr/local first (the fdk-aac pattern — this provides the dev libraries,
+headers and pkg-config files itself):
 
 ```sh
-sudo apt install libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
+sudo apt install nasm libx264-dev
+curl -O https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz
+tar xf ffmpeg-8.1.2.tar.xz && cd ffmpeg-8.1.2
+./configure --prefix=/usr/local --enable-gpl --enable-libx264 \
+            --enable-shared --enable-pic
+make -j$(nproc) && sudo make install && sudo ldconfig
+```
+
+On a distro that already ships FFmpeg 8.x, its dev packages work instead:
+`sudo apt install libavcodec-dev libavformat-dev libavutil-dev libswscale-dev`.
+
+```sh
 cargo build --release --features video
 ```
 

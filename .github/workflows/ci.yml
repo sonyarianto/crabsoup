@@ -46,3 +46,50 @@ jobs:
 
       - name: Release build
         run: cargo build --release
+
+  video:
+    name: test + clippy + build (video feature)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake libtool libmp3lame-dev libopus-dev libasound2-dev nasm libx264-dev
+
+      - name: Build fdk-aac (no distro package; see README)
+        run: |
+          git clone --depth 1 https://github.com/mstorsjo/fdk-aac /tmp/fdk-aac
+          cd /tmp/fdk-aac
+          ./autogen.sh && ./configure --prefix=/usr/local
+          make -j$(nproc) && sudo make install
+          sudo ldconfig
+
+      - name: Build FFmpeg 8.1.2 from source (security floor; see README)
+        run: |
+          curl -O https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz
+          tar xf ffmpeg-8.1.2.tar.xz && cd ffmpeg-8.1.2
+          ./configure --prefix=/usr/local --enable-gpl --enable-libx264 \
+                      --enable-shared --enable-pic
+          make -j$(nproc) && sudo make install
+          sudo ldconfig
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-video-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-video-cargo-
+
+      - name: Clippy
+        run: cargo clippy --all-targets --features video -- -D warnings
+
+      - name: Tests
+        run: cargo test --lib --features video
+
+      - name: Release build
+        run: cargo build --release --features video
