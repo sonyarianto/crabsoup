@@ -1663,6 +1663,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let (tx, _rx) = mpsc::channel();
@@ -1744,6 +1745,9 @@ mod tests {
             };
             assert_eq!(closed, WS_CLOSE_NORMAL.to_be_bytes());
             server.await.unwrap().unwrap();
+            })
+            .await
+            .expect("ws_end_to_end_dispatch timed out after 5s");
         });
     }
 }

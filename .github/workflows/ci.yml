@@ -20,13 +20,26 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y autoconf automake libtool libmp3lame-dev libopus-dev libasound2-dev
 
+      - name: Cache fdk-aac
+        id: cache-fdk
+        uses: actions/cache@v4
+        with:
+          path: /tmp/fdk-aac
+          key: ${{ runner.os }}-fdk-aac-${{ hashFiles('.github/workflows/ci.yml') }}
+
       - name: Build fdk-aac (no distro package; see README)
+        if: steps.cache-fdk.outputs.cache-hit != 'true'
         run: |
           git clone --depth 1 https://github.com/mstorsjo/fdk-aac /tmp/fdk-aac
           cd /tmp/fdk-aac
           ./autogen.sh && ./configure --prefix=/usr/local
           make -j$(nproc) && sudo make install
           sudo ldconfig
+
+      - name: Install fdk-aac from cache
+        if: steps.cache-fdk.outputs.cache-hit == 'true'
+        run: |
+          cd /tmp/fdk-aac && sudo make install && sudo ldconfig
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -88,7 +101,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y autoconf automake libtool libmp3lame-dev libopus-dev libasound2-dev nasm libx264-dev
 
+      - name: Cache fdk-aac
+        id: cache-fdk-video
+        uses: actions/cache@v4
+        with:
+          path: /tmp/fdk-aac
+          key: ${{ runner.os }}-fdk-aac-${{ hashFiles('.github/workflows/ci.yml') }}
+
       - name: Build fdk-aac (no distro package; see README)
+        if: steps.cache-fdk-video.outputs.cache-hit != 'true'
         run: |
           git clone --depth 1 https://github.com/mstorsjo/fdk-aac /tmp/fdk-aac
           cd /tmp/fdk-aac
@@ -96,7 +117,22 @@ jobs:
           make -j$(nproc) && sudo make install
           sudo ldconfig
 
+      - name: Install fdk-aac from cache
+        if: steps.cache-fdk-video.outputs.cache-hit == 'true'
+        run: |
+          cd /tmp/fdk-aac && sudo make install && sudo ldconfig
+
+      - name: Cache FFmpeg 8.1.2
+        id: cache-ffmpeg
+        uses: actions/cache@v4
+        with:
+          path: |
+            ffmpeg-8.1.2.tar.xz
+            ffmpeg-8.1.2
+          key: ${{ runner.os }}-ffmpeg-8.1.2
+
       - name: Build FFmpeg 8.1.2 from source (security floor; see README)
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
         run: |
           curl -O https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz
           tar xf ffmpeg-8.1.2.tar.xz && cd ffmpeg-8.1.2
@@ -104,6 +140,11 @@ jobs:
                       --enable-shared --enable-pic
           make -j$(nproc) && sudo make install
           sudo ldconfig
+
+      - name: Install FFmpeg from cache
+        if: steps.cache-ffmpeg.outputs.cache-hit == 'true'
+        run: |
+          cd ffmpeg-8.1.2 && sudo make install && sudo ldconfig
 
       - name: Cache cargo
         uses: actions/cache@v4
