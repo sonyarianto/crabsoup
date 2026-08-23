@@ -102,7 +102,9 @@ impl FileOutput {
 mod tests {
     use super::*;
     use crate::config::OutputFormat;
+    #[cfg(feature = "mp3")]
     use crate::source::AudioSource;
+    #[cfg(feature = "mp3")]
     use crate::source::file::FileSource;
     use std::sync::mpsc;
 
@@ -128,6 +130,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "mp3")]
     #[test]
     fn records_mp3_that_decodes_back_with_symphonia() {
         let path = std::env::temp_dir().join("crabsoup-c1.mp3");

@@ -21,7 +21,11 @@ use crabsoup::engine::mixer::{CrossfadeMixer, PriorityMixer};
 use crabsoup::engine::pitch::{PitchMode, PitchSource};
 use crabsoup::engine::reverb::ConvReverb;
 use crabsoup::engine::stereo::{Stereo, VocalRemover};
-use crabsoup::output::encoder::{AacEncoder, Encoder, Mp3Encoder, OpusEncoder};
+use crabsoup::output::encoder::{Encoder, OpusEncoder};
+#[cfg(feature = "aac")]
+use crabsoup::output::encoder::AacEncoder;
+#[cfg(feature = "mp3")]
+use crabsoup::output::encoder::Mp3Encoder;
 use crabsoup::resample::SincResampler;
 use crabsoup::source::{AudioSource, SineSource, SourceProvider};
 
@@ -470,20 +474,21 @@ fn encode(c: &mut Criterion) {
     group.throughput(Throughput::Elements(BUF as u64));
 
     let pcm = vec![0.0f32; BUF];
-    let encoders: [(&str, Box<dyn Encoder>); 3] = [
-        (
-            "mp3",
-            Box::new(Mp3Encoder::new(RATE, CHANS as u16, 192_000).unwrap()),
-        ),
-        (
-            "opus",
-            Box::new(OpusEncoder::new(48_000, CHANS as u16, 128_000, "bench").unwrap()),
-        ),
-        (
-            "aac",
-            Box::new(AacEncoder::new(RATE, CHANS as u16, 128_000).unwrap()),
-        ),
-    ];
+    let mut encoders: Vec<(&str, Box<dyn Encoder>)> = Vec::new();
+    #[cfg(feature = "mp3")]
+    encoders.push((
+        "mp3",
+        Box::new(Mp3Encoder::new(RATE, CHANS as u16, 192_000).unwrap()) as Box<dyn Encoder>,
+    ));
+    encoders.push((
+        "opus",
+        Box::new(OpusEncoder::new(48_000, CHANS as u16, 128_000, "bench").unwrap()) as _,
+    ));
+    #[cfg(feature = "aac")]
+    encoders.push((
+        "aac",
+        Box::new(AacEncoder::new(RATE, CHANS as u16, 128_000).unwrap()) as Box<dyn Encoder>,
+    ));
     for (name, mut enc) in encoders {
         group.bench_function(name, |b| {
             b.iter(|| {

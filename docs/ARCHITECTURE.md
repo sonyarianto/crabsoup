@@ -433,24 +433,34 @@ One engine thread plus one thread per output:
 - Both mixers keep reusable scratch `Vec<f32>` fields (sized on buffer-size
   change) so `next_buffer` never allocates.
 
-## Opus path
+## Opus path (always linked; `mp3` feature, default-on)
 
 `SincResampler` (16-tap Hann-windowed sinc, 256-phase table) bus -> 48 kHz,
 encode 20 ms frames, mux one Ogg page per packet, flush per packet so audio
-reaches Icecast promptly.
+reaches Icecast promptly. Opus is always built (the harbor decodes it via
+`audiopus`/`libopus`); MP3 is the LAME FFI in `src/output/encoder.rs` gated
+behind `#[cfg(feature = "mp3")]`, default-on — `format = "mp3"` without the
+feature fails at script eval (`needs a build with --features mp3`), and
+`cargo build --release --no-default-features` drops the system `libmp3lame`
+link entirely (add `--features mp3` to re-enable).
 
-## AAC path
+## AAC path (`aac` feature, default-on)
 
-`AacEncoder` (`src/output/encoder.rs`) wraps FDK-AAC via FFI (same opaque
-handle + explicit `Drop` template as LAME): AAC-LC, mono/stereo, bitrate in
-bits/s, raw ADTS transport (`AACENC_TRANSMUX`/`TT_MP4_ADTS`). 44.1 kHz needs
-no resampler. FDK consumes **at most one frame's worth of input per
-`aacEncEncode` call** (`nSamplesToRead - nSamplesRead`; excess is silently
-dropped), so `encode` loops on the leftover using the reported
-`numInSamples`, and `finish` drains with `numInSamples = -1` until
-`AACENC_ENCODE_EOF`. ADTS has no in-stream title mechanism — `set_title`
-stays the trait no-op. fdk-aac has no distro package; it's built from source
-into `/usr/local` and `build.rs` adds the link path.
+`AacEncoder` (`src/output/encoder.rs`, gated behind `#[cfg(feature =
+"aac")]`) wraps FDK-AAC via FFI (same opaque handle + explicit `Drop`
+template as LAME): AAC-LC, mono/stereo, bitrate in bits/s, raw ADTS transport
+(`AACENC_TRANSMUX`/`TT_MP4_ADTS`). 44.1 kHz needs no resampler. FDK consumes
+**at most one frame's worth of input per `aacEncEncode` call**
+(`nSamplesToRead - nSamplesRead`; excess is silently dropped), so `encode`
+loops on the leftover using the reported `numInSamples`, and `finish` drains
+with `numInSamples = -1` until `AACENC_ENCODE_EOF`. ADTS has no in-stream
+title mechanism — `set_title` stays the trait no-op. fdk-aac has no distro
+package; it's built from source into `/usr/local` and `build.rs` adds the link
+path. Like `mp3`, `aac` is default-on — plain builds keep HLS/RTMP/MP4 + AAC
+Icecast/file outputs; `cargo build --release --no-default-features` drops the
+system `fdk-aac` link (and, without `--features aac`, `output.hls`/`output.rtmp`
+/`output.mp4` stay unregistered and a script's `format = "aac"` fails with
+`needs a build with --features aac`).
 
 ## Icecast client (`src/output/icecast_client.rs`)
 

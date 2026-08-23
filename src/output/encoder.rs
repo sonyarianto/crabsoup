@@ -2,7 +2,11 @@
 //! Ogg/Opus (via libopus + a built-in Ogg muxer). libshout then transports the
 //! encoded bytes to Icecast.
 
-use std::ffi::{c_int, c_uint, c_void};
+#[cfg(any(feature = "mp3", feature = "aac"))]
+use std::ffi::c_int;
+#[cfg(feature = "aac")]
+use std::ffi::{c_uint, c_void};
+#[cfg(any(feature = "mp3", feature = "aac"))]
 use std::ptr;
 
 use crate::Result;
@@ -36,14 +40,20 @@ pub fn create_encoder(
     title: &str,
 ) -> Result<Box<dyn Encoder>> {
     match format {
+        #[cfg(feature = "mp3")]
         OutputFormat::Mp3 => Ok(Box::new(Mp3Encoder::new(sample_rate, channels, bitrate)?)),
+        #[cfg(not(feature = "mp3"))]
+        OutputFormat::Mp3 => Err("MP3 output needs a build with --features mp3".into()),
         OutputFormat::Opus => Ok(Box::new(OpusEncoder::new(
             sample_rate,
             channels,
             bitrate,
             title,
         )?)),
+        #[cfg(feature = "aac")]
         OutputFormat::Aac => Ok(Box::new(AacEncoder::new(sample_rate, channels, bitrate)?)),
+        #[cfg(not(feature = "aac"))]
+        OutputFormat::Aac => Err("AAC output needs a build with --features aac".into()),
     }
 }
 
@@ -56,11 +66,13 @@ pub(crate) fn clamp_i16(s: f32) -> i16 {
 // ---------------------------------------------------------------------------
 
 // Opaque LAME handle; only ever used behind a pointer.
+#[cfg(feature = "mp3")]
 #[repr(C)]
 struct LameFlagsRaw {
     _unused: [u8; 1],
 }
 
+#[cfg(feature = "mp3")]
 #[link(name = "mp3lame")]
 unsafe extern "C" {
     fn lame_init() -> *mut LameFlagsRaw;
@@ -82,15 +94,19 @@ unsafe extern "C" {
     fn lame_encode_flush(gf: *mut LameFlagsRaw, mp3buf: *mut u8, size: c_int) -> c_int;
 }
 
+#[cfg(feature = "mp3")]
 const VBR_OFF: c_int = 0;
 
+#[cfg(feature = "mp3")]
 pub struct Mp3Encoder {
     gf: *mut LameFlagsRaw,
     channels: usize,
 }
 
+#[cfg(feature = "mp3")]
 unsafe impl Send for Mp3Encoder {}
 
+#[cfg(feature = "mp3")]
 impl Mp3Encoder {
     pub fn new(sample_rate: u32, channels: u16, bitrate: u32) -> Result<Self> {
         let gf = unsafe { lame_init() };
@@ -119,6 +135,7 @@ impl Mp3Encoder {
     }
 }
 
+#[cfg(feature = "mp3")]
 impl Encoder for Mp3Encoder {
     fn content_type(&self) -> &'static str {
         "audio/mpeg"
@@ -165,6 +182,7 @@ impl Encoder for Mp3Encoder {
     }
 }
 
+#[cfg(feature = "mp3")]
 impl Drop for Mp3Encoder {
     fn drop(&mut self) {
         if !self.gf.is_null() {
@@ -322,7 +340,11 @@ impl Encoder for OpusEncoder {
 // AAC (FDK-AAC FFI, ADTS transport)
 // ---------------------------------------------------------------------------
 
-// Opaque FDK-AAC encoder handle; only ever used behind a pointer.
+#[cfg(feature = "aac")]
+mod aac {
+    use super::*;
+
+    // Opaque FDK-AAC encoder handle; only ever used behind a pointer.
 #[repr(C)]
 struct AacEncoderRaw {
     _unused: [u8; 1],
@@ -649,11 +671,16 @@ impl Drop for AacEncoder {
         }
     }
 }
+}
+
+#[cfg(feature = "aac")]
+pub use aac::AacEncoder;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(feature = "mp3")]
     #[test]
     fn mp3_encoder_produces_frames() {
         let mut enc = Mp3Encoder::new(44100, 2, 128_000).unwrap();
@@ -708,6 +735,7 @@ mod tests {
         assert!(!String::from_utf8_lossy(&all).contains("title=later"));
     }
 
+    #[cfg(feature = "aac")]
     #[test]
     fn aac_encoder_produces_adts_stream() {
         let mut enc = AacEncoder::new(44100, 2, 128_000).unwrap();
@@ -724,6 +752,7 @@ mod tests {
         assert_eq!(bytes[1] >> 4, 0xF);
     }
 
+    #[cfg(feature = "aac")]
     #[test]
     fn he_aac_encoder_produces_adts_stream() {
         let mut enc = AacEncoder::new_he_aac(44100, 2, 64_000).unwrap();
@@ -739,6 +768,7 @@ mod tests {
         assert_eq!(bytes[1] >> 4, 0xF);
     }
 
+    #[cfg(feature = "aac")]
     #[test]
     fn he_aac_stream_carries_sbr_and_decodes() {
         // HE-AAC is AAC-LC plus SBR. In ADTS the SBR shows up as the half-rate
@@ -786,6 +816,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "aac")]
     #[test]
     fn he_aac_v2_stream_carries_sbr_parametric_stereo_and_decodes() {
         // HE-AAC v2 is AAC-LC plus SBR plus parametric stereo (PS). Its
@@ -843,6 +874,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "aac")]
     #[test]
     fn he_aac_v2_rejects_mono_input() {
         let err = match AacEncoder::new_he_aac_v2(44100, 1, 64_000) {

@@ -7,7 +7,9 @@ use crate::Result;
 use crate::config::{AacProfile, OutputConfig, OutputFormat, OutputProtocol};
 use crate::engine::mixer::StatusHandle;
 use crate::engine::tap::{AudioFrame, interruptible_sleep, recv_frame_or_shutdown};
-use crate::output::encoder::{AacEncoder, Encoder, create_encoder};
+use crate::output::encoder::{Encoder, create_encoder};
+#[cfg(feature = "aac")]
+use crate::output::encoder::AacEncoder;
 use crate::output::icecast_client::IcecastClient;
 
 enum SendResult {
@@ -76,23 +78,28 @@ impl IcecastOutput {
             // `aac_profile = "heaacv2"` upgrades it to SBR + parametric
             // stereo — the profile for 64 kbit/s stereo.
             OutputFormat::Aac => match self.config.aac_profile {
-                AacProfile::Lc => create_encoder(
+                #[cfg(feature = "aac")]
+                AacProfile::He => Box::new(AacEncoder::new_he_aac(
+                    self.sample_rate,
+                    self.chans as u16,
+                    self.config.bitrate,
+                )?),
+                #[cfg(feature = "aac")]
+                AacProfile::HeV2 => Box::new(AacEncoder::new_he_aac_v2(
+                    self.sample_rate,
+                    self.chans as u16,
+                    self.config.bitrate,
+                )?),
+                // AAC-LC (and any profile in no-aac builds, where
+                // parse_format already rejected the format) goes through
+                // the shared factory.
+                _ => create_encoder(
                     self.config.format,
                     self.sample_rate,
                     self.chans as u16,
                     self.config.bitrate,
                     &self.config.name,
                 )?,
-                AacProfile::He => Box::new(AacEncoder::new_he_aac(
-                    self.sample_rate,
-                    self.chans as u16,
-                    self.config.bitrate,
-                )?),
-                AacProfile::HeV2 => Box::new(AacEncoder::new_he_aac_v2(
-                    self.sample_rate,
-                    self.chans as u16,
-                    self.config.bitrate,
-                )?),
             },
             _ => create_encoder(
                 self.config.format,

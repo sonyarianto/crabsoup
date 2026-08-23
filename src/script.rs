@@ -36,9 +36,11 @@ use rand::{Rng, SeedableRng};
 use symphonia::core::audio::SignalSpec;
 
 use crate::config::{
-    AacProfile, ControlConfig, FileOutputConfig, HlsOutputConfig, HlsRendition, LiveConfig,
-    MixerConfig, OutputConfig, OutputFormat, OutputProtocol, StreamConfig, collect_audio,
+    AacProfile, ControlConfig, FileOutputConfig, HlsOutputConfig, LiveConfig, MixerConfig,
+    OutputConfig, OutputFormat, OutputProtocol, StreamConfig, collect_audio,
 };
+#[cfg(feature = "aac")]
+use crate::config::HlsRendition;
 #[cfg(feature = "video")]
 use crate::config::{collect_images, collect_video};
 #[cfg(feature = "soundcard")]
@@ -71,9 +73,9 @@ pub struct ScriptResult {
     pub outputs: Vec<OutputConfig>,
     pub file_outputs: Vec<FileOutputConfig>,
     pub hls_outputs: Vec<HlsOutputConfig>,
-    #[cfg(feature = "rtmp")]
+    #[cfg(all(feature = "rtmp", feature = "aac"))]
     pub rtmp_outputs: Vec<crate::config::RtmpOutputConfig>,
-    #[cfg(feature = "video")]
+    #[cfg(all(feature = "video", feature = "aac"))]
     pub mp4_outputs: Vec<crate::config::Mp4OutputConfig>,
     #[cfg(feature = "soundcard")]
     pub soundcard_outputs: Vec<SoundcardOutputConfig>,
@@ -116,9 +118,9 @@ struct ScriptState {
     outputs: Vec<OutputConfig>,
     file_outputs: Vec<FileOutputConfig>,
     hls_outputs: Vec<HlsOutputConfig>,
-    #[cfg(feature = "rtmp")]
+    #[cfg(all(feature = "rtmp", feature = "aac"))]
     rtmp_outputs: Vec<crate::config::RtmpOutputConfig>,
-    #[cfg(feature = "video")]
+    #[cfg(all(feature = "video", feature = "aac"))]
     mp4_outputs: Vec<crate::config::Mp4OutputConfig>,
     #[cfg(feature = "soundcard")]
     soundcard_outputs: Vec<SoundcardOutputConfig>,
@@ -3535,12 +3537,16 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
     globals.set("server", server)?;
 
     // ---- outputs ----------------------------------------------------------
-    /// Parse an output format string (`"mp3"` / `"opus"`).
+    /// Parse an output format string (`"mp3"` / `"opus"`). MP3/AAC only
+    /// parse in builds with the matching feature; the error names the flag.
     fn parse_format(value: &str) -> mlua::Result<OutputFormat> {
         match value {
-            "mp3" => Ok(OutputFormat::Mp3),
+            "mp3" if cfg!(feature = "mp3") => Ok(OutputFormat::Mp3),
             "opus" => Ok(OutputFormat::Opus),
-            "aac" => Ok(OutputFormat::Aac),
+            "aac" if cfg!(feature = "aac") => Ok(OutputFormat::Aac),
+            "mp3" | "aac" => Err(mlua::Error::runtime(format!(
+                "format {value:?} needs a build with --features {value}"
+            ))),
             other => Err(mlua::Error::runtime(format!(
                 "unknown output format {other:?} (use \"mp3\", \"opus\" or \"aac\")"
             ))),
@@ -3590,11 +3596,21 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
 
     let out_state = state.clone();
     let make_output = lua.create_function(move |_, (opts, mut source): (Table, LuaSource)| {
-        let format = opts
-            .get::<Option<String>>("format")?
-            .map(|f| parse_format(&f))
-            .transpose()?
-            .unwrap_or(OutputFormat::Mp3);
+        let format =
+            match opts
+                .get::<Option<String>>("format")?
+                .map(|f| parse_format(&f))
+                .transpose()?
+            {
+                Some(f) => f,
+                None if cfg!(feature = "mp3") => OutputFormat::Mp3,
+                None => {
+                    return Err(mlua::Error::runtime(
+                        "output: format is required in this build \
+                         (--features mp3 restores the \"mp3\" default)",
+                    ))
+                }
+            };
         let protocol = opts
             .get::<Option<String>>("protocol")?
             .map(|p| parse_protocol(&p))
@@ -3649,11 +3665,21 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
             let path: String = opts
                 .get("path")
                 .map_err(|_| mlua::Error::runtime("output.file: path is required"))?;
-            let format = opts
-                .get::<Option<String>>("format")?
-                .map(|f| parse_format(&f))
-                .transpose()?
-                .unwrap_or(OutputFormat::Mp3);
+            let format =
+                match opts
+                    .get::<Option<String>>("format")?
+                    .map(|f| parse_format(&f))
+                    .transpose()?
+                {
+                    Some(f) => f,
+                    None if cfg!(feature = "mp3") => OutputFormat::Mp3,
+                    None => {
+                        return Err(mlua::Error::runtime(
+                            "output.file: format is required in this build \
+                             (--features mp3 restores the default \"mp3\")",
+                        ))
+                    }
+                };
             let cfg = FileOutputConfig {
                 path: path.into(),
                 format,
@@ -3665,121 +3691,126 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
             Ok(())
         })?,
     )?;
-    let hls_state = state.clone();
-    output.set(
-        "hls",
-        lua.create_function(move |_, (opts, mut source): (Table, LuaSource)| {
-            let directory: String = opts
-                .get("directory")
-                .map_err(|_| mlua::Error::runtime("output.hls: directory is required"))?;
-            let video: Option<Table> = opts.get("video")?;
-            let has_video = video.is_some();
-            if has_video {
-                // `video` must be a marker returned by `video.video(path)`,
-                // `video.playlist(...)`, `video.single(path)` or
-                // `video.slideshow(...)`; that call also created the shared
-                // tap the output subscribes to at startup.
-                let s = hls_state.borrow();
-                #[cfg(feature = "video")]
-                if s.video_tap.is_none()
-                    || (s.video.is_empty()
-                        && s.video_playlists.is_empty()
-                        && s.video_slideshows.is_empty())
-                {
+    // `output.hls({directory, segment_seconds, renditions, ...}, src)`
+    // segments AAC into an HLS playlist; unavailable without the codec.
+    #[cfg(feature = "aac")]
+    {
+        let hls_state = state.clone();
+        output.set(
+            "hls",
+            lua.create_function(move |_, (opts, mut source): (Table, LuaSource)| {
+                let directory: String = opts
+                    .get("directory")
+                    .map_err(|_| mlua::Error::runtime("output.hls: directory is required"))?;
+                let video: Option<Table> = opts.get("video")?;
+                let has_video = video.is_some();
+                if has_video {
+                    // `video` must be a marker returned by `video.video(path)`,
+                    // `video.playlist(...)`, `video.single(path)` or
+                    // `video.slideshow(...)`; that call also created the shared
+                    // tap the output subscribes to at startup.
+                    let s = hls_state.borrow();
+                    #[cfg(feature = "video")]
+                    if s.video_tap.is_none()
+                        || (s.video.is_empty()
+                            && s.video_playlists.is_empty()
+                            && s.video_slideshows.is_empty())
+                    {
+                        return Err(mlua::Error::runtime(
+                            "output.hls({video = ...}) requires a video.video/video.playlist/ \
+                             video.slideshow source registered first",
+                        ));
+                    }
+                    #[cfg(not(feature = "video"))]
+                    {
+                        let _ = s;
+                        return Err(mlua::Error::runtime(
+                            "output.hls({video = ...}) needs a video build (--features video)",
+                        ));
+                    }
+                }
+                // Multi-rendition ABR (G3.3): one encoder + subdirectory per
+                // entry, tied together by a variant master playlist. With a
+                // `video = marker` each rendition also gets its own H.264 encode
+                // at its own resolution/bitrate.
+                let renditions: Vec<Table> = opts
+                    .get::<Option<Vec<Table>>>("renditions")?
+                    .unwrap_or_default();
+                let mut parsed_renditions = Vec::new();
+                let mut names: Vec<String> = Vec::new();
+                for r in &renditions {
+                    let bitrate: u32 = r.get("bitrate").map_err(|_| {
+                        mlua::Error::runtime("output.hls: every rendition needs a bitrate")
+                    })?;
+                    if bitrate == 0 {
+                        return Err(mlua::Error::runtime(
+                            "output.hls: rendition bitrate must be > 0",
+                        ));
+                    }
+                    let name: String = r
+                        .get("name")
+                        .unwrap_or_else(|_| format!("{}k", bitrate / 1000));
+                    if name.is_empty()
+                        || name.contains('/')
+                        || name.contains('\\')
+                        || name == ".."
+                    {
+                        return Err(mlua::Error::runtime(format!(
+                            "output.hls: rendition name {name:?} must be a plain directory name"
+                        )));
+                    }
+                    if names.contains(&name) {
+                        return Err(mlua::Error::runtime(format!(
+                            "output.hls: duplicate rendition name {name:?}"
+                        )));
+                    }
+                    names.push(name.clone());
+                    let width: Option<u32> = r.get("width")?;
+                    let height: Option<u32> = r.get("height")?;
+                    if width.is_some() != height.is_some() {
+                        return Err(mlua::Error::runtime(format!(
+                            "output.hls: rendition {name:?} sets width and height together"
+                        )));
+                    }
+                    if width == Some(0) || height == Some(0) {
+                        return Err(mlua::Error::runtime(format!(
+                            "output.hls: rendition {name:?} resolution must be > 0"
+                        )));
+                    }
+                    let video_bitrate: u64 = r.get("video_bitrate").unwrap_or(1_500_000);
+                    parsed_renditions.push(HlsRendition {
+                        name,
+                        bitrate,
+                        video_bitrate,
+                        width,
+                        height,
+                    });
+                }
+                let segment_name: String = opts
+                    .get("segment_name")
+                    .unwrap_or_else(|_| "seg-{n}.ts".into());
+                if !segment_name.contains("{n}") || !segment_name.ends_with(".ts") {
                     return Err(mlua::Error::runtime(
-                        "output.hls({video = ...}) requires a video.video/video.playlist/ \
-                         video.slideshow source registered first",
+                        "output.hls: segment_name must contain {n} and end in .ts (e.g. \"seg-{n}.ts\")",
                     ));
                 }
-                #[cfg(not(feature = "video"))]
-                {
-                    let _ = s;
-                    return Err(mlua::Error::runtime(
-                        "output.hls({video = ...}) needs a video build (--features video)",
-                    ));
-                }
-            }
-            // Multi-rendition ABR (G3.3): one encoder + subdirectory per
-            // entry, tied together by a variant master playlist. With a
-            // `video = marker` each rendition also gets its own H.264 encode
-            // at its own resolution/bitrate.
-            let renditions: Vec<Table> = opts
-                .get::<Option<Vec<Table>>>("renditions")?
-                .unwrap_or_default();
-            let mut parsed_renditions = Vec::new();
-            let mut names: Vec<String> = Vec::new();
-            for r in &renditions {
-                let bitrate: u32 = r.get("bitrate").map_err(|_| {
-                    mlua::Error::runtime("output.hls: every rendition needs a bitrate")
-                })?;
-                if bitrate == 0 {
-                    return Err(mlua::Error::runtime(
-                        "output.hls: rendition bitrate must be > 0",
-                    ));
-                }
-                let name: String = r
-                    .get("name")
-                    .unwrap_or_else(|_| format!("{}k", bitrate / 1000));
-                if name.is_empty()
-                    || name.contains('/')
-                    || name.contains('\\')
-                    || name == ".."
-                {
-                    return Err(mlua::Error::runtime(format!(
-                        "output.hls: rendition name {name:?} must be a plain directory name"
-                    )));
-                }
-                if names.contains(&name) {
-                    return Err(mlua::Error::runtime(format!(
-                        "output.hls: duplicate rendition name {name:?}"
-                    )));
-                }
-                names.push(name.clone());
-                let width: Option<u32> = r.get("width")?;
-                let height: Option<u32> = r.get("height")?;
-                if width.is_some() != height.is_some() {
-                    return Err(mlua::Error::runtime(format!(
-                        "output.hls: rendition {name:?} sets width and height together"
-                    )));
-                }
-                if width == Some(0) || height == Some(0) {
-                    return Err(mlua::Error::runtime(format!(
-                        "output.hls: rendition {name:?} resolution must be > 0"
-                    )));
-                }
-                let video_bitrate: u64 = r.get("video_bitrate").unwrap_or(1_500_000);
-                parsed_renditions.push(HlsRendition {
-                    name,
-                    bitrate,
-                    video_bitrate,
-                    width,
-                    height,
-                });
-            }
-            let segment_name: String = opts
-                .get("segment_name")
-                .unwrap_or_else(|_| "seg-{n}.ts".into());
-            if !segment_name.contains("{n}") || !segment_name.ends_with(".ts") {
-                return Err(mlua::Error::runtime(
-                    "output.hls: segment_name must contain {n} and end in .ts (e.g. \"seg-{n}.ts\")",
-                ));
-            }
-            let cfg = HlsOutputConfig {
-                directory: directory.into(),
-                segment_seconds: opts.get("segment_seconds").unwrap_or(5.0),
-                retention: opts.get("retention").unwrap_or(12),
-                video: has_video,
-                renditions: parsed_renditions,
-                segment_name,
-                persist_at: opts.get::<Option<String>>("persist_at")?.map(PathBuf::from),
-                fallible: opts.get("fallible").unwrap_or(false),
-            };
-            let mut s = hls_state.borrow_mut();
-            claim_root(&mut s, &mut source)?;
-            s.hls_outputs.push(cfg);
-            Ok(())
-        })?,
-    )?;
+                let cfg = HlsOutputConfig {
+                    directory: directory.into(),
+                    segment_seconds: opts.get("segment_seconds").unwrap_or(5.0),
+                    retention: opts.get("retention").unwrap_or(12),
+                    video: has_video,
+                    renditions: parsed_renditions,
+                    segment_name,
+                    persist_at: opts.get::<Option<String>>("persist_at")?.map(PathBuf::from),
+                    fallible: opts.get("fallible").unwrap_or(false),
+                };
+                let mut s = hls_state.borrow_mut();
+                claim_root(&mut s, &mut source)?;
+                s.hls_outputs.push(cfg);
+                Ok(())
+            })?,
+        )?;
+    }
     #[cfg(feature = "soundcard")]
     {
         let sc_out_state = state.clone();
@@ -3798,7 +3829,7 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
     // (Part H5): publish the tap as FLV to an RTMP server. Video, when
     // given a video-source marker, subscribes to the shared tap exactly
     // like `output.hls({video = ...})`.
-    #[cfg(feature = "rtmp")]
+    #[cfg(all(feature = "rtmp", feature = "aac"))]
     {
         let rtmp_state = state.clone();
         output.set(
@@ -3857,8 +3888,8 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
     // mux the tap into a seekable MP4 recording. Video, when given a
     // video-source marker, subscribes to the shared tap exactly like
     // `output.hls({video = ...})`. Requires the `video` feature (the muxer
-    // is ffmpeg).
-    #[cfg(feature = "video")]
+    // is ffmpeg) and `aac` (the audio track codec).
+    #[cfg(all(feature = "video", feature = "aac"))]
     {
         let mp4_state = state.clone();
         output.set(
@@ -4043,9 +4074,9 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         outputs: std::mem::take(&mut s.outputs),
         file_outputs: std::mem::take(&mut s.file_outputs),
         hls_outputs: std::mem::take(&mut s.hls_outputs),
-        #[cfg(feature = "rtmp")]
+        #[cfg(all(feature = "rtmp", feature = "aac"))]
         rtmp_outputs: std::mem::take(&mut s.rtmp_outputs),
-        #[cfg(feature = "video")]
+        #[cfg(all(feature = "video", feature = "aac"))]
         mp4_outputs: std::mem::take(&mut s.mp4_outputs),
         #[cfg(feature = "soundcard")]
         soundcard_outputs: std::mem::take(&mut s.soundcard_outputs),
@@ -6157,6 +6188,7 @@ mod tests {
         assert_eq!(count(&rx), 2, "one event per burst, despite one label");
     }
 
+    #[cfg(feature = "mp3")]
     #[test]
     fn multiple_outputs_share_one_root_source() {
         let (_rt, res) = run(r#"
@@ -6173,6 +6205,7 @@ mod tests {
         assert_eq!(res.outputs[1].format, OutputFormat::Opus);
     }
 
+    #[cfg(feature = "mp3")]
     #[test]
     fn different_roots_for_multiple_outputs_are_rejected() {
         let err = match run(r#"
@@ -6186,6 +6219,7 @@ mod tests {
         assert!(err.to_string().contains("share the same root source"));
     }
 
+    #[cfg(feature = "mp3")]
     #[test]
     fn file_output_registers_and_shares_root() {
         let (_rt, res) = run(r#"
@@ -6205,6 +6239,7 @@ mod tests {
         assert_eq!(res.file_outputs[0].bitrate, 64_000);
     }
 
+    #[cfg(feature = "mp3")]
     #[test]
     fn file_output_requires_path_and_shared_root() {
         let err = match run(r#"
@@ -6227,6 +6262,7 @@ mod tests {
         assert!(err.to_string().contains("share the same root source"));
     }
 
+    #[cfg(feature = "aac")]
     #[test]
     fn hls_output_registers_and_defaults() {
         let (_rt, res) = run(r#"
@@ -6250,6 +6286,7 @@ mod tests {
         assert!(!res.hls_outputs[0].fallible);
     }
 
+    #[cfg(feature = "aac")]
     #[test]
     fn hls_output_parses_renditions_and_options() {
         let (_rt, res) = run(r#"
@@ -6290,6 +6327,7 @@ mod tests {
         assert!(res.root.is_some(), "root wrapped by fallible");
     }
 
+    #[cfg(feature = "aac")]
     #[test]
     fn hls_output_requires_directory() {
         let err = match run(r#"
@@ -6302,6 +6340,7 @@ mod tests {
         assert!(err.to_string().contains("directory is required"));
     }
 
+    #[cfg(feature = "aac")]
     #[test]
     fn hls_rendition_validation_errors() {
         let err = match run(r#"
@@ -6366,6 +6405,7 @@ mod tests {
         assert!(err.to_string().contains("resolution must be > 0"));
     }
 
+    #[cfg(feature = "aac")]
     #[test]
     fn hls_fallible_keeps_the_engine_alive() {
         let (_rt, res) = run(r#"
@@ -6392,6 +6432,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "aac")]
     #[test]
     fn hls_without_fallible_exhausts_normally() {
         let (_rt, res) = run(r#"
@@ -6406,7 +6447,7 @@ mod tests {
         assert!(root.is_exhausted(), "finite root without fallible must exhaust");
     }
 
-    #[cfg(feature = "video")]
+    #[cfg(all(feature = "video", feature = "aac"))]
     #[test]
     fn mp4_output_registers_and_defaults() {
         let (_rt, res) = run(r#"
@@ -6423,7 +6464,7 @@ mod tests {
         assert!(!res.mp4_outputs[0].video, "video defaults to false");
     }
 
-    #[cfg(feature = "video")]
+    #[cfg(all(feature = "video", feature = "aac"))]
     #[test]
     fn mp4_output_requires_file() {
         let err = match run(r#"
@@ -6436,7 +6477,7 @@ mod tests {
         assert!(err.to_string().contains("file is required"));
     }
 
-    #[cfg(feature = "video")]
+    #[cfg(all(feature = "video", feature = "aac"))]
     #[test]
     fn mp4_output_video_marker_requires_video_source() {
         let err = match run(r#"

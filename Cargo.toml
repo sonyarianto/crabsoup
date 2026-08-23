@@ -59,6 +59,17 @@ wsola = "0.1"
 sha1 = "0.10"
 
 [features]
+# Codec encoders: ON by default so plain builds keep every broadcast
+# format; minimal/headless servers use `--no-default-features` to drop the
+# system libmp3lame and fdk-aac link requirements (Opus stays: audiopus
+# links system libopus and the harbor decodes its live streams with it).
+default = ["mp3", "aac"]
+# MP3 encoding (Part Icecast/file `format = "mp3"`): links the system
+# libmp3lame (hand-rolled FFI in `src/output/encoder.rs`).
+mp3 = []
+# AAC/HE-AAC encoding (`format = "aac"`, HLS segments, RTMP audio, MP4
+# recording): links the system fdk-aac (no distro package; see README).
+aac = []
 # Video support (Part H): off by default so core builds stay libav-free.
 video = ["dep:ffmpeg-next"]
 # RTMP publishing (Part H5): links the system librtmp (rtmp:// URLs). Off

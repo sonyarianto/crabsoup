@@ -84,15 +84,23 @@ muxer).
 
 ## Building
 
-Requires Rust (edition 2024) and the dev packages for the native codecs:
+Requires Rust (edition 2024) and the dev packages for the native codecs.
+The default build links all three audio codecs (LAME/MP3, libopus/Opus,
+fdk-aac/AAC). Opus is always linked (the harbor decodes it), but MP3/AAC
+are default-on features that can be dropped for minimal/headless servers:
 
 ```sh
+# Full codecs (default):
 sudo apt install libmp3lame-dev libopus-dev   # Debian/Ubuntu
 # fdk-aac has no Debian/Ubuntu package: build from source into /usr/local
 # (build.rs links against it there):
 #   git clone https://github.com/mstorsjo/fdk-aac && cd fdk-aac
 #   ./autogen.sh && ./configure --prefix=/usr/local && make && sudo make install
-cargo build --release
+cargo build --release                         # mp3 + aac + opus
+
+# Minimal headless (Opus-only) — no libmp3lame / fdk-aac needed:
+sudo apt install libopus-dev
+cargo build --release --no-default-features   # opus only; add --features mp3 and/or --features aac to re-enable
 ```
 
 Video (HLS + RTMP) adds FFmpeg and the `video` feature. **FFmpeg ≥ 8.1.2 is

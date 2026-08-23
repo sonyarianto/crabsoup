@@ -10,11 +10,12 @@ use crabsoup::engine::mixer::{MixCommand, PriorityMixer, StatusHandle};
 use crabsoup::engine::tap::{AudioFrame, EngineTap, interruptible_sleep, recv_frame_or_shutdown};
 use crabsoup::live::harbor::Harbor;
 use crabsoup::output::file::FileOutput;
+#[cfg(feature = "aac")]
 use crabsoup::output::hls::HlsOutput;
 use crabsoup::output::icecast::IcecastOutput;
-#[cfg(feature = "video")]
+#[cfg(all(feature = "video", feature = "aac"))]
 use crabsoup::output::mp4::Mp4Output;
-#[cfg(feature = "rtmp")]
+#[cfg(all(feature = "rtmp", feature = "aac"))]
 use crabsoup::output::rtmp::RtmpOutput;
 #[cfg(feature = "soundcard")]
 use crabsoup::output::soundcard::SoundcardOutput;
@@ -228,11 +229,13 @@ fn main() -> crabsoup::Result<()> {
 
     // HLS outputs: the directory is prepared up front so a bad path fails
     // fast; the consumer thread then rotates the segment window.
+    #[cfg(feature = "aac")]
     let hls = if cli.preview {
         Vec::new()
     } else {
         result.hls_outputs.clone()
     };
+    #[cfg(feature = "aac")]
     for cfg in &hls {
         // Part H6: an HLS output marked `video` subscribes to the shared
         // video tap; the first registered track's (first playlist track's,
@@ -261,13 +264,13 @@ fn main() -> crabsoup::Result<()> {
     // RTMP outputs (Part H5): publish FLV (AAC audio, optional H.264 video)
     // to an RTMP server. Connection is lazy with retries — an unreachable
     // server does not fail startup, the output just waits.
-    #[cfg(feature = "rtmp")]
+    #[cfg(all(feature = "rtmp", feature = "aac"))]
     let rtmp = if cli.preview {
         Vec::new()
     } else {
         result.rtmp_outputs.clone()
     };
-    #[cfg(feature = "rtmp")]
+    #[cfg(all(feature = "rtmp", feature = "aac"))]
     for cfg in &rtmp {
         // Part H6 model: an RTMP output marked `video` subscribes to the
         // shared video tap; the first registered track's spec drives the
@@ -311,13 +314,13 @@ fn main() -> crabsoup::Result<()> {
     // MP4 outputs (Part H4): the file and streams are opened up front so a
     // bad path fails fast; the consumer thread then interleaves A/V into
     // the recording.
-    #[cfg(feature = "video")]
+    #[cfg(all(feature = "video", feature = "aac"))]
     let mp4 = if cli.preview {
         Vec::new()
     } else {
         result.mp4_outputs.clone()
     };
-    #[cfg(feature = "video")]
+    #[cfg(all(feature = "video", feature = "aac"))]
     for cfg in &mp4 {
         // Part H4: an MP4 output marked `video` subscribes to the shared
         // video tap; the first registered track's spec drives the H.264

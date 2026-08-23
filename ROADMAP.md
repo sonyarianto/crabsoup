@@ -1,6 +1,21 @@
 # Crabsoup roadmap
 
 ## Done (verified end-to-end)
+- [x] **Codec feature gate — `mp3`/`aac` are now default-on opt-out**:
+      plain builds still link LAME + fdk-aac, but
+      `cargo build --release --no-default-features` drops the system
+      `libmp3lame`/`fdk-aac` links entirely (Opus stays: `audiopus`/`libopus`
+      and harbor decode). `mp3`/`aac` features gate the LAME/aac FFI in
+      `src/output/encoder.rs`, `create_encoder` arms (clear runtime error),
+      script `parse_format` + `output.file`/`output.icecast` defaults,
+      `output.hls`/`output.rtmp`/`output.mp4` registrations (HLS unregistered
+      without `aac`, RTMP needs `rtmp+aac`, MP4 needs `video+aac`), and the
+      codec-specific tests + benches; scripts requesting a missing codec fail
+      with `needs a build with --features …`. CI now has a minimal job
+      (`--no-default-features`, only `libopus-dev`); README/getting-started/
+      ARCHITECTURE note the flags. Verified: default (366) and minimal
+      (344) lib tests pass, `cargo build --release --no-default-features`
+      links without `-lmp3lame`/`-lfdk-aac`, clippy clean in all combos.
 - [x] **Soundcard feature gate — `cpal` is now opt-in (`soundcard`)**:
       plain builds no longer need ALSA dev headers/pkg-config on headless
       servers (cpal unconditionally pulls alsa-sys on Linux). Follows the
