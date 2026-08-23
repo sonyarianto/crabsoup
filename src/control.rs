@@ -1695,18 +1695,21 @@ mod tests {
 
             let mut head = Vec::new();
             let mut chunk = [0u8; 1024];
-            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+            let header_end = loop {
+                if let Some(pos) = head.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
                 let n = client.read(&mut chunk).await.unwrap();
                 head.extend_from_slice(&chunk[..n]);
-            }
-            let resp = String::from_utf8_lossy(&head);
+            };
+            let resp = String::from_utf8_lossy(&head[..header_end]);
             assert!(resp.starts_with("HTTP/1.1 101"), "{resp}");
             assert!(
                 resp.contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="),
                 "{resp}"
             );
 
-            let mut buf = Vec::new();
+            let mut buf = head[header_end..].to_vec();
             let mut chunk = [0u8; 512];
             let reply = loop {
                 if let Ok(Some((0x1, true, payload, _))) = parse_ws_frame(&buf) {
