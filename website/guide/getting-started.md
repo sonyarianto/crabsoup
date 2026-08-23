@@ -28,6 +28,9 @@ soundcard.
 - **Video (opt-in, `--features video`)**: file → HLS(video) with
   `video.video`/`video.single`/`video.playlist` sources and keyframe-aligned
   MPEG-TS segments plus a master playlist — see the [video guide](/guide/video)
+- **Soundcard I/O (opt-in, `--features soundcard`)**: `input.soundcard`
+  capture and `output.soundcard` playback via cpal (Linux needs
+  `libasound2-dev`); headless streaming servers don't need it
 
 ## Building
 

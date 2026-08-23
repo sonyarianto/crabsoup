@@ -128,6 +128,15 @@ cargo build --release --features rtmp          # audio-only RTMP
 cargo build --release --features rtmp,video    # h264 + aac RTMP (and HLS)
 ```
 
+Soundcard I/O (`input.soundcard`/`output.soundcard`) adds the `soundcard`
+feature; on Linux it needs ALSA dev headers (`cpal` links alsa-sys
+unconditionally), so headless streaming servers can skip it:
+
+```sh
+sudo apt install libasound2-dev pkg-config     # only for --features soundcard
+cargo build --release --features soundcard
+```
+
 Lua 5.4 is vendored and compiled at build time (needs a C compiler).
 
 ## What's in the box
@@ -139,8 +148,8 @@ Lua 5.4 is vendored and compiled at build time (needs a C compiler).
 - Jingles: one-shot clips played over the music, triggered from a
   Liquidsoap-style telnet control port
 - Outputs: MP3 (LAME), Ogg/Opus (libopus + a built-in Ogg muxer with
-  spec-correct CRC-32), AAC/ADTS (fdk-aac), soundcard, file, HLS, RTMP,
-  MP4 recording
+  spec-correct CRC-32), AAC/ADTS (fdk-aac), file, HLS, RTMP, MP4
+  recording; soundcard playback/capture via the `soundcard` feature
 - Video (Part H, `--features video`): `video.video`, `video.single`,
   `video.playlist` and `video.slideshow` (stills with optional crossfades)
   feed a decode thread that publishes PTS-paced frames to a shared tap;
@@ -200,7 +209,8 @@ Named options are Lua tables; most have defaults. `format` is `"mp3"`,
 **Inputs** (live sources):
 
 - `input.harbor({port, mount, password})` — live DJ via Icecast source protocol
-- `input.soundcard({device})` — capture from a sound card (cpal) via an SPSC ring
+- `input.soundcard({device})` — capture from a sound card (cpal) via an SPSC
+  ring (soundcard feature)
 - `input.http(url, {reconnect_backoff})` — continuous relay/pull source;
   reconnects on drop and exhausts while disconnected, so
   `fallback({relay, local})` composes
@@ -208,7 +218,7 @@ Named options are Lua tables; most have defaults. `format` is `"mp3"`,
 **Outputs** (all consume the shared tap, any number at once):
 
 - `output.icecast({...}, src)` — MP3/Opus/AAC to Icecast (or SHOUTcast v2)
-- `output.soundcard({device}, src)` — play through a device
+- `output.soundcard({device}, src)` — play through a device (soundcard feature)
 - `output.file({path, format}, src)` — encode to a local file
 - `output.hls({...}, src)` / `output.mp4({...}, src)` / `output.rtmp({...}, src)` —
   HLS segments, MP4 recording, FLV publishing (video feature)
@@ -310,10 +320,10 @@ shipped and verified; the status of the rest of the project is tracked in
 | `compress(threshold, ratio, ...)`, `normalize(target, ...)` | `compress(src, {threshold = -12, ratio = 2})`, `normalize(src, {target = -13})` |
 | replaygain (liq `amplify` + RG tags) | `replaygain(src, {max_boost = 6, max_cut = 6})` |
 | `input.harbor(...)` | `input.harbor({...})` |
-| `input.soundcard()` | `input.soundcard({device = nil})` — cpal capture bridged into the bus via an SPSC ring |
+| `input.soundcard()` | `input.soundcard({device = nil})` — cpal capture bridged into the bus via an SPSC ring (soundcard feature) |
 | `input.http(...)` | `input.http(url, {reconnect_backoff = 500})` — continuous relay/pull source, reconnects on drop, exhausts while disconnected so `fallback({relay, local})` composes |
 | `output.icecast(...)` | `output.icecast({...}, src)` — multiple outputs share one source via the tap |
-| `output.soundcard()` | `output.soundcard({device = nil}, src)` — tap consumer playing through the device |
+| `output.soundcard()` | `output.soundcard({device = nil}, src)` — tap consumer playing through the device (soundcard feature) |
 | `output.file(...)` | `output.file({path, format}, src)` |
 | `server.telnet(...)` | `server.telnet({port = 1234})` |
 | telnet `skip` / `status` / `uptime` | same |

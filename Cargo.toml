@@ -39,8 +39,9 @@ ogg = "0.9"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "1.0"
 # Cross-platform audio device I/O (Part F2: `input.soundcard` /
-# `output.soundcard`).
-cpal = "0.15"
+# `output.soundcard`). Optional: headless Icecast servers don't need it,
+# and on Linux cpal unconditionally pulls alsa-sys (system libasound2-dev).
+cpal = { version = "0.15", optional = true }
 # .liq scripting (Liquidsoap-style config in Lua); vendored Lua 5.4,
 # no `send` feature: sources are Rc-based and stay on the main thread.
 mlua = { version = "0.10", default-features = false, features = ["lua54", "vendored"] }
@@ -63,6 +64,9 @@ video = ["dep:ffmpeg-next"]
 # RTMP publishing (Part H5): links the system librtmp (rtmp:// URLs). Off
 # by default so core builds don't need librtmp-dev.
 rtmp = []
+# Soundcard I/O (Part F2): `input.soundcard`/`output.soundcard` via cpal.
+# Off by default so core builds don't need alsa-lib/pkg-config.
+soundcard = ["dep:cpal"]
 
 [dev-dependencies]
 criterion = "0.5"

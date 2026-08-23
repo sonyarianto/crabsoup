@@ -88,10 +88,11 @@ Encodes the root source to a file (e.g. Opus) instead of broadcasting.
 
 ## `output.soundcard({device}, src)`
 
-A tap consumer playing through the device via the same SPSC-ring pattern as
-the harbor: its thread resamples into a reusable scratch and pushes into a
-ring the device callback drains (silence on underrun). Device and stream open
-at startup, so a missing device fails before the tap pulls.
+Soundcard build only (`--features soundcard`). A tap consumer playing through
+the device via the same SPSC-ring pattern as the harbor: its thread resamples
+into a reusable scratch and pushes into a ring the device callback drains
+(silence on underrun). Device and stream open at startup, so a missing device
+fails before the tap pulls.
 
 ## `output.hls({directory, segment_seconds, retention, ...}, src)`
 

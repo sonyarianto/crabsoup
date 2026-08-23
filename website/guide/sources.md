@@ -134,9 +134,10 @@ port](/guide/control-port) — `status` shows `live: true|false` and
 
 ## `input.soundcard({device})`
 
-cpal capture bridged into the bus via an SPSC ring. The device is opened
-synchronously at script evaluation, so a missing/broken device fails fast
-(`--check` is hardware-dependent for scripts that use it).
+Soundcard build only (`--features soundcard`). cpal capture bridged into the
+bus via an SPSC ring. The device is opened synchronously at script
+evaluation, so a missing/broken device fails fast (`--check` is
+hardware-dependent for scripts that use it).
 
 ## `input.http(url, {reconnect_backoff = 500})`
 

@@ -37,11 +37,12 @@ use symphonia::core::audio::SignalSpec;
 
 use crate::config::{
     AacProfile, ControlConfig, FileOutputConfig, HlsOutputConfig, HlsRendition, LiveConfig,
-    MixerConfig, OutputConfig, OutputFormat, OutputProtocol, SoundcardOutputConfig, StreamConfig,
-    collect_audio,
+    MixerConfig, OutputConfig, OutputFormat, OutputProtocol, StreamConfig, collect_audio,
 };
 #[cfg(feature = "video")]
 use crate::config::{collect_images, collect_video};
+#[cfg(feature = "soundcard")]
+use crate::config::SoundcardOutputConfig;
 use crate::engine::effects::{db_to_gain, Agc, Amplify, Compressor, Echo, EffectSource, Limiter};
 use crate::engine::eq::{Eq, EqBand, EqType};
 use crate::engine::mixer::CrossfadeMixer;
@@ -56,6 +57,7 @@ use crate::source::pipe::{PcmFormat, PipeConfig, PipeSource};
 use crate::source::playlist::{Playlist, PlaylistSource};
 use crate::source::replaygain::ReplayGainSource;
 use crate::source::request::{RequestQueue, RequestQueueSource};
+#[cfg(feature = "soundcard")]
 use crate::source::soundcard::{SoundcardInputConfig, SoundcardInputSource};
 use crate::source::{AudioSource, BlankSource, SilenceSource, SineSource};
 
@@ -73,6 +75,7 @@ pub struct ScriptResult {
     pub rtmp_outputs: Vec<crate::config::RtmpOutputConfig>,
     #[cfg(feature = "video")]
     pub mp4_outputs: Vec<crate::config::Mp4OutputConfig>,
+    #[cfg(feature = "soundcard")]
     pub soundcard_outputs: Vec<SoundcardOutputConfig>,
     /// Shared state of the `request.queue` source, handed to the telnet
     /// server for `queue.push`/`queue.list`/`queue.clear`/`queue.skip`.
@@ -117,6 +120,7 @@ struct ScriptState {
     rtmp_outputs: Vec<crate::config::RtmpOutputConfig>,
     #[cfg(feature = "video")]
     mp4_outputs: Vec<crate::config::Mp4OutputConfig>,
+    #[cfg(feature = "soundcard")]
     soundcard_outputs: Vec<SoundcardOutputConfig>,
     request_queue: Option<Arc<RequestQueue>>,
     /// Named telnet commands registered by `server.register(name, fn)`;
@@ -3300,24 +3304,6 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         // is a marker that exhausts immediately when composed.
         Ok(LuaSource::new(Box::new(SilenceSource::new())))
     })?;
-    // ---- soundcard capture (Liquidsoap `input.soundcard`) -------------------
-    // Opens the device at script evaluation (fail fast); the cpal stream runs
-    // on its own realtime thread and the source drains it on the pull thread.
-    let sc_state = state.clone();
-    let soundcard_fn = lua.create_function(move |_, opts: Option<Table>| {
-        let device: Option<String> = match &opts {
-            Some(t) => t.get("device")?,
-            None => None,
-        };
-        let (spec, _) = bus(&sc_state);
-        let src = SoundcardInputSource::open(
-            &SoundcardInputConfig { device },
-            spec.rate,
-            spec.channels.count(),
-        )
-        .map_err(mlua::Error::runtime)?;
-        Ok(LuaSource::new(Box::new(src)))
-    })?;
     // ---- relay/pull-stream source (Liquidsoap `input.http`) --------------
     // A network thread GETs the URL and decodes the live body into a ring;
     // while disconnected the source exhausts, so a
@@ -3342,7 +3328,28 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
     })?;
     let input = lua.create_table()?;
     input.set("harbor", harbor_fn)?;
-    input.set("soundcard", soundcard_fn)?;
+    // ---- soundcard capture (Liquidsoap `input.soundcard`) -------------------
+    // Opens the device at script evaluation (fail fast); the cpal stream runs
+    // on its own realtime thread and the source drains it on the pull thread.
+    #[cfg(feature = "soundcard")]
+    {
+        let sc_state = state.clone();
+        let soundcard_fn = lua.create_function(move |_, opts: Option<Table>| {
+            let device: Option<String> = match &opts {
+                Some(t) => t.get("device")?,
+                None => None,
+            };
+            let (spec, _) = bus(&sc_state);
+            let src = SoundcardInputSource::open(
+                &SoundcardInputConfig { device },
+                spec.rate,
+                spec.channels.count(),
+            )
+            .map_err(mlua::Error::runtime)?;
+            Ok(LuaSource::new(Box::new(src)))
+        })?;
+        input.set("soundcard", soundcard_fn)?;
+    }
     input.set("http", http_fn)?;
     globals.set("input", input)?;
 
@@ -3773,17 +3780,20 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
             Ok(())
         })?,
     )?;
-    let sc_out_state = state.clone();
-    output.set(
-        "soundcard",
-        lua.create_function(move |_, (opts, mut source): (Table, LuaSource)| {
-            let device: Option<String> = opts.get("device")?;
-            let mut s = sc_out_state.borrow_mut();
-            claim_root(&mut s, &mut source)?;
-            s.soundcard_outputs.push(SoundcardOutputConfig { device });
-            Ok(())
-        })?,
-    )?;
+    #[cfg(feature = "soundcard")]
+    {
+        let sc_out_state = state.clone();
+        output.set(
+            "soundcard",
+            lua.create_function(move |_, (opts, mut source): (Table, LuaSource)| {
+                let device: Option<String> = opts.get("device")?;
+                let mut s = sc_out_state.borrow_mut();
+                claim_root(&mut s, &mut source)?;
+                s.soundcard_outputs.push(SoundcardOutputConfig { device });
+                Ok(())
+            })?,
+        )?;
+    }
     // `output.rtmp({url = ..., format, bitrate, video = marker}, root)`
     // (Part H5): publish the tap as FLV to an RTMP server. Video, when
     // given a video-source marker, subscribes to the shared tap exactly
@@ -4037,6 +4047,7 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         rtmp_outputs: std::mem::take(&mut s.rtmp_outputs),
         #[cfg(feature = "video")]
         mp4_outputs: std::mem::take(&mut s.mp4_outputs),
+        #[cfg(feature = "soundcard")]
         soundcard_outputs: std::mem::take(&mut s.soundcard_outputs),
         request_queue: s.request_queue.take(),
         custom_commands: s.custom_commands.iter().map(|(n, _)| n.clone()).collect(),
@@ -4704,6 +4715,7 @@ mod tests {
         out
     }
 
+    #[cfg(feature = "soundcard")]
     #[test]
     fn output_soundcard_registers_without_opening_a_device() {
         // Unlike `input.soundcard`, the device is opened only at connect()
@@ -4716,6 +4728,7 @@ mod tests {
         assert!(res.root.is_some(), "output.soundcard claims the root");
     }
 
+    #[cfg(feature = "soundcard")]
     #[test]
     fn input_soundcard_opens_or_fails_gracefully_without_a_device() {
         // The capture device opens at script evaluation, so this is

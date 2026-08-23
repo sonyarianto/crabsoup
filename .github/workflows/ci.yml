@@ -48,7 +48,7 @@ jobs:
         run: cargo build --release
 
   video:
-    name: test + clippy + build (video feature)
+    name: test + clippy + build (video + soundcard features)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -86,10 +86,10 @@ jobs:
           restore-keys: ${{ runner.os }}-video-cargo-
 
       - name: Clippy
-        run: cargo clippy --all-targets --features video -- -D warnings
+        run: cargo clippy --all-targets --features video,soundcard -- -D warnings
 
       - name: Tests
-        run: cargo test --lib --features video
+        run: cargo test --lib --features video,soundcard
 
       - name: Release build
-        run: cargo build --release --features video
+        run: cargo build --release --features video,soundcard

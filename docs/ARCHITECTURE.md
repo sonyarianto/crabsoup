@@ -487,7 +487,12 @@ into `/usr/local` and `build.rs` adds the link path.
   them type-less too). Never inject comment pages mid-stream: Icecast
   forwards them to listeners as audio, producing decoder warnings.
 
-## Soundcard I/O (`input.soundcard`, `output.soundcard`)
+## Soundcard I/O (`input.soundcard`, `output.soundcard`, `--features soundcard`)
+
+Opt-in via the `soundcard` feature: `cpal` unconditionally pulls
+`alsa-sys` on Linux (system libasound2-dev + pkg-config), so headless
+Icecast builds skip it by default. Scripts calling the soundcard
+functions on a feature-less build fail with unknown-function.
 
 Both directions bridge through the same SPSC-ring pattern as the live
 harbor, because cpal's callbacks run on a realtime audio thread that must

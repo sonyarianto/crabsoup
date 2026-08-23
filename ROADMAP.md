@@ -1,6 +1,19 @@
 # Crabsoup roadmap
 
 ## Done (verified end-to-end)
+- [x] **Soundcard feature gate — `cpal` is now opt-in (`soundcard`)**:
+      plain builds no longer need ALSA dev headers/pkg-config on headless
+      servers (cpal unconditionally pulls alsa-sys on Linux). Follows the
+      `video`/`rtmp` pattern: `#[cfg(feature = "soundcard")]` gates
+      `src/source/soundcard.rs` + `src/output/soundcard.rs`, both Lua
+      registrations, the `ScriptState`/`ScriptResult`
+      `soundcard_outputs` fields, main's output spawn loop, and the two
+      script tests; scripts calling `input.soundcard`/`output.soundcard`
+      on a feature-less build fail with unknown-function. CI's feature
+      job now runs `--features video,soundcard`; README/getting-started/
+      guides/ARCHITECTURE note the flag. Verified: default build+tests
+      (366) and `--features soundcard` build+tests (376) pass, clippy
+      clean both ways.
 - [x] **G-crossfade — top-level `crossfade(src, {duration, curve})`**: a
       ring-buffer overlap crossfade over the consecutive tracks of any
       source, mirroring Liquidsoap's `crossfade`/`rotate` recipe. A

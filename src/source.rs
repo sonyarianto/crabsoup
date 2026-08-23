@@ -10,6 +10,7 @@ pub mod pipe;
 pub mod playlist;
 pub mod replaygain;
 pub mod request;
+#[cfg(feature = "soundcard")]
 pub mod soundcard;
 
 use symphonia::core::audio::SignalSpec;

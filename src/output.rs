@@ -10,4 +10,5 @@ pub mod mpegts;
 pub mod ogg_mux;
 #[cfg(feature = "rtmp")]
 pub mod rtmp;
+#[cfg(feature = "soundcard")]
 pub mod soundcard;
