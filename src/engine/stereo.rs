@@ -55,7 +55,7 @@ impl Effect for Stereo {
             (((1.0 - self.pan) * FRAC_PI_2).sin(), 1.0)
         };
         let w = self.width;
-        for pair in buf.chunks_exact_mut(2) {
+        for pair in buf.as_chunks_mut::<2>().0 {
             let l = pair[0];
             let r = pair[1];
             let mid = (l + r) * 0.5;
@@ -110,7 +110,7 @@ impl Effect for VocalRemover {
         }
         let s = self.strength;
         let one_minus_s = 1.0 - s;
-        for pair in buf.chunks_exact_mut(2) {
+        for pair in buf.as_chunks_mut::<2>().0 {
             let l = pair[0];
             let r = pair[1];
             let l_low = self.lp_l.tick(l);

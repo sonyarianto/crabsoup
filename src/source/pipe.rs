@@ -74,12 +74,12 @@ impl PcmFormat {
     fn decode(&self, bytes: &[u8], out: &mut Vec<f32>) {
         match self {
             PcmFormat::S16Le => {
-                for c in bytes.chunks_exact(2) {
+                for c in bytes.as_chunks::<2>().0 {
                     out.push(i16::from_le_bytes([c[0], c[1]]) as f32 / 32767.0);
                 }
             }
             PcmFormat::S24Le => {
-                for c in bytes.chunks_exact(3) {
+                for c in bytes.as_chunks::<3>().0 {
                     let sign = if c[2] & 0x80 != 0 { 0xFF } else { 0 };
                     let v = i32::from_le_bytes([c[0], c[1], c[2], sign]);
                     out.push(v as f32 / 8_388_607.0);

@@ -261,7 +261,7 @@ mod tests {
         let mut out = Vec::new();
         mux.write_program(&mut out);
         assert_eq!(out.len(), 2 * TS_PACKET_SIZE);
-        for (i, packet) in out.chunks_exact(TS_PACKET_SIZE).enumerate() {
+        for (i, packet) in out.as_chunks::<TS_PACKET_SIZE>().0.iter().enumerate() {
             assert_eq!(packet[0], SYNC);
             let pid = (((packet[1] & 0x1f) as u16) << 8) | packet[2] as u16;
             assert_eq!(pid, if i == 0 { PAT_PID } else { PMT_PID });

@@ -6763,7 +6763,7 @@ mod tests {
     fn stereo_widen_zero_collapses_to_mono() {
         let out =
             preview_out(r#"output.preview(stereo.widen(sine({freq = 440, duration = 0.2}), 0))"#);
-        for pair in out.chunks_exact(2) {
+        for pair in out.as_chunks::<2>().0 {
             assert!(
                 (pair[0] - pair[1]).abs() < 1e-5,
                 "channels identical after mono collapse: {} vs {}",
