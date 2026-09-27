@@ -1,6 +1,8 @@
 # Crabsoup
 
 [![Sponsor](https://img.shields.io/badge/Sponsor-GitHub%20Sponsors-ea4aaa.svg)](https://github.com/sponsors/sonyarianto)
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-FFDD00?logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/sonyarianto)
+[![Ko-fi](https://img.shields.io/badge/Ko--fi-F16061?logo=ko-fi&logoColor=white)](https://ko-fi.com/sonyarianto)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/sonyarianto/crabsoup/actions/workflows/ci.yml/badge.svg)](https://github.com/sonyarianto/crabsoup/actions/workflows/ci.yml)
 
@@ -417,4 +419,6 @@ MIT
 
 If Crabsoup runs your station and you want to say thanks: [GitHub
 Sponsors](https://github.com/sponsors/sonyarianto) · [Buy Me a
-Coffee](https://buymeacoffee.com/sonyarianto) · [PayPal](https://paypal.me/sonyarianto)
+Coffee](https://buymeacoffee.com/sonyarianto) ·
+[Ko-fi](https://ko-fi.com/sonyarianto) ·
+[PayPal](https://paypal.me/sonyarianto)
