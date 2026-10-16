@@ -5,6 +5,7 @@ pub mod flv;
 pub mod hls;
 pub mod icecast;
 pub mod icecast_client;
+pub mod meter;
 #[cfg(all(feature = "video", feature = "aac"))]
 pub mod mp4;
 pub mod mpegts;

@@ -1,6 +1,10 @@
 # Crabsoup roadmap
 
 ## Done (verified end-to-end)
+- [x] **`output.meter({path = "/levels"}, src)` — on-air loudness meter**:
+      EBU R128 loudness and true peak (`ebur128` crate) plus a 16-band
+      spectrum per channel, served as server-sent events at `path` on the HTTP
+      control port while a client listens. Verified live on a 24/7 station.
 - [x] **Codec feature gate — `mp3`/`aac` are now default-on opt-out**:
       plain builds still link LAME + fdk-aac, but
       `cargo build --release --no-default-features` drops the system

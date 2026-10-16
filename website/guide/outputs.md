@@ -86,6 +86,17 @@ Decodes and mixes locally with no broadcast.
 
 Encodes the root source to a file (e.g. Opus) instead of broadcasting.
 
+## `output.meter({path}, src)`
+
+Measures what goes on air and streams it as server-sent events at `path` (must
+start with `/`) on the HTTP control port, so `server.telnet({http_port = N})` is
+required. It sends `levels` ten times a second (EBU R128 `momentary`,
+`shortTerm`, `integrated` loudness in LUFS, loudness `range` in LU, `truePeak`
+in dBFS since the last event; `null` in silence) and `spectrum` thirty times a
+second (per channel, 16 log-spaced bands from 30 Hz to 10 kHz, each 0-255). It
+measures only while a client listens; the integrated loudness starts over after
+10 s with nobody listening.
+
 ## `output.soundcard({device}, src)`
 
 Soundcard build only (`--features soundcard`). A tap consumer playing through

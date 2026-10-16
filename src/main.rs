@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,6 +14,7 @@ use crabsoup::output::file::FileOutput;
 #[cfg(feature = "aac")]
 use crabsoup::output::hls::HlsOutput;
 use crabsoup::output::icecast::IcecastOutput;
+use crabsoup::output::meter::Meter;
 #[cfg(all(feature = "video", feature = "aac"))]
 use crabsoup::output::mp4::Mp4Output;
 #[cfg(all(feature = "rtmp", feature = "aac"))]
@@ -98,7 +100,12 @@ fn main() -> crabsoup::Result<()> {
 
     // Shared status for the telnet `status`/`uptime` commands; the consuming
     // loops keep the current label fresh.
-    let status = StatusHandle::new();
+    let meters: HashMap<String, Meter> = result
+        .meter_outputs
+        .iter()
+        .map(|path| (path.clone(), Meter::default()))
+        .collect();
+    let status = StatusHandle::new().with_meters(meters.clone());
     let shutdown = Arc::new(AtomicBool::new(false));
 
     // Background tokio runtime: live harbor listener + Ctrl-C handler.
@@ -201,6 +208,14 @@ fn main() -> crabsoup::Result<()> {
                 }
             }
             output.run()
+        }));
+    }
+
+    for (_, meter) in meters {
+        let meter_rx = tap.register();
+        let meter_shutdown = shutdown.clone();
+        handles.push(std::thread::spawn(move || {
+            meter.run(meter_rx, spec.rate, chans, meter_shutdown)
         }));
     }
 
@@ -455,6 +470,9 @@ fn print_result(result: &ScriptResult, preview: bool) {
                 out.port,
                 out.mount
             ));
+        }
+        for path in &result.meter_outputs {
+            lines.push(format!("meter: GET {path} on the HTTP control port"));
         }
         for rec in &result.file_outputs {
             lines.push(format!(

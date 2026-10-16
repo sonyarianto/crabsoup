@@ -72,6 +72,8 @@ pub struct ScriptResult {
     pub control: Option<ControlConfig>,
     pub outputs: Vec<OutputConfig>,
     pub file_outputs: Vec<FileOutputConfig>,
+    /// `output.meter` paths, each served on the HTTP control port.
+    pub meter_outputs: Vec<String>,
     pub hls_outputs: Vec<HlsOutputConfig>,
     #[cfg(all(feature = "rtmp", feature = "aac"))]
     pub rtmp_outputs: Vec<crate::config::RtmpOutputConfig>,
@@ -117,6 +119,7 @@ struct ScriptState {
     control: Option<ControlConfig>,
     outputs: Vec<OutputConfig>,
     file_outputs: Vec<FileOutputConfig>,
+    meter_outputs: Vec<String>,
     hls_outputs: Vec<HlsOutputConfig>,
     #[cfg(all(feature = "rtmp", feature = "aac"))]
     rtmp_outputs: Vec<crate::config::RtmpOutputConfig>,
@@ -3691,6 +3694,31 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
             Ok(())
         })?,
     )?;
+    // `output.meter({path = "/levels"}, src)`: loudness and spectrum as server-sent events at
+    // `path` on the HTTP control port.
+    let meter_state = state.clone();
+    output.set(
+        "meter",
+        lua.create_function(move |_, (opts, mut source): (Table, LuaSource)| {
+            let path: String = opts
+                .get("path")
+                .map_err(|_| mlua::Error::runtime("output.meter: path is required"))?;
+            if !path.starts_with('/') {
+                return Err(mlua::Error::runtime(format!(
+                    "output.meter: path {path:?} must start with /"
+                )));
+            }
+            let mut s = meter_state.borrow_mut();
+            if s.meter_outputs.contains(&path) {
+                return Err(mlua::Error::runtime(format!(
+                    "output.meter: {path} is already a meter"
+                )));
+            }
+            claim_root(&mut s, &mut source)?;
+            s.meter_outputs.push(path);
+            Ok(())
+        })?,
+    )?;
     // `output.hls({directory, segment_seconds, renditions, ...}, src)`
     // segments AAC into an HLS playlist; unavailable without the codec.
     #[cfg(feature = "aac")]
@@ -4073,6 +4101,7 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
         control: s.control.take(),
         outputs: std::mem::take(&mut s.outputs),
         file_outputs: std::mem::take(&mut s.file_outputs),
+        meter_outputs: std::mem::take(&mut s.meter_outputs),
         hls_outputs: std::mem::take(&mut s.hls_outputs),
         #[cfg(all(feature = "rtmp", feature = "aac"))]
         rtmp_outputs: std::mem::take(&mut s.rtmp_outputs),
@@ -4096,6 +4125,13 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
     if result.root.is_none() && result.preview.is_none() {
         return Err(mlua::Error::runtime(
             "script defines no output: add output.icecast(...) or output.preview(...)",
+        ));
+    }
+    if !result.meter_outputs.is_empty()
+        && result.control.as_ref().and_then(|c| c.http_port).is_none()
+    {
+        return Err(mlua::Error::runtime(
+            "output.meter is served over HTTP: add server.telnet({http_port = ...})",
         ));
     }
     let runtime = ScriptRuntime {
@@ -6217,6 +6253,30 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("share the same root source"));
+    }
+
+    #[test]
+    fn meter_output_registers_its_path() {
+        let (_rt, res) = run(r#"
+            src = sine({freq = 440, duration = 1})
+            server.telnet({port = 0, http_port = 0})
+            output.meter({path = "/levels"}, src)
+            "#)
+        .expect("script runs");
+        assert_eq!(res.meter_outputs, ["/levels"]);
+    }
+
+    #[test]
+    fn meter_output_needs_the_http_control_port() {
+        let err = match run(r#"
+            src = sine({freq = 440, duration = 1})
+            output.meter({path = "/levels"}, src)
+            "#)
+        {
+            Ok(_) => panic!("a meter without http_port must fail"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("http_port"), "{err}");
     }
 
     #[cfg(feature = "mp3")]

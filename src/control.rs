@@ -27,6 +27,8 @@
 //! over HTTP on the same host: `GET /status`, `GET /uptime`, `GET /queue`,
 //! `GET /jingles`, and `POST /cmd` with a JSON body
 //! `{"command": "..."}`. Every response reuses the JSON envelope above.
+//! Each `output.meter` path streams server-sent loudness and spectrum
+//! events instead.
 //!
 //! `server.telnet({ws_port = N})` serves it over WebSocket (RFC 6455) on
 //! the same host: each text frame is one command (either a bare command
@@ -233,6 +235,11 @@ async fn handle_http(
             return Ok(());
         }
     };
+    if method == "GET"
+        && let Some(meter) = status.meter(&path)
+    {
+        return stream_levels(socket, meter.subscribe()).await;
+    }
     let ctx = DispatchCtx {
         jingles,
         queue: queue.as_deref(),
@@ -243,6 +250,30 @@ async fn handle_http(
     };
     let (code, body) = http_route(&method, &path, &body, &ctx, &mut rng);
     write_http(&mut socket, code, &body).await
+}
+
+/// Server-sent events until the client goes away.
+async fn stream_levels(
+    mut socket: TcpStream,
+    mut events: tokio::sync::broadcast::Receiver<Arc<str>>,
+) -> Result<(), String> {
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                Cache-Control: no-cache\r\nConnection: close\r\n\r\n";
+    if socket.write_all(head.as_bytes()).await.is_err() {
+        return Ok(());
+    }
+    loop {
+        match events.recv().await {
+            Ok(event) => {
+                if socket.write_all(event.as_bytes()).await.is_err() {
+                    return Ok(());
+                }
+            }
+            // A slow client skips what it missed.
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+        }
+    }
 }
 
 /// Read a raw request head (up to and including `\r\n\r\n`). Returns the

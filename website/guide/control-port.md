@@ -95,6 +95,7 @@ curl -X POST -H 'Content-Type: application/json' \
 | `GET /queue` | `queue.list` |
 | `GET /jingles` | `jingles.list` |
 | `POST /cmd` `{"command": "..."}` | any control command; reply identical to `json <command>` on telnet |
+| `GET <path>` of an `output.meter` | server-sent events, see [`output.meter`](outputs.md#output-meter-path-src) |
 
 HTTP status codes: 200 for `{"ok": true}`, 400 for `{"ok": false}`
 (unknown command, bad usage, malformed body), 404 for unknown routes,

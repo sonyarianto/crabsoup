@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -336,6 +337,8 @@ pub struct StatusHandle {
     /// True while a live DJ holds the harbor (the playlist is ducked).
     /// Shared with the harbor, which toggles it on connect/disconnect.
     harbor_connected: Arc<AtomicBool>,
+    /// `output.meter`s by the path the HTTP control port serves each at.
+    meters: HashMap<String, crate::output::meter::Meter>,
 }
 
 impl StatusHandle {
@@ -344,7 +347,17 @@ impl StatusHandle {
             started: std::time::Instant::now(),
             current: Arc::new(Mutex::new(String::new())),
             harbor_connected: Arc::new(AtomicBool::new(false)),
+            meters: HashMap::new(),
         }
+    }
+
+    pub fn with_meters(mut self, meters: HashMap<String, crate::output::meter::Meter>) -> Self {
+        self.meters = meters;
+        self
+    }
+
+    pub fn meter(&self, path: &str) -> Option<&crate::output::meter::Meter> {
+        self.meters.get(path)
     }
 
     /// The flag the harbor writes to; hand a clone to the harbor.
