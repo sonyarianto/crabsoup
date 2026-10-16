@@ -186,7 +186,7 @@ printf 'status\n' | nc localhost 1234         # current track + uptime
 printf 'shutdown\n' | nc localhost 1234
 ```
 
-Commands: `jingles.list`, `jingles.play [n|substr]`, `skip`, `status`,
+Commands: `jingles.list`, `jingles.play [n|substr]`, `skip`, `live.stop`, `status`,
 `uptime`, `shutdown`, `exit`, `help`, plus anything you register in the
 script with `server.register("name", function(args) return reply end)` —
 the handler gets the rest of the line as one string and its return value is

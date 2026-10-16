@@ -21,6 +21,7 @@ printf 'shutdown\n' | nc localhost 1234
 | `jingles.play [n\|substr]` | Play a random, indexed, or substring-matched jingle |
 | `queue.push <uri>` | Push a request (path or `http(s)://` URL) onto the request queue |
 | `skip` | Skip the current track |
+| `live.stop` | Cut the live DJ off and refuse DJs for 60 s (source clients reconnect on their own) |
 | `status` | Current track + uptime |
 | `uptime` | Engine uptime |
 | `shutdown` | Graceful shutdown |
@@ -50,7 +51,7 @@ message the plain-text protocol prints). Notable fields:
 | `json queue.list` | `{"ok":true,"queue":["...", ...]}` |
 | `json jingles.list` | `{"ok":true,"jingles":["...", ...]}` |
 | `json queue.push <uri>` | `{"ok":true,"queued":"...","length":N}` |
-| `json skip` / `json shutdown` | `{"ok":true,"message":"..."}` |
+| `json skip` / `json live.stop` / `json shutdown` | `{"ok":true,"message":"..."}` |
 | `json <custom command>` | `{"ok":true,"reply":"..."}` |
 | any error | `{"ok":false,"error":"..."}` |
 

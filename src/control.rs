@@ -8,6 +8,7 @@
 //! - `jingles.play <n>`        — play jingle at index `n`
 //! - `jingles.play <substr>`   — play the jingle whose name contains `substr`
 //! - `skip`                    — skip the current track
+//! - `live.stop`               — cut the live DJ off and refuse DJs for 60 s
 //! - `status`                  — current track + uptime
 //! - `uptime`                  — seconds since startup
 //! - `shutdown`                — stop the app (like Ctrl-C)
@@ -52,6 +53,10 @@ use crate::config::ControlConfig;
 use crate::engine::mixer::{MixCommand, StatusHandle};
 use crate::script::ScriptEvent;
 use crate::source::request::RequestQueue;
+
+// Long enough for a source client's automatic reconnects to give up, short enough not to lock a DJ
+// out for good.
+const DJ_REFUSED_AFTER_CUT: Duration = Duration::from_secs(60);
 
 /// Telnet command server. Owns one `mpsc::Sender` into the priority mixer.
 pub struct ControlServer {
@@ -939,6 +944,19 @@ fn dispatch(cmd: &str, ctx: &DispatchCtx, rng: &mut SmallRng) -> CommandResult {
             let _ = ctx.tx.send(MixCommand::Skip);
             CommandResult::Reply(CommandReply::Ok("skipping".into()))
         }
+        "live.stop" => {
+            if !ctx.status.cut_dj(DJ_REFUSED_AFTER_CUT) {
+                let why = if ctx.status.harbor_connected() {
+                    "the DJ on air cannot be cut (socket not cloneable)"
+                } else {
+                    "no DJ is on air"
+                };
+                return CommandResult::Reply(CommandReply::Err(format!("ERROR: {why}")));
+            }
+            log::info!("control port: live DJ cut off");
+            let secs = DJ_REFUSED_AFTER_CUT.as_secs();
+            CommandResult::Reply(CommandReply::Ok(format!("DJ cut off, refused for {secs} s")))
+        }
         "queue.push" => match parts.next() {
             Some(path) => match ctx.queue {
                 Some(q) => {
@@ -1052,7 +1070,7 @@ fn dispatch(cmd: &str, ctx: &DispatchCtx, rng: &mut SmallRng) -> CommandResult {
 }
 
 fn help_text() -> &'static str {
-    "commands: jingles.list | jingles.play [n|substr] | queue.push <path> | queue.list | queue.clear | queue.skip | skip | status | uptime | shutdown | <custom commands> | json <command> | exit | help"
+    "commands: jingles.list | jingles.play [n|substr] | queue.push <path> | queue.list | queue.clear | queue.skip | live.stop | skip | status | uptime | shutdown | <custom commands> | json <command> | exit | help"
 }
 
 fn pick_jingle(jingles: &[PathBuf], arg: &str) -> Result<usize, String> {
@@ -1145,6 +1163,74 @@ mod tests {
             CommandResult::Exit => panic!("skip must reply"),
         }
         assert!(matches!(rx.try_recv(), Ok(MixCommand::Skip)));
+    }
+
+    #[test]
+    fn live_stop_cuts_the_dj_off_and_refuses_them() {
+        let (tx, _rx) = mpsc::channel();
+        let status = StatusHandle::new();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut dj = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        status.dj_line().lock().unwrap().connection = Some(listener.accept().unwrap().0);
+        let ctx = DispatchCtx {
+            jingles: &jingles(),
+            queue: None,
+            tx: &tx,
+            status: &status,
+            custom: &[],
+            event_tx: &mpsc::channel().0,
+        };
+
+        let reply = dispatch("live.stop", &ctx, &mut SmallRng::from_entropy());
+
+        match reply {
+            CommandResult::Reply(r) => assert_eq!(r.text(), "DJ cut off, refused for 60 s"),
+            CommandResult::Exit => panic!("live.stop must reply"),
+        }
+        assert_eq!(std::io::Read::read(&mut dj, &mut [0; 1]).unwrap(), 0);
+        assert!(status.dj_line().lock().unwrap().refused_until.is_some());
+    }
+
+    #[test]
+    fn live_stop_without_a_dj_is_an_error() {
+        let (tx, _rx) = mpsc::channel();
+        let status = StatusHandle::new();
+        let ctx = DispatchCtx {
+            jingles: &jingles(),
+            queue: None,
+            tx: &tx,
+            status: &status,
+            custom: &[],
+            event_tx: &mpsc::channel().0,
+        };
+
+        match dispatch("live.stop", &ctx, &mut SmallRng::from_entropy()) {
+            CommandResult::Reply(r) => assert_eq!(r.text(), "ERROR: no DJ is on air"),
+            CommandResult::Exit => panic!("live.stop must reply"),
+        }
+    }
+
+    #[test]
+    fn live_stop_says_so_when_the_dj_on_air_cannot_be_cut() {
+        let (tx, _rx) = mpsc::channel();
+        let status = StatusHandle::new();
+        status.harbor_flag().store(true, Ordering::SeqCst);
+        let ctx = DispatchCtx {
+            jingles: &jingles(),
+            queue: None,
+            tx: &tx,
+            status: &status,
+            custom: &[],
+            event_tx: &mpsc::channel().0,
+        };
+
+        match dispatch("live.stop", &ctx, &mut SmallRng::from_entropy()) {
+            CommandResult::Reply(r) => assert_eq!(
+                r.text(),
+                "ERROR: the DJ on air cannot be cut (socket not cloneable)"
+            ),
+            CommandResult::Exit => panic!("live.stop must reply"),
+        }
     }
 
     #[test]

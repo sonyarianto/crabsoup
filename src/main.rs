@@ -107,7 +107,13 @@ fn main() -> crabsoup::Result<()> {
         .build()?;
 
     if let Some(live_cfg) = &result.harbor {
-        let harbor = Harbor::new(live_cfg.clone(), spec, tx.clone(), status.harbor_flag());
+        let harbor = Harbor::new(
+            live_cfg.clone(),
+            spec,
+            tx.clone(),
+            status.harbor_flag(),
+            status.dj_line(),
+        );
         rt.spawn(async move { harbor.run().await });
     }
 

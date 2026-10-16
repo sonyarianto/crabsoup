@@ -1,7 +1,7 @@
 use std::io::{Read, Seek, SeekFrom};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use base64::Engine;
@@ -17,7 +17,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::config::LiveConfig;
-use crate::engine::mixer::MixCommand;
+use crate::engine::mixer::{DjLine, MixCommand};
 use crate::live::source::{LiveSink, LiveSource};
 use crate::source::{AudioSource, PcmConverter};
 
@@ -40,6 +40,7 @@ pub struct Harbor {
     target: SignalSpec,
     tx: mpsc::Sender<MixCommand>,
     occupied: Arc<AtomicBool>,
+    line: Arc<Mutex<DjLine>>,
 }
 
 impl Harbor {
@@ -49,12 +50,14 @@ impl Harbor {
         tx: mpsc::Sender<MixCommand>,
         // Shared with the status handle so `/status` can report on-air state.
         occupied: Arc<AtomicBool>,
+        line: Arc<Mutex<DjLine>>,
     ) -> Self {
         Self {
             config,
             target,
             tx,
             occupied,
+            line,
         }
     }
 
@@ -85,8 +88,11 @@ impl Harbor {
             let target = self.target;
             let tx = self.tx.clone();
             let occupied = self.occupied.clone();
+            let line = self.line.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(socket, config, target, tx, occupied).await {
+                if let Err(e) =
+                    handle_connection(socket, config, target, tx, occupied, line).await
+                {
                     log::warn!("live harbor ({peer}): {e}");
                 }
             });
@@ -101,6 +107,7 @@ async fn handle_connection(
     target: SignalSpec,
     tx: mpsc::Sender<MixCommand>,
     occupied: Arc<AtomicBool>,
+    line: Arc<Mutex<DjLine>>,
 ) -> Result<(), String> {
     let mut socket = socket;
     socket.set_nodelay(true).map_err(|e| e.to_string())?;
@@ -137,8 +144,9 @@ async fn handle_connection(
         return Ok(());
     }
 
-    // Only one DJ at a time.
-    if occupied.swap(true, Ordering::SeqCst) {
+    // Only one DJ at a time, and none for a while after `live.stop`.
+    let refused = line.lock().unwrap().refused_until.is_some_and(|t| std::time::Instant::now() < t);
+    if refused || occupied.swap(true, Ordering::SeqCst) {
         respond(&mut socket, 403, "Forbidden").await?;
         return Ok(());
     }
@@ -173,6 +181,10 @@ async fn handle_connection(
             return Err(format!("converting to blocking stream: {e}"));
         }
     };
+    line.lock().unwrap().connection = std_stream
+        .try_clone()
+        .inspect_err(|e| log::warn!("live harbor: cannot clone socket, live.stop disabled: {e}"))
+        .ok();
 
     // Hand the connection over to a decode thread. The SPSC ring (sized at
     // twice the drop-oldest cap) hands PCM from the decode thread to the
@@ -193,6 +205,7 @@ async fn handle_connection(
             exhausted,
             tx,
             occupied,
+            line,
         );
     });
 
@@ -215,6 +228,7 @@ fn decode_live_stream(
     exhausted: Arc<AtomicBool>,
     tx: mpsc::Sender<MixCommand>,
     occupied: Arc<AtomicBool>,
+    line: Arc<Mutex<DjLine>>,
 ) {
     decode_live_stream_inner(
         stream,
@@ -238,6 +252,8 @@ fn decode_live_stream(
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     log::debug!("live harbor: drain-wait done, buffered={}", sink.buffered());
+    // The kept clone would otherwise hold the socket open after the DJ is gone.
+    line.lock().unwrap().connection = None;
     finish(&exhausted, &tx, &occupied);
 }
 

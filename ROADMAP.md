@@ -1,6 +1,15 @@
 # Crabsoup roadmap
 
 ## Done (verified end-to-end)
+- [x] **`live.stop` — cut the live DJ off from the control port**: the
+      harbor shares its DJ's socket with the `StatusHandle` (`DjLine`);
+      `live.stop` shuts it down, so the decode thread sees end of stream and
+      the playlist fades back in, and the harbor answers 403 to every source
+      client for 60 s (BUTT and similar clients reconnect on their own).
+      `ERROR: no DJ is on air` when nobody holds the harbor. Inline tests
+      (default 366 -> 368, minimal 344 -> 346): the DJ's socket is closed
+      and later DJs refused, the no-DJ error. Deployed in production on a
+      24/7 station; README + control-port guide updated.
 - [x] **Codec feature gate — `mp3`/`aac` are now default-on opt-out**:
       plain builds still link LAME + fdk-aac, but
       `cargo build --release --no-default-features` drops the system

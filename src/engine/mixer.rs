@@ -336,6 +336,16 @@ pub struct StatusHandle {
     /// True while a live DJ holds the harbor (the playlist is ducked).
     /// Shared with the harbor, which toggles it on connect/disconnect.
     harbor_connected: Arc<AtomicBool>,
+    /// Shared with the harbor, so `live.stop` can cut the DJ off.
+    dj_line: Arc<Mutex<DjLine>>,
+}
+
+/// The connected DJ's socket, and until when DJs stay refused after a cut: source clients such as
+/// BUTT reconnect on their own.
+#[derive(Default)]
+pub struct DjLine {
+    pub connection: Option<std::net::TcpStream>,
+    pub refused_until: Option<std::time::Instant>,
 }
 
 impl StatusHandle {
@@ -344,7 +354,25 @@ impl StatusHandle {
             started: std::time::Instant::now(),
             current: Arc::new(Mutex::new(String::new())),
             harbor_connected: Arc::new(AtomicBool::new(false)),
+            dj_line: Arc::default(),
         }
+    }
+
+    /// The DJ line the harbor writes to; hand a clone to the harbor.
+    pub fn dj_line(&self) -> Arc<Mutex<DjLine>> {
+        self.dj_line.clone()
+    }
+
+    /// Closes the live DJ's connection and refuses DJs for `refuse_for`; false with no DJ on air.
+    pub fn cut_dj(&self, refuse_for: std::time::Duration) -> bool {
+        let mut line = self.dj_line.lock().unwrap();
+        let Some(connection) = line.connection.take() else {
+            return false;
+        };
+        // The decode thread's blocking read then ends the stream, and the playlist fades back in.
+        let _ = connection.shutdown(std::net::Shutdown::Both);
+        line.refused_until = Some(std::time::Instant::now() + refuse_for);
+        true
     }
 
     /// The flag the harbor writes to; hand a clone to the harbor.
