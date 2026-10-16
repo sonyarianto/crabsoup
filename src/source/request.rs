@@ -26,7 +26,22 @@ struct QueueState {
     /// One-shot skip requested by the control port; consumed when a queued
     /// track is actually playing.
     skip: bool,
+    /// The playlist's own next tracks, after the queued requests (`queue.upcoming`).
+    upcoming: Vec<RequestUri>,
+    /// Paths taken out of the rotation (`queue.drop`): the playlist skips the next occurrence of each once.
+    dropped: Vec<String>,
+    /// The track the playlist handed out last: during a crossfade it mixes in while `status` still
+    /// reports the outgoing one.
+    incoming: Option<RequestUri>,
+    /// A new rotation (`rotation.set`) the playlist switches to at its next pick.
+    rotation: Option<Vec<RequestUri>>,
 }
+
+/// How many next playlist tracks `queue.upcoming` lists.
+const UPCOMING: usize = 5;
+/// How many next tracks the playlist publishes: more than `queue.upcoming` lists, so dropped tracks
+/// leave enough behind them.
+pub const UPCOMING_WINDOW: usize = 20;
 
 impl RequestQueue {
     pub fn new() -> Self {
@@ -65,6 +80,65 @@ impl RequestQueue {
         self.inner.lock().unwrap().requests.front().cloned()
     }
 
+    pub fn set_upcoming(&self, uris: Vec<RequestUri>) {
+        self.inner.lock().unwrap().upcoming = uris;
+    }
+
+    /// The next playlist tracks still to play, without those taken out of the rotation.
+    pub fn upcoming(&self) -> Vec<RequestUri> {
+        let st = self.inner.lock().unwrap();
+        let mut dropped = st.dropped.clone();
+        st.upcoming
+            .iter()
+            .filter(|uri| !take_first(&mut dropped, &uri.raw()))
+            .take(UPCOMING)
+            .cloned()
+            .collect()
+    }
+
+    pub fn set_incoming(&self, uri: RequestUri) {
+        self.inner.lock().unwrap().incoming = Some(uri);
+    }
+
+    pub fn incoming(&self) -> Option<RequestUri> {
+        self.inner.lock().unwrap().incoming.clone()
+    }
+
+    /// Replaces the playlist's rotation from its next pick on; the playing track and the queued
+    /// requests stay.
+    pub fn set_rotation(&self, uris: Vec<RequestUri>) {
+        let mut st = self.inner.lock().unwrap();
+        // Shown at once, not at the next pick minutes away; earlier drops were for the old rotation.
+        st.upcoming = uris.iter().take(UPCOMING_WINDOW).cloned().collect();
+        st.dropped.clear();
+        st.rotation = Some(uris);
+    }
+
+    /// True while a queued request or a new rotation waits for the playlist's next pick.
+    pub fn has_pending(&self) -> bool {
+        let st = self.inner.lock().unwrap();
+        !st.requests.is_empty() || st.rotation.is_some()
+    }
+
+    pub fn take_rotation(&self) -> Option<Vec<RequestUri>> {
+        self.inner.lock().unwrap().rotation.take()
+    }
+
+    /// Take the playlist's next occurrence of `path` out of the rotation.
+    pub fn drop_upcoming(&self, path: &str) {
+        self.inner.lock().unwrap().dropped.push(path.to_string());
+    }
+
+    /// True if the playlist should skip `uri` because it was dropped; consumes that drop.
+    pub fn take_dropped(&self, uri: &RequestUri) -> bool {
+        take_first(&mut self.inner.lock().unwrap().dropped, &uri.raw())
+    }
+
+    /// Replace every queued request at once (a playing track is unaffected).
+    pub fn replace(&self, uris: Vec<RequestUri>) {
+        self.inner.lock().unwrap().requests = uris.into();
+    }
+
     /// Drop every queued request (a playing track is unaffected).
     pub fn clear(&self) {
         self.inner.lock().unwrap().requests.clear();
@@ -77,7 +151,7 @@ impl RequestQueue {
 
     /// Pop the next request, dropping any pending skip (a skip only applies
     /// to a track already playing).
-    fn pop(&self) -> Option<RequestUri> {
+    pub fn pop(&self) -> Option<RequestUri> {
         let mut st = self.inner.lock().unwrap();
         st.skip = false;
         st.requests.pop_front()
@@ -88,6 +162,10 @@ impl RequestQueue {
         let mut st = self.inner.lock().unwrap();
         std::mem::take(&mut st.skip)
     }
+}
+
+fn take_first(list: &mut Vec<String>, raw: &str) -> bool {
+    list.iter().position(|path| path == raw).map(|at| list.remove(at)).is_some()
 }
 
 impl Default for RequestQueue {

@@ -20,6 +20,11 @@ printf 'shutdown\n' | nc localhost 1234
 | `jingles.list` | Index + path per line |
 | `jingles.play [n\|substr]` | Play a random, indexed, or substring-matched jingle |
 | `queue.push <uri>` | Push a request (path or `http(s)://` URL) onto the request queue |
+| `queue.set <json>` | Replace the whole request queue with a JSON array of URIs |
+| `queue.upcoming` | The next 5 tracks of a `playlist({requests = true})` rotation, after the queued requests |
+| `queue.incoming` | The track that playlist handed out last (mixing in during a crossfade) |
+| `queue.drop <path>` | Skip the rotation's next occurrence of `path` |
+| `rotation.set <json>` | Replace the playlist's rotation (non-empty JSON array of URIs) from its next track on |
 | `skip` | Skip the current track |
 | `status` | Current track + uptime |
 | `uptime` | Engine uptime |
@@ -50,6 +55,8 @@ message the plain-text protocol prints). Notable fields:
 | `json queue.list` | `{"ok":true,"queue":["...", ...]}` |
 | `json jingles.list` | `{"ok":true,"jingles":["...", ...]}` |
 | `json queue.push <uri>` | `{"ok":true,"queued":"...","length":N}` |
+| `json queue.set <json>` | `{"ok":true,"queue":["...", ...]}` |
+| `json queue.upcoming` / `json queue.incoming` | `{"ok":true,"upcoming":[...]}` / `{"ok":true,"incoming":[...]}` (zero or one) |
 | `json skip` / `json shutdown` | `{"ok":true,"message":"..."}` |
 | `json <custom command>` | `{"ok":true,"reply":"..."}` |
 | any error | `{"ok":false,"error":"..."}` |
@@ -93,6 +100,8 @@ curl -X POST -H 'Content-Type: application/json' \
 | `GET /status` | `status` |
 | `GET /uptime` | `uptime` |
 | `GET /queue` | `queue.list` |
+| `GET /upcoming` | `queue.upcoming` |
+| `GET /incoming` | `queue.incoming` |
 | `GET /jingles` | `jingles.list` |
 | `POST /cmd` `{"command": "..."}` | any control command; reply identical to `json <command>` on telnet |
 

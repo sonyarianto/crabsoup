@@ -13,6 +13,9 @@ shuffle:
 pl = playlist({directory = "./internal/media", shuffle = false, loop = true})
 ```
 
+A scanned directory plays in sorted order, `files` in the order given (duplicates dropped);
+`shuffle = true` shuffles both.
+
 ## `single("path")`
 
 Plays one file (or `http(s)://` URL) once.
@@ -73,6 +76,17 @@ Never fails outright: silence covers an exhausted or failed child. Composes
 
 Play requests pushed over the telnet port (`queue.push <uri>`) — the
 Liquidsoap-style request queue.
+
+`playlist({..., requests = true})` plays the queued requests itself, ahead of its next track and
+through its own crossfade, instead of cutting in like a `fallback`. It needs `request.queue()`
+declared first and replaces it in the graph (only one of them should consume the queue). The
+playlist's rotation is then controlled from the [control port](/guide/control-port):
+`queue.upcoming`, `queue.incoming`, `queue.drop`, `rotation.set`.
+
+```lua
+request.queue()
+pl = playlist({directory = "./internal/media", requests = true})
+```
 
 ## `request.dynamic(fn)`
 

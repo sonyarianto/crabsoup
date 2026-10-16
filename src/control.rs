@@ -213,7 +213,8 @@ impl ControlHttpServer {
 }
 
 const MAX_HTTP_HEADER: usize = 16 * 1024;
-const MAX_HTTP_BODY: usize = 64 * 1024;
+// `rotation.set` carries a whole rotation: ~1,500 annotated paths are a few hundred KiB.
+const MAX_HTTP_BODY: usize = 1024 * 1024;
 
 /// Serve one HTTP request and close the connection (no keep-alive).
 async fn handle_http(
@@ -338,6 +339,8 @@ fn http_route(
         ("GET", "/status") => "status".into(),
         ("GET", "/uptime") => "uptime".into(),
         ("GET", "/queue") => "queue.list".into(),
+        ("GET", "/upcoming") => "queue.upcoming".into(),
+        ("GET", "/incoming") => "queue.incoming".into(),
         ("GET", "/jingles") => "jingles.list".into(),
         ("POST", "/cmd") => match serde_json::from_str::<serde_json::Value>(body) {
             Ok(v) => match v.get("command").and_then(serde_json::Value::as_str) {
@@ -964,6 +967,52 @@ fn dispatch(cmd: &str, ctx: &DispatchCtx, rng: &mut SmallRng) -> CommandResult {
                 "ERROR: no request.queue source in script".into(),
             )),
         },
+        "queue.set" | "rotation.set" | "queue.drop" | "queue.upcoming" | "queue.incoming" => {
+            let Some(q) = ctx.queue else {
+                return CommandResult::Reply(CommandReply::Err(
+                    "ERROR: no request.queue source in script".into(),
+                ));
+            };
+            let rest = cmd.trim().split_once(char::is_whitespace).map_or("", |(_, r)| r.trim());
+            let uris = serde_json::from_str::<Vec<String>>(rest).map(|paths| {
+                paths.iter().map(|p| crate::request::RequestUri::new(p)).collect::<Vec<_>>()
+            });
+            let raw = |uris: &[crate::request::RequestUri]| uris.iter().map(|u| u.raw()).collect();
+            CommandResult::Reply(match (verb, uris) {
+                ("queue.set", Ok(uris)) => {
+                    q.replace(uris);
+                    CommandReply::List { key: "queue", empty: "queue empty", items: raw(&q.list()) }
+                }
+                ("rotation.set", Ok(uris)) if !uris.is_empty() => {
+                    let n = uris.len();
+                    q.set_rotation(uris);
+                    CommandReply::Ok(format!("rotation set: {n} tracks"))
+                }
+                ("queue.set", Err(_)) => {
+                    CommandReply::Err("usage: queue.set <JSON array of paths>".into())
+                }
+                ("rotation.set", _) => {
+                    CommandReply::Err("usage: rotation.set <non-empty JSON array of paths>".into())
+                }
+                ("queue.drop", _) if rest.is_empty() => {
+                    CommandReply::Err("usage: queue.drop <path>".into())
+                }
+                ("queue.drop", _) => {
+                    q.drop_upcoming(rest);
+                    CommandReply::Ok(format!("dropped from rotation: {rest}"))
+                }
+                ("queue.upcoming", _) => CommandReply::List {
+                    key: "upcoming",
+                    empty: "no upcoming playlist track",
+                    items: raw(&q.upcoming()),
+                },
+                _ => CommandReply::List {
+                    key: "incoming",
+                    empty: "nothing handed out yet",
+                    items: raw(q.incoming().as_slice()),
+                },
+            })
+        }
         "queue.clear" => match ctx.queue {
             Some(q) => {
                 q.clear();
@@ -1052,7 +1101,7 @@ fn dispatch(cmd: &str, ctx: &DispatchCtx, rng: &mut SmallRng) -> CommandResult {
 }
 
 fn help_text() -> &'static str {
-    "commands: jingles.list | jingles.play [n|substr] | queue.push <path> | queue.list | queue.clear | queue.skip | skip | status | uptime | shutdown | <custom commands> | json <command> | exit | help"
+    "commands: jingles.list | jingles.play [n|substr] | queue.push <path> | queue.set <json paths> | queue.list | queue.upcoming | queue.incoming | queue.drop <path> | rotation.set <json paths> | queue.clear | queue.skip | skip | status | uptime | shutdown | <custom commands> | json <command> | exit | help"
 }
 
 fn pick_jingle(jingles: &[PathBuf], arg: &str) -> Result<usize, String> {
@@ -1234,6 +1283,31 @@ mod tests {
     }
 
     #[test]
+    fn queue_set_replaces_the_whole_queue_in_order() {
+        let (tx, _rx) = mpsc::channel();
+        let status = StatusHandle::new();
+        let queue = RequestQueue::new();
+        queue.push(crate::request::RequestUri::new("/tmp/old.mp3"));
+        let ctx = DispatchCtx {
+            jingles: &jingles(),
+            queue: Some(&queue),
+            tx: &tx,
+            status: &status,
+            custom: &[],
+            event_tx: &mpsc::channel().0,
+        };
+
+        dispatch(
+            r#"queue.set ["/tmp/b.mp3", "annotate:amplify=\"1 dB\":/tmp/a b.mp3"]"#,
+            &ctx,
+            &mut SmallRng::from_entropy(),
+        );
+
+        let queued: Vec<String> = queue.list().iter().map(|uri| uri.raw()).collect();
+        assert_eq!(queued, ["/tmp/b.mp3", "/tmp/a b.mp3"]);
+    }
+
+    #[test]
     fn queue_commands_require_a_configured_queue() {
         let (tx, _rx) = mpsc::channel();
         let status = StatusHandle::new();
@@ -1252,6 +1326,11 @@ mod tests {
             "queue.list",
             "queue.skip",
             "queue.clear",
+            "queue.set []",
+            "queue.upcoming",
+            "queue.incoming",
+            "queue.drop /tmp/a.mp3",
+            r#"rotation.set ["/tmp/a.mp3"]"#,
         ] {
             match dispatch(cmd, &ctx, &mut rng) {
                 CommandResult::Reply(r) => {

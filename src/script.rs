@@ -1977,7 +1977,7 @@ fn bus(state: &Rc<RefCell<ScriptState>>) -> (SignalSpec, usize) {
 }
 
 /// Collect and validate the audio requests for a `playlist`-style source
-/// table (`directory` and/or `files`), sorted and deduped.
+/// table (`directory` and/or `files`), deduped: a directory scan sorted, `files` in their given order.
 fn playlist_requests(opts: &Table) -> mlua::Result<Vec<RequestUri>> {
     let directory: Option<String> = opts.get("directory").ok().flatten();
     let files: Vec<String> = opts.get("files").ok().unwrap_or_default();
@@ -1985,6 +1985,7 @@ fn playlist_requests(opts: &Table) -> mlua::Result<Vec<RequestUri>> {
     if let Some(dir) = &directory {
         let mut paths = Vec::new();
         collect_audio(&PathBuf::from(dir), &mut paths);
+        paths.sort();
         requests.extend(
             paths
                 .into_iter()
@@ -1993,8 +1994,8 @@ fn playlist_requests(opts: &Table) -> mlua::Result<Vec<RequestUri>> {
     }
     // `files` entries may be paths or http:// URLs.
     requests.extend(files.iter().map(|f| RequestUri::new(f)));
-    requests.sort();
-    requests.dedup();
+    let mut seen = std::collections::HashSet::new();
+    requests.retain(|uri| seen.insert(uri.raw()));
     if requests.is_empty() {
         return Err(mlua::Error::runtime(
             "playlist: no audio files found (check `directory`/`files`)",
@@ -2191,13 +2192,15 @@ fn crossfading_playlist(
     requests: Vec<RequestUri>,
     shuffle: bool,
     loop_playlist: bool,
+    queue: Option<Arc<RequestQueue>>,
     state: &Rc<RefCell<ScriptState>>,
 ) -> Box<dyn AudioSource> {
     let (spec, fpb) = bus(state);
     let chans = spec.channels.count();
     let mixer_cfg = state.borrow().mixer.clone();
     let request = state.borrow().request;
-    let playlist = Playlist::new(requests, shuffle, loop_playlist, request, spec, fpb, None);
+    let playlist = Playlist::new(requests, shuffle, loop_playlist, request, spec, fpb, None)
+        .with_requests(queue);
     Box::new(CrossfadeMixer::new(
         Box::new(playlist),
         &mixer_cfg,
@@ -2397,12 +2400,20 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
             // preload, no overlap) for children of `rotate` and friends;
             // wrap the composition in `crossfade(...)` instead.
             let crossfade: bool = opts.get("crossfade").ok().flatten().unwrap_or(true);
+            let queue = if opts.get("requests").unwrap_or(false) {
+                let queue = pl_state.borrow().request_queue.clone();
+                Some(queue.ok_or_else(|| {
+                    mlua::Error::runtime("playlist: requests = true needs request.queue() first")
+                })?)
+            } else {
+                None
+            };
             let src = if crossfade {
-                crossfading_playlist(requests, shuffle, loop_playlist, &pl_state)
+                crossfading_playlist(requests, shuffle, loop_playlist, queue, &pl_state)
             } else {
                 let (spec, fpb) = bus(&pl_state);
                 let request = pl_state.borrow().request;
-                let playlist = Playlist::new(requests, shuffle, loop_playlist, request, spec, fpb, None);
+                let playlist = Playlist::new(requests, shuffle, loop_playlist, request, spec, fpb, None).with_requests(queue);
                 Box::new(PlaylistSource::new(playlist))
             };
             Ok(LuaSource::new(src))
@@ -3286,7 +3297,7 @@ pub fn run(src: &str) -> mlua::Result<(ScriptRuntime, ScriptResult)> {
                 .into_iter()
                 .map(|p| RequestUri::Local(p, None))
                 .collect();
-            let src = crossfading_playlist(requests, false, false, &jingle_state);
+            let src = crossfading_playlist(requests, false, false, None, &jingle_state);
             Ok(LuaSource::new(src))
         })?,
     )?;
@@ -7323,6 +7334,30 @@ mod tests {
         let mut buf = vec![0f32; 4096 * 2];
         root.next_buffer(&mut buf);
         assert_eq!(root.label().as_deref(), Some("sine 440 Hz"));
+    }
+
+    #[test]
+    fn playlist_files_keep_their_given_order_without_duplicates() {
+        let lua = Lua::new();
+        let opts: mlua::Table = lua
+            .load(r#"return {files = {"c.mp3", "a.mp3", "c.mp3", "b.mp3"}}"#)
+            .eval()
+            .unwrap();
+        let files: Vec<String> = playlist_requests(&opts)
+            .unwrap()
+            .iter()
+            .map(RequestUri::raw)
+            .collect();
+        assert_eq!(files, ["c.mp3", "a.mp3", "b.mp3"]);
+    }
+
+    #[test]
+    fn playlist_requests_needs_a_request_queue() {
+        let err = match run(r#"output.preview(playlist({files = {"a.mp3"}, requests = true}))"#) {
+            Ok(_) => panic!("requests = true without request.queue() must fail"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("needs request.queue()"), "{err}");
     }
 
     #[test]

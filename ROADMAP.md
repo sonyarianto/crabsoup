@@ -1,6 +1,17 @@
 # Crabsoup roadmap
 
 ## Done (verified end-to-end)
+- [x] **Rotation control — `playlist({requests = true})`**: queued requests
+      play ahead of the playlist's next track, inside its crossfade, instead
+      of cutting in through a `fallback`. The control port steers the
+      rotation: `queue.set <json>` replaces the queue, `queue.upcoming`
+      (`GET /upcoming`) lists the next 5 playlist tracks, `queue.incoming`
+      (`GET /incoming`) names the track mixing in, `queue.drop <path>` skips
+      its next occurrence, `rotation.set <json>` swaps the whole rotation
+      from the next pick on (HTTP body cap 64 KiB -> 1 MiB for it). An
+      unshuffled playlist now keeps the `files` order (directory scans stay
+      sorted). Verified live: an external scheduler drives a 24/7 station
+      with `rotation.set`.
 - [x] **Codec feature gate — `mp3`/`aac` are now default-on opt-out**:
       plain builds still link LAME + fdk-aac, but
       `cargo build --release --no-default-features` drops the system
