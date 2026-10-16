@@ -80,14 +80,14 @@ fn main() -> crabsoup::Result<()> {
         .take()
         .or_else(|| result.preview.take())
         .expect("script output checked by run()");
+    // Shared status for the telnet `status`/`uptime` commands; the consuming
+    // loops keep the current label fresh.
+    let status = StatusHandle::new();
     let (tx, rx) = mpsc::channel();
-    let root: Box<dyn AudioSource> = Box::new(PriorityMixer::new(
-        root_source,
-        rx,
-        &result.mixer,
-        spec,
-        fpb,
-    ));
+    let root: Box<dyn AudioSource> = Box::new(
+        PriorityMixer::new(root_source, rx, &result.mixer, spec, fpb)
+            .with_history(status.history()),
+    );
     let mut tap = EngineTap::new(root, spec.rate, chans);
 
     let broadcast = if cli.preview {
@@ -96,9 +96,6 @@ fn main() -> crabsoup::Result<()> {
         result.outputs.clone()
     };
 
-    // Shared status for the telnet `status`/`uptime` commands; the consuming
-    // loops keep the current label fresh.
-    let status = StatusHandle::new();
     let shutdown = Arc::new(AtomicBool::new(false));
 
     // Background tokio runtime: live harbor listener + Ctrl-C handler.

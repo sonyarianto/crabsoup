@@ -9,6 +9,7 @@
 //! - `jingles.play <substr>`   — play the jingle whose name contains `substr`
 //! - `skip`                    — skip the current track
 //! - `status`                  — current track + uptime
+//! - `history`                 — the last tracks on air, newest first, with start times
 //! - `uptime`                  — seconds since startup
 //! - `shutdown`                — stop the app (like Ctrl-C)
 //! - `exit` / `quit`           — close the connection
@@ -25,7 +26,7 @@
 //!
 //! `server.telnet({http_port = N})` also serves the same command surface
 //! over HTTP on the same host: `GET /status`, `GET /uptime`, `GET /queue`,
-//! `GET /jingles`, and `POST /cmd` with a JSON body
+//! `GET /jingles`, `GET /history`, and `POST /cmd` with a JSON body
 //! `{"command": "..."}`. Every response reuses the JSON envelope above.
 //!
 //! `server.telnet({ws_port = N})` serves it over WebSocket (RFC 6455) on
@@ -49,7 +50,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::config::ControlConfig;
-use crate::engine::mixer::{MixCommand, StatusHandle};
+use crate::engine::mixer::{MixCommand, Played, StatusHandle};
 use crate::script::ScriptEvent;
 use crate::source::request::RequestQueue;
 
@@ -339,6 +340,7 @@ fn http_route(
         ("GET", "/uptime") => "uptime".into(),
         ("GET", "/queue") => "queue.list".into(),
         ("GET", "/jingles") => "jingles.list".into(),
+        ("GET", "/history") => "history".into(),
         ("POST", "/cmd") => match serde_json::from_str::<serde_json::Value>(body) {
             Ok(v) => match v.get("command").and_then(serde_json::Value::as_str) {
                 Some(c) => c.to_string(),
@@ -840,6 +842,8 @@ enum CommandReply {
     },
     /// `jingles.play ...`: the chosen jingle path.
     Playing(String),
+    /// `history`: the last tracks on air, newest first.
+    History(Vec<Played>),
 }
 
 impl CommandReply {
@@ -868,6 +872,12 @@ impl CommandReply {
                 }
             }
             CommandReply::Playing(path) => format!("playing {path}"),
+            CommandReply::History(tracks) if tracks.is_empty() => "nothing played yet".into(),
+            CommandReply::History(tracks) => tracks
+                .iter()
+                .map(|t| format!("{} {} {}", t.began_ms, t.started_ms, t.title))
+                .collect::<Vec<_>>()
+                .join("\n"),
         }
     }
 
@@ -913,6 +923,19 @@ impl CommandReply {
             CommandReply::Playing(path) => {
                 serde_json::json!({ "ok": true, "playing": path }).to_string()
             }
+            CommandReply::History(tracks) => {
+                let tracks: Vec<_> = tracks
+                    .iter()
+                    .map(|t| {
+                        serde_json::json!({
+                            "title": t.title,
+                            "began_ms": t.began_ms,
+                            "started_ms": t.started_ms,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({ "ok": true, "history": tracks }).to_string()
+            }
         }
     }
 }
@@ -934,6 +957,7 @@ fn dispatch(cmd: &str, ctx: &DispatchCtx, rng: &mut SmallRng) -> CommandResult {
     match verb {
         "help" => CommandResult::Reply(CommandReply::Ok(help_text().into())),
         "exit" | "quit" => CommandResult::Exit,
+        "history" => CommandResult::Reply(CommandReply::History(ctx.status.history().tracks())),
         "skip" => {
             log::info!("control port: skip requested");
             let _ = ctx.tx.send(MixCommand::Skip);
@@ -1052,7 +1076,7 @@ fn dispatch(cmd: &str, ctx: &DispatchCtx, rng: &mut SmallRng) -> CommandResult {
 }
 
 fn help_text() -> &'static str {
-    "commands: jingles.list | jingles.play [n|substr] | queue.push <path> | queue.list | queue.clear | queue.skip | skip | status | uptime | shutdown | <custom commands> | json <command> | exit | help"
+    "commands: jingles.list | jingles.play [n|substr] | queue.push <path> | queue.list | queue.clear | queue.skip | skip | status | history | uptime | shutdown | <custom commands> | json <command> | exit | help"
 }
 
 fn pick_jingle(jingles: &[PathBuf], arg: &str) -> Result<usize, String> {

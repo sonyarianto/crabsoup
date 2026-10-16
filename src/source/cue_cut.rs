@@ -162,6 +162,10 @@ impl AudioSource for CueCutSource {
         self.child.label()
     }
 
+    fn next_label(&self) -> Option<String> {
+        self.child.next_label()
+    }
+
     fn replaygain_db(&self) -> Option<f32> {
         self.child.replaygain_db()
     }

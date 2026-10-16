@@ -201,7 +201,7 @@ with replies instead of the prose welcome line. Plain-text `status` also
 shows live-DJ state as a `live: true|false` line.
 
 `server.telnet({http_port = N})` serves the same commands over HTTP:
-`GET /status`, `GET /uptime`, `GET /queue`, `GET /jingles`, and
+`GET /status`, `GET /uptime`, `GET /queue`, `GET /jingles`, `GET /history`, and
 `POST /cmd` with `{"command": "..."}` — same JSON envelope, 400 on
 `{"ok": false}`, 404/405 for bad routes and methods.
 `server.telnet({ws_port = N})` serves them over WebSocket (RFC 6455):

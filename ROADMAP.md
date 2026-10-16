@@ -1,6 +1,16 @@
 # Crabsoup roadmap
 
 ## Done (verified end-to-end)
+- [x] **Play history on the control port**: `PriorityMixer` records the last
+      20 tracks on air (playlist tracks and live DJs, never jingles) with
+      `began_ms` (start of the crossfade into the track, from
+      `next_label`) and `started_ms` (when it became the current track),
+      timed by the frames mixed. Served as telnet `history` /
+      `json history` and `GET /history`. Wrapper sources that delegate
+      `label()` now forward `next_label()` too (all but `map_metadata`), so
+      the crossfade start survives effects, `cue_cut`, `pipe`, selectors, etc.
+      History verified live (Deeper Vibes, 24/7); the wrapper forwarding is
+      new and covered by a unit test.
 - [x] **Codec feature gate — `mp3`/`aac` are now default-on opt-out**:
       plain builds still link LAME + fdk-aac, but
       `cargo build --release --no-default-features` drops the system

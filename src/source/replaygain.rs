@@ -76,6 +76,10 @@ impl AudioSource for ReplayGainSource {
         self.child.label()
     }
 
+    fn next_label(&self) -> Option<String> {
+        self.child.next_label()
+    }
+
     fn crossfade_overrides(&self) -> Option<crate::source::CrossfadeOverrides> {
         self.child.crossfade_overrides()
     }

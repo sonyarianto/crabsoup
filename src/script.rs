@@ -435,6 +435,10 @@ impl AudioSource for OnMetadataSource {
         self.child.label()
     }
 
+    fn next_label(&self) -> Option<String> {
+        self.child.next_label()
+    }
+
     fn replaygain_db(&self) -> Option<f32> {
         self.child.replaygain_db()
     }
@@ -504,6 +508,10 @@ impl AudioSource for OnTrackSource {
 
     fn label(&self) -> Option<String> {
         self.child.label()
+    }
+
+    fn next_label(&self) -> Option<String> {
+        self.child.next_label()
     }
 
     fn replaygain_db(&self) -> Option<f32> {
@@ -736,6 +744,10 @@ impl AudioSource for StripBlankSource {
 
     fn label(&self) -> Option<String> {
         self.child.label()
+    }
+
+    fn next_label(&self) -> Option<String> {
+        self.child.next_label()
     }
 
     fn replaygain_db(&self) -> Option<f32> {
@@ -1348,6 +1360,11 @@ impl AudioSource for FallbackSource {
             .or_else(|| Some("(no source)".into()))
     }
 
+    fn next_label(&self) -> Option<String> {
+        self.active()
+            .and_then(|i| self.children[i].0.lock().unwrap().next_label())
+    }
+
     fn replaygain_db(&self) -> Option<f32> {
         if let Some(i) = self.active() {
             return self.children[i].0.lock().unwrap().replaygain_db();
@@ -1430,6 +1447,12 @@ impl AudioSource for RandomSource {
         self.order
             .first()
             .and_then(|&i| self.children[i].0.lock().unwrap().label())
+    }
+
+    fn next_label(&self) -> Option<String> {
+        self.order
+            .first()
+            .and_then(|&i| self.children[i].0.lock().unwrap().next_label())
     }
 
     fn replaygain_db(&self) -> Option<f32> {
@@ -1515,6 +1538,12 @@ impl AudioSource for AddSource {
         self.children
             .first()
             .and_then(|c| c.0.lock().unwrap().label())
+    }
+
+    fn next_label(&self) -> Option<String> {
+        self.children
+            .first()
+            .and_then(|c| c.0.lock().unwrap().next_label())
     }
 
     fn replaygain_db(&self) -> Option<f32> {
@@ -1849,6 +1878,12 @@ impl AudioSource for ScheduleSource {
         self.children
             .get(self.current)
             .and_then(|c| c.0.lock().unwrap().label())
+    }
+
+    fn next_label(&self) -> Option<String> {
+        self.children
+            .get(self.current)
+            .and_then(|c| c.0.lock().unwrap().next_label())
     }
 
     fn replaygain_db(&self) -> Option<f32> {

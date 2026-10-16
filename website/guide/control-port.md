@@ -22,6 +22,7 @@ printf 'shutdown\n' | nc localhost 1234
 | `queue.push <uri>` | Push a request (path or `http(s)://` URL) onto the request queue |
 | `skip` | Skip the current track |
 | `status` | Current track + uptime |
+| `history` | Last 20 tracks on air, newest first: `<began_ms> <started_ms> <title>` per line (Unix ms; `began_ms` is the start of the crossfade into the track, `started_ms` when it became the current track). Live DJs are listed, jingles are not |
 | `uptime` | Engine uptime |
 | `shutdown` | Graceful shutdown |
 | `exit` | Disconnect |
@@ -47,6 +48,7 @@ message the plain-text protocol prints). Notable fields:
 | --- | --- |
 | `json status` | `{"ok":true,"playing":"...","uptime_seconds":N,"harbor_connected":bool}` |
 | `json uptime` | `{"ok":true,"uptime_seconds":N}` |
+| `json history` | `{"ok":true,"history":[{"title":"...","began_ms":N,"started_ms":N}, ...]}` |
 | `json queue.list` | `{"ok":true,"queue":["...", ...]}` |
 | `json jingles.list` | `{"ok":true,"jingles":["...", ...]}` |
 | `json queue.push <uri>` | `{"ok":true,"queued":"...","length":N}` |
@@ -94,6 +96,7 @@ curl -X POST -H 'Content-Type: application/json' \
 | `GET /uptime` | `uptime` |
 | `GET /queue` | `queue.list` |
 | `GET /jingles` | `jingles.list` |
+| `GET /history` | `history` |
 | `POST /cmd` `{"command": "..."}` | any control command; reply identical to `json <command>` on telnet |
 
 HTTP status codes: 200 for `{"ok": true}`, 400 for `{"ok": false}`

@@ -459,6 +459,10 @@ impl AudioSource for PipeSource {
         self.child.lock().unwrap().label()
     }
 
+    fn next_label(&self) -> Option<String> {
+        self.child.lock().unwrap().next_label()
+    }
+
     fn replaygain_db(&self) -> Option<f32> {
         self.child.lock().unwrap().replaygain_db()
     }

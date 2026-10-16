@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -336,6 +337,34 @@ pub struct StatusHandle {
     /// True while a live DJ holds the harbor (the playlist is ducked).
     /// Shared with the harbor, which toggles it on connect/disconnect.
     harbor_connected: Arc<AtomicBool>,
+    history: History,
+}
+
+const HISTORY_SIZE: usize = 20;
+
+/// A track that went on air, in Unix milliseconds: `began_ms` is the start of the crossfade into
+/// it, `started_ms` when it became the reported track.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Played {
+    pub title: String,
+    pub began_ms: u64,
+    pub started_ms: u64,
+}
+
+/// The last tracks on air, newest first: playlist tracks and live DJs, never a jingle.
+#[derive(Clone, Default)]
+pub struct History(Arc<Mutex<VecDeque<Played>>>);
+
+impl History {
+    fn push(&self, played: Played) {
+        let mut tracks = self.0.lock().unwrap();
+        tracks.push_front(played);
+        tracks.truncate(HISTORY_SIZE);
+    }
+
+    pub fn tracks(&self) -> Vec<Played> {
+        self.0.lock().unwrap().iter().cloned().collect()
+    }
 }
 
 impl StatusHandle {
@@ -344,7 +373,13 @@ impl StatusHandle {
             started: std::time::Instant::now(),
             current: Arc::new(Mutex::new(String::new())),
             harbor_connected: Arc::new(AtomicBool::new(false)),
+            history: History::default(),
         }
+    }
+
+    /// The history the priority mixer records; hand a clone to [`PriorityMixer::with_history`].
+    pub fn history(&self) -> History {
+        self.history.clone()
     }
 
     /// The flag the harbor writes to; hand a clone to the harbor.
@@ -400,6 +435,13 @@ pub struct PriorityMixer {
     /// allocates on the hot path.
     scratch_m: Vec<f32>,
     scratch_o: Vec<f32>,
+    history: History,
+    /// The tap pulls at wall-clock pace, so frames mixed since `clock_origin_ms` time the history.
+    frames_mixed: u64,
+    clock_origin_ms: Option<u64>,
+    on_air: Option<String>,
+    /// The track the main source is crossfading into, and when that fade began.
+    incoming: Option<(String, u64)>,
 }
 
 impl PriorityMixer {
@@ -425,7 +467,57 @@ impl PriorityMixer {
             shutdown: false,
             scratch_m: Vec::new(),
             scratch_o: Vec::new(),
+            history: History::default(),
+            frames_mixed: 0,
+            clock_origin_ms: None,
+            on_air: None,
+            incoming: None,
         }
+    }
+
+    pub fn with_history(mut self, history: History) -> Self {
+        self.history = history;
+        self
+    }
+
+    fn mixed_at_ms(&self, frames: u64) -> u64 {
+        self.clock_origin_ms.unwrap_or_default() + frames * 1000 / self.target_spec.rate as u64
+    }
+
+    /// `began` is the time of the buffer's first frame, `ended` of the frame after its last one.
+    fn record_history(&mut self, began: u64, ended: u64) {
+        if let Some(next) = self.main.next_label()
+            && self
+                .incoming
+                .as_ref()
+                .is_none_or(|(title, _)| *title != next)
+        {
+            self.incoming = Some((next, began));
+        }
+        let program = if self.live.is_some() && self.gain > 0.5 {
+            self.live.as_ref().and_then(|live| live.label())
+        } else {
+            self.main.label()
+        };
+        let Some(title) = program.filter(|title| !title.is_empty()) else {
+            return;
+        };
+        if self.on_air.as_ref() == Some(&title) {
+            return;
+        }
+        let began_ms = match self.incoming.take() {
+            Some((incoming, at)) if incoming == title => at,
+            other => {
+                self.incoming = other;
+                began
+            }
+        };
+        self.history.push(Played {
+            title: title.clone(),
+            began_ms,
+            started_ms: ended,
+        });
+        self.on_air = Some(title);
     }
 
     /// True after a [`MixCommand::Shutdown`] was received.
@@ -557,6 +649,15 @@ impl AudioSource for PriorityMixer {
                 + self.scratch_o[i] as f64 * self.gain) as f32;
         }
         self.step_gain(out_len);
+        self.clock_origin_ms.get_or_insert_with(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the clock is past 1970")
+                .as_millis() as u64
+        });
+        let began = self.mixed_at_ms(self.frames_mixed);
+        self.frames_mixed += (out_len / self.target_spec.channels.count()) as u64;
+        self.record_history(began, self.mixed_at_ms(self.frames_mixed));
         out_len
     }
 
@@ -577,6 +678,10 @@ impl AudioSource for PriorityMixer {
         } else {
             self.main.label()
         }
+    }
+
+    fn next_label(&self) -> Option<String> {
+        self.main.next_label()
     }
 
     fn replaygain_db(&self) -> Option<f32> {
@@ -1089,6 +1194,105 @@ mod tests {
         status.set_current("a track");
         assert_eq!(status.current(), "a track");
         assert!(status.uptime_seconds() < 1000);
+    }
+
+    #[test]
+    fn history_times_a_track_from_the_start_of_the_crossfade_into_it_through_a_wrapper() {
+        // A lasts 1 s; with a 0.2 s crossfade B mixes in from 0.8 s and is on air at 1 s.
+        let provider = Box::new(FakeProvider::new(vec![(1.0, 100), (2.0, 1000)]));
+        let cfg = mixer_config(0.2);
+        let cross = CrossfadeMixer::new(provider, &cfg, RATE as u32, CHANS);
+        let wrapped = crate::source::replaygain::ReplayGainSource::new(Box::new(cross), 0.0, 0.0);
+        let spec = symphonia::core::audio::SignalSpec::new(
+            RATE as u32,
+            symphonia::core::audio::Channels::FRONT_LEFT
+                | symphonia::core::audio::Channels::FRONT_RIGHT,
+        );
+        let (_tx, rx) = mpsc::channel();
+        let history = History::default();
+        let mut pm = PriorityMixer::new(Box::new(wrapped), rx, &cfg, spec, 10)
+            .with_history(history.clone());
+        let mut buf = vec![0f32; 10 * CHANS];
+        for _ in 0..12 {
+            pm.next_buffer(&mut buf);
+        }
+
+        let tracks = history.tracks();
+        let origin = tracks[1].began_ms;
+        assert_eq!(tracks[0].title, "src(2)");
+        assert_eq!(tracks[0].began_ms - origin, 800);
+        assert_eq!(tracks[0].started_ms - origin, 1000);
+        assert_eq!(tracks[1].title, "src(1)");
+    }
+
+    #[test]
+    fn history_leaves_jingles_out() {
+        let main = Box::new(FakeSource {
+            value: 1.0,
+            total_frames: 100_000,
+            pos_frames: 0,
+            fades: None,
+        });
+        let cfg = MixerConfig {
+            duck_seconds: 0.1,
+            ..mixer_config(0.2)
+        };
+        let spec = symphonia::core::audio::SignalSpec::new(
+            RATE as u32,
+            symphonia::core::audio::Channels::FRONT_LEFT
+                | symphonia::core::audio::Channels::FRONT_RIGHT,
+        );
+        let (tx, rx) = mpsc::channel();
+        let history = History::default();
+        let mut pm = PriorityMixer::new(main, rx, &cfg, spec, 10).with_history(history.clone());
+        let jingle = std::env::temp_dir().join("crabsoup-history-jingle.wav");
+        std::fs::write(&jingle, crate::analysis::fixtures::wav16_mono(&[1000; 300], RATE as u32))
+            .unwrap();
+        tx.send(MixCommand::PlayJingle(jingle)).unwrap();
+        let mut buf = vec![0f32; 10 * CHANS];
+        for _ in 0..40 {
+            pm.next_buffer(&mut buf);
+        }
+
+        let titles: Vec<String> = history.tracks().into_iter().map(|t| t.title).collect();
+        assert_eq!(titles, ["src(1)"]);
+    }
+
+    #[test]
+    fn history_records_a_live_dj_once_they_are_on_air() {
+        let main = Box::new(FakeSource {
+            value: 1.0,
+            total_frames: 100_000,
+            pos_frames: 0,
+            fades: None,
+        });
+        let cfg = MixerConfig {
+            duck_seconds: 0.1,
+            ..mixer_config(0.2)
+        };
+        let spec = symphonia::core::audio::SignalSpec::new(
+            RATE as u32,
+            symphonia::core::audio::Channels::FRONT_LEFT
+                | symphonia::core::audio::Channels::FRONT_RIGHT,
+        );
+        let (tx, rx) = mpsc::channel();
+        let history = History::default();
+        let mut pm = PriorityMixer::new(main, rx, &cfg, spec, 10).with_history(history.clone());
+        let mut buf = vec![0f32; 10 * CHANS];
+        pm.next_buffer(&mut buf);
+        let dj = FakeSource {
+            value: 3.0,
+            total_frames: 100_000,
+            pos_frames: 0,
+            fades: None,
+        };
+        tx.send(MixCommand::SetLive(Box::new(dj))).unwrap();
+        for _ in 0..3 {
+            pm.next_buffer(&mut buf);
+        }
+
+        let titles: Vec<String> = history.tracks().into_iter().map(|t| t.title).collect();
+        assert_eq!(titles, ["src(3)", "src(1)"]);
     }
 
     #[test]
