@@ -126,6 +126,11 @@ live and fades back in on disconnect. MP3/Vorbis/AAC uploads decode via
 symphonia; Opus takes the native decode path. The value composes as a marker
 in `fallback`.
 
+Title updates from the DJ's source client (BUTT, Mixxx, ices) arrive as
+Icecast's `GET /admin/metadata?mode=updinfo&mount=...&song=...`, with the same
+passwords; the song becomes the live source's title on air and in `status`
+(`LIVE DJ` until the first update, and again at each new connection).
+
 `extra_passwords` (optional) adds per-streamer accounts: any password in
 the list authenticates on the shared mount alongside `password`, so each DJ
 can have their own credentials. The on-air state is visible on the [control

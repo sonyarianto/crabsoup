@@ -567,7 +567,7 @@ impl AudioSource for PriorityMixer {
     fn label(&self) -> Option<String> {
         let override_live = self.gain > 0.5 && self.live.is_some();
         if override_live {
-            Some("LIVE DJ".into())
+            self.live.as_ref().and_then(|live| live.label())
         } else if let Some(j) = self.jingle.as_ref() {
             if self.gain > 0.5 {
                 j.label()
@@ -796,6 +796,7 @@ mod tests {
         assert!((buf[0] - 1.0).abs() < 1e-6);
         pm.next_buffer(&mut buf);
         assert!((buf[0] - 3.0).abs() < 1e-6);
+        assert_eq!(pm.label().as_deref(), Some("src(3)"));
 
         // DJ disconnects: the buffer after ClearLive still mixes at gain 1.0
         // (pre-step), then the gain drops to 0 and the playlist returns.

@@ -1,5 +1,5 @@
 use std::io::{Read, Seek, SeekFrom};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
@@ -40,6 +40,7 @@ pub struct Harbor {
     target: SignalSpec,
     tx: mpsc::Sender<MixCommand>,
     occupied: Arc<AtomicBool>,
+    title: Arc<Mutex<Option<String>>>,
 }
 
 impl Harbor {
@@ -55,6 +56,7 @@ impl Harbor {
             target,
             tx,
             occupied,
+            title: Arc::default(),
         }
     }
 
@@ -85,8 +87,11 @@ impl Harbor {
             let target = self.target;
             let tx = self.tx.clone();
             let occupied = self.occupied.clone();
+            let title = self.title.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(socket, config, target, tx, occupied).await {
+                if let Err(e) =
+                    handle_connection(socket, config, target, tx, occupied, title).await
+                {
                     log::warn!("live harbor ({peer}): {e}");
                 }
             });
@@ -101,6 +106,7 @@ async fn handle_connection(
     target: SignalSpec,
     tx: mpsc::Sender<MixCommand>,
     occupied: Arc<AtomicBool>,
+    title: Arc<Mutex<Option<String>>>,
 ) -> Result<(), String> {
     let mut socket = socket;
     socket.set_nodelay(true).map_err(|e| e.to_string())?;
@@ -137,6 +143,15 @@ async fn handle_connection(
         return Ok(());
     }
 
+    // Source clients (BUTT, Mixxx, ices) send the title on a separate request, as to Icecast.
+    if let Some(song) = request.song {
+        *title.lock().unwrap() = Some(song).filter(|song| !song.is_empty());
+        return socket
+            .write_all(METADATA_OK_RESPONSE)
+            .await
+            .map_err(|e| format!("sending response: {e}"));
+    }
+
     // Only one DJ at a time.
     if occupied.swap(true, Ordering::SeqCst) {
         respond(&mut socket, 403, "Forbidden").await?;
@@ -144,6 +159,7 @@ async fn handle_connection(
     }
 
     log::info!("live harbor: DJ connected to {}", config.mount);
+    *title.lock().unwrap() = None;
 
     // A bounded upload (`curl -T file`, Content-Length present) must not see
     // the final 200 before its body: curl aborts the rest of the transfer the
@@ -179,7 +195,7 @@ async fn handle_connection(
     // mixer's LiveSource lock-free; the consumer enforces the window.
     let (prod, cons) = HeapRb::<f32>::new(2 * MAX_LIVE_FRAMES).split();
     let exhausted = Arc::new(AtomicBool::new(false));
-    let live = Box::new(LiveSource::new(cons, exhausted.clone(), MAX_LIVE_FRAMES));
+    let live = Box::new(LiveSource::new(cons, exhausted.clone(), MAX_LIVE_FRAMES, title));
     let _ = tx.send(MixCommand::SetLive(live));
 
     thread::spawn(move || {
@@ -547,6 +563,8 @@ struct SourceRequest {
     /// `Transfer-Encoding: chunked` — the body must be de-chunked before
     /// decoding (ffmpeg's `-method PUT` uses this).
     chunked: bool,
+    /// Set for a title update (`GET /admin/metadata?mode=updinfo&mount=...&song=...`).
+    song: Option<String>,
 }
 
 fn parse_source_request(header: &[u8]) -> Result<SourceRequest, u16> {
@@ -554,12 +572,23 @@ fn parse_source_request(header: &[u8]) -> Result<SourceRequest, u16> {
     let mut lines = text.lines();
     let request_line = lines.next().ok_or(400u16)?;
     let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or("").to_string();
-    if !method.eq_ignore_ascii_case("PUT") {
+    let method = parts.next().unwrap_or("");
+    let target = parts.next().unwrap_or("");
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let param = |name: &str| {
+        let mut pairs = query.split('&').filter_map(|pair| pair.split_once('='));
+        pairs.find(|(key, _)| *key == name).map(|(_, value)| percent_decode(value))
+    };
+    let (path, song) = if method.eq_ignore_ascii_case("PUT") {
+        (path.to_string(), None)
+    } else if method.eq_ignore_ascii_case("GET")
+        && path == "/admin/metadata"
+        && param("mode").as_deref() == Some("updinfo")
+    {
+        (param("mount").unwrap_or_default(), Some(param("song").unwrap_or_default()))
+    } else {
         return Err(405);
-    }
-    let target = parts.next().unwrap_or("").to_string();
-    let path = target.split('?').next().unwrap_or("").to_string();
+    };
 
     let mut authorization = None;
     let mut content_type = None;
@@ -585,7 +614,29 @@ fn parse_source_request(header: &[u8]) -> Result<SourceRequest, u16> {
         content_type,
         content_length,
         chunked,
+        song,
     })
+}
+
+/// Query-string decoding: `+` is a space, `%XX` a byte; the bytes are read as UTF-8.
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = text.get(i + 1..i + 3).filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()));
+        let hex = hex.and_then(|h| u8::from_str_radix(h, 16).ok());
+        match (bytes[i], hex) {
+            (b'+', _) => out.push(b' '),
+            (b'%', Some(byte)) => {
+                out.push(byte);
+                i += 2;
+            }
+            (byte, _) => out.push(byte),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Decode `Basic <base64>` credentials and check the password part.
@@ -619,6 +670,9 @@ fn hint_for_content_type(content_type: Option<&str>) -> Hint {
     }
     hint
 }
+
+// Icecast's own reply to a title update; some source clients read the `<return>`.
+const METADATA_OK_RESPONSE: &[u8] = b"HTTP/1.0 200 OK\r\nServer: Crabsoup Harbor\r\nContent-Type: text/xml\r\nContent-Length: 113\r\n\r\n<?xml version=\"1.0\"?>\n<iceresponse><message>Metadata update successful</message><return>1</return></iceresponse>\n";
 
 const OK_RESPONSE: &[u8] =
     b"HTTP/1.0 200 OK\r\nServer: Crabsoup Harbor\r\nContent-Length: 0\r\n\r\n";
@@ -687,6 +741,20 @@ mod tests {
             b"PUT /live HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Type: audio/mpeg\r\n\r\n";
         let req = parse_source_request(header).unwrap();
         assert!(req.chunked);
+    }
+
+    #[test]
+    fn parses_a_title_update_from_a_source_client() {
+        let header = b"GET /admin/metadata?mode=updinfo&mount=%2Flive&song=Louie+Vega+-+Caf%C3%A9%20%26%20Co HTTP/1.0\r\nAuthorization: Basic c291cmNlOnNlY3JldA==\r\n\r\n";
+        let req = parse_source_request(header).unwrap();
+        assert_eq!(req.path, "/live");
+        assert_eq!(req.song.as_deref(), Some("Louie Vega - Café & Co"));
+        assert_eq!(req.authorization.as_deref(), Some("Basic c291cmNlOnNlY3JldA=="));
+    }
+
+    #[test]
+    fn a_percent_sign_not_followed_by_two_hex_digits_stays_as_is() {
+        assert_eq!(percent_decode("50%+5%-1"), "50% 5%-1");
     }
 
     #[test]

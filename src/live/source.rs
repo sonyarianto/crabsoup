@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ringbuf::{HeapCons, HeapProd, traits::*};
@@ -17,14 +17,21 @@ pub struct LiveSource {
     exhausted: Arc<AtomicBool>,
     /// Max samples played before the oldest are dropped (live latency cap).
     max_samples: usize,
+    title: Arc<Mutex<Option<String>>>,
 }
 
 impl LiveSource {
-    pub fn new(consumer: HeapCons<f32>, exhausted: Arc<AtomicBool>, max_samples: usize) -> Self {
+    pub fn new(
+        consumer: HeapCons<f32>,
+        exhausted: Arc<AtomicBool>,
+        max_samples: usize,
+        title: Arc<Mutex<Option<String>>>,
+    ) -> Self {
         Self {
             consumer,
             exhausted,
             max_samples,
+            title,
         }
     }
 }
@@ -49,7 +56,7 @@ impl AudioSource for LiveSource {
     }
 
     fn label(&self) -> Option<String> {
-        Some("LIVE DJ".into())
+        Some(self.title.lock().unwrap().clone().unwrap_or_else(|| "LIVE DJ".into()))
     }
 }
 
@@ -96,10 +103,20 @@ mod tests {
     use ringbuf::HeapRb;
 
     #[test]
+    fn is_labelled_with_the_djs_title_once_they_send_one() {
+        let (_prod, cons) = HeapRb::<f32>::new(8).split();
+        let title = Arc::new(Mutex::new(None));
+        let src = LiveSource::new(cons, Arc::new(AtomicBool::new(false)), 4, title.clone());
+        assert_eq!(src.label().as_deref(), Some("LIVE DJ"));
+        *title.lock().unwrap() = Some("Blaze - Lovelee Dae".into());
+        assert_eq!(src.label().as_deref(), Some("Blaze - Lovelee Dae"));
+    }
+
+    #[test]
     fn returns_frames_then_silence_then_exhausted() {
         let (prod, cons) = HeapRb::<f32>::new(200).split();
         let ex = Arc::new(AtomicBool::new(false));
-        let mut src = LiveSource::new(cons, ex.clone(), 100);
+        let mut src = LiveSource::new(cons, ex.clone(), 100, Arc::default());
         let mut sink = LiveSink::new(prod);
         sink.push_samples(&[1.0, 2.0, 3.0]);
 
@@ -120,7 +137,7 @@ mod tests {
         // dropping (the old non-blocking sink would silently lose it).
         let (prod, cons) = HeapRb::<f32>::new(2 * 16).split();
         let sink = LiveSink::new(prod);
-        let mut src = LiveSource::new(cons, Arc::new(AtomicBool::new(false)), 16);
+        let mut src = LiveSource::new(cons, Arc::new(AtomicBool::new(false)), 16, Arc::default());
         let total = 10_000usize;
         let producer = std::thread::spawn(move || {
             let mut sink = sink;
@@ -147,7 +164,7 @@ mod tests {
         let (prod, cons) = HeapRb::<f32>::new(200).split();
         let ex = Arc::new(AtomicBool::new(false));
         let mut sink = LiveSink::new(prod);
-        let mut src = LiveSource::new(cons, ex.clone(), 4);
+        let mut src = LiveSource::new(cons, ex.clone(), 4, Arc::default());
         sink.push_samples(&[1.0, 2.0, 3.0]);
         sink.push_samples(&[4.0, 5.0, 6.0]);
 

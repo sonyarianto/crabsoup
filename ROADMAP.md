@@ -1446,6 +1446,13 @@ API reference + 5 tutorials; ≥100 stars and ≥20 contributors; green CI +
 load tests + fuzzing.
 
 ## Done (cont.)
+- [x] Harbor title updates: `input.harbor` answers source clients'
+      `GET /admin/metadata?mode=updinfo` (mount + Basic auth checked like the
+      `PUT`, Icecast's XML reply) and the live source reports the DJ's song as
+      its label instead of `LIVE DJ`, so outputs and `status` follow the set.
+      The title resets when a new DJ connects. Tests: updinfo parsing with
+      percent-decoding, the live label before/after an update, the priority
+      mixer forwarding the live label. Deployed in production (Deeper Vibes).
 - [x] J3 (WebSocket control channel): `server.telnet({ws_port = N})` serves
       the same command surface as telnet/HTTP over WebSocket (RFC 6455) on
       the same host. Hand-rolled framing (`ControlWsServer` in
