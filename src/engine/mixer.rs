@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use symphonia::core::audio::SignalSpec;
 
 use crate::config::MixerConfig;
+use crate::output::file::Recording;
 use crate::source::file::FileSource;
 use crate::source::{AudioSource, SilenceSource, SourceProvider};
 
@@ -336,6 +337,8 @@ pub struct StatusHandle {
     /// True while a live DJ holds the harbor (the playlist is ducked).
     /// Shared with the harbor, which toggles it on connect/disconnect.
     harbor_connected: Arc<AtomicBool>,
+    /// What `record.*` drives, by `output.icecast` mount.
+    recordings: Vec<(String, Recording)>,
 }
 
 impl StatusHandle {
@@ -344,7 +347,17 @@ impl StatusHandle {
             started: std::time::Instant::now(),
             current: Arc::new(Mutex::new(String::new())),
             harbor_connected: Arc::new(AtomicBool::new(false)),
+            recordings: Vec::new(),
         }
+    }
+
+    pub fn with_recording(mut self, mount: &str, recording: Recording) -> Self {
+        self.recordings.push((mount.to_string(), recording));
+        self
+    }
+
+    pub fn recording(&self, mount: &str) -> Option<&Recording> {
+        self.recordings.iter().find(|(m, _)| m == mount).map(|(_, r)| r)
     }
 
     /// The flag the harbor writes to; hand a clone to the harbor.

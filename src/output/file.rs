@@ -6,12 +6,13 @@
 
 use std::fs::File;
 use std::io::Write;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::{Arc, Mutex};
 
 use crate::Result;
-use crate::config::FileOutputConfig;
+use crate::config::{FileOutputConfig, OutputFormat};
 use crate::engine::tap::{AudioFrame, recv_frame_or_shutdown};
 use crate::output::encoder::{Encoder, create_encoder};
 
@@ -98,6 +99,99 @@ impl FileOutput {
     }
 }
 
+/// A copy of an `output.icecast` mount's encoded stream to a file, started and stopped from the
+/// control port: the audio is encoded once, for the broadcast. A writer thread does the file IO,
+/// so a slow disk cannot hold up the broadcast.
+#[derive(Clone)]
+pub struct Recording {
+    format: OutputFormat,
+    tx: SyncSender<Chunk>,
+    path: Arc<Mutex<Option<PathBuf>>>,
+}
+
+enum Chunk {
+    Start(File),
+    Bytes(Vec<u8>),
+    Stop(SyncSender<()>),
+}
+
+/// About ten seconds of a 256 kbps stream in 1024-frame buffers: room for a disk that stalls.
+const RECORDING_QUEUE: usize = 512;
+
+impl Recording {
+    /// `format` is that of the output whose stream is copied.
+    pub fn new(format: OutputFormat) -> Self {
+        let (tx, rx) = sync_channel(RECORDING_QUEUE);
+        let path = Arc::new(Mutex::new(None));
+        let writer_path = path.clone();
+        std::thread::spawn(move || write_chunks(rx, writer_path));
+        Self { format, tx, path }
+    }
+
+    /// Start copying the stream to `path`, truncating it.
+    pub fn start(&self, path: &Path) -> Result<()> {
+        // An Ogg stream's headers come once, at its start: a copy from the middle does not play.
+        if self.format == OutputFormat::Opus {
+            return Err("an Ogg/Opus stream cannot be recorded from its middle".into());
+        }
+        if let Some(current) = self.path() {
+            return Err(format!("already recording to {}", current.display()).into());
+        }
+        let file =
+            File::create(path).map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+        self.tx.send(Chunk::Start(file)).map_err(|_| "the recording writer stopped")?;
+        log::info!("recording to {}", path.display());
+        *self.path.lock().unwrap() = Some(path.to_path_buf());
+        Ok(())
+    }
+
+    /// Close the file once everything copied so far is written.
+    pub fn stop(&self) -> Result<()> {
+        let path = self.path.lock().unwrap().take().ok_or("not recording")?;
+        let (ack, written) = sync_channel(1);
+        self.tx.send(Chunk::Stop(ack)).map_err(|_| "the recording writer stopped")?;
+        written.recv().map_err(|_| "the recording writer stopped")?;
+        log::info!("recording closed: {}", path.display());
+        Ok(())
+    }
+
+    pub fn path(&self) -> Option<PathBuf> {
+        self.path.lock().unwrap().clone()
+    }
+
+    /// Called by the recorded output with each piece of its encoded stream.
+    pub fn write(&self, bytes: &[u8]) {
+        if bytes.is_empty() || self.path.lock().unwrap().is_none() {
+            return;
+        }
+        if self.tx.try_send(Chunk::Bytes(bytes.to_vec())).is_err() {
+            log::warn!("recording: the disk is behind, {} bytes left out", bytes.len());
+        }
+    }
+}
+
+/// Runs until every clone of its [`Recording`] is dropped; a failed write ends the recording.
+fn write_chunks(rx: Receiver<Chunk>, path: Arc<Mutex<Option<PathBuf>>>) {
+    let mut file = None;
+    for chunk in rx {
+        match chunk {
+            Chunk::Start(new) => file = Some(new),
+            Chunk::Bytes(bytes) => {
+                if let Some(open) = file.as_mut()
+                    && let Err(e) = open.write_all(&bytes)
+                {
+                    log::error!("recording to {:?} stopped: {e}", path.lock().unwrap().take());
+                    file = None;
+                }
+            }
+            Chunk::Stop(ack) => {
+                file = None;
+                let _ = ack.send(());
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,6 +265,32 @@ mod tests {
             "decoded audio must not be silence"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_recording_holds_only_the_stream_copied_between_start_and_stop() {
+        let path = std::env::temp_dir().join("crabsoup-recording.aac");
+        let recording = Recording::new(OutputFormat::Aac);
+
+        recording.write(b"before ");
+        recording.start(&path).expect("recording starts");
+        recording.write(b"during ");
+        recording.write(b"the set");
+        recording.stop().expect("recording stops");
+        recording.write(b" after");
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"during the set");
+        assert_eq!(recording.path(), None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_ogg_opus_stream_cannot_be_recorded_from_its_middle() {
+        let recording = Recording::new(OutputFormat::Opus);
+
+        let started = recording.start(&std::env::temp_dir().join("crabsoup-recording.ogg"));
+
+        assert!(started.is_err());
     }
 
     #[test]

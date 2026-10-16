@@ -9,7 +9,7 @@ use clap::{CommandFactory, Parser};
 use crabsoup::engine::mixer::{MixCommand, PriorityMixer, StatusHandle};
 use crabsoup::engine::tap::{AudioFrame, EngineTap, interruptible_sleep, recv_frame_or_shutdown};
 use crabsoup::live::harbor::Harbor;
-use crabsoup::output::file::FileOutput;
+use crabsoup::output::file::{FileOutput, Recording};
 #[cfg(feature = "aac")]
 use crabsoup::output::hls::HlsOutput;
 use crabsoup::output::icecast::IcecastOutput;
@@ -98,7 +98,14 @@ fn main() -> crabsoup::Result<()> {
 
     // Shared status for the telnet `status`/`uptime` commands; the consuming
     // loops keep the current label fresh.
-    let status = StatusHandle::new();
+    let mut status = StatusHandle::new();
+    for out in &broadcast {
+        if status.recording(&out.mount).is_some() {
+            log::warn!("{}: only the first output on this mount can be recorded", out.mount);
+        } else {
+            status = status.with_recording(&out.mount, Recording::new(out.format));
+        }
+    }
     let shutdown = Arc::new(AtomicBool::new(false));
 
     // Background tokio runtime: live harbor listener + Ctrl-C handler.
@@ -172,7 +179,9 @@ fn main() -> crabsoup::Result<()> {
     // One consuming thread per output; each keeps its own reconnect loop so
     // one stalled mount cannot affect the pull rate or the other outputs.
     let mut handles = Vec::new();
-    for out_cfg in &broadcast {
+    for (i, out_cfg) in broadcast.iter().enumerate() {
+        let first_on_mount = broadcast[..i].iter().all(|o| o.mount != out_cfg.mount);
+        let recording = status.recording(&out_cfg.mount).filter(|_| first_on_mount).cloned();
         let out_rx = tap.register();
         let out_shutdown = shutdown.clone();
         let out_status = status.clone();
@@ -183,6 +192,9 @@ fn main() -> crabsoup::Result<()> {
             let mut output = IcecastOutput::new(cfg, out_rx, rate, channels);
             output.set_shutdown(out_shutdown.clone());
             output.set_status(out_status);
+            if let Some(recording) = recording {
+                output.set_recording(recording);
+            }
             // Initial connection: retry until we reach the server, but stop
             // if the operator hits Ctrl-C while we wait.
             loop {

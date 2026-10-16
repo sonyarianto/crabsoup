@@ -22,6 +22,9 @@ printf 'shutdown\n' | nc localhost 1234
 | `queue.push <uri>` | Push a request (path or `http(s)://` URL) onto the request queue |
 | `skip` | Skip the current track |
 | `status` | Current track + uptime |
+| `record.start <mount> <path>` | Copy that `output.icecast` mount's encoded stream, as sent, to `path` (MP3/AAC; not Ogg/Opus) |
+| `record.stop <mount>` | End that mount's recording once the file is complete |
+| `record.status <mount>` | The file that mount is recording to, if any |
 | `uptime` | Engine uptime |
 | `shutdown` | Graceful shutdown |
 | `exit` | Disconnect |
@@ -50,6 +53,7 @@ message the plain-text protocol prints). Notable fields:
 | `json queue.list` | `{"ok":true,"queue":["...", ...]}` |
 | `json jingles.list` | `{"ok":true,"jingles":["...", ...]}` |
 | `json queue.push <uri>` | `{"ok":true,"queued":"...","length":N}` |
+| `json record.start <mount> <path>` / `json record.status <mount>` | `{"ok":true,"recording":"<path>"}`, `null` when not recording |
 | `json skip` / `json shutdown` | `{"ok":true,"message":"..."}` |
 | `json <custom command>` | `{"ok":true,"reply":"..."}` |
 | any error | `{"ok":false,"error":"..."}` |

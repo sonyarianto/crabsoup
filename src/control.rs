@@ -9,6 +9,9 @@
 //! - `jingles.play <substr>`   — play the jingle whose name contains `substr`
 //! - `skip`                    — skip the current track
 //! - `status`                  — current track + uptime
+//! - `record.start <mount> <path>` — copy that `output.icecast` mount's stream, as sent, to `path`
+//! - `record.stop <mount>`     — end its recording once the file is complete
+//! - `record.status <mount>`   — the file it is recording to, if any
 //! - `uptime`                  — seconds since startup
 //! - `shutdown`                — stop the app (like Ctrl-C)
 //! - `exit` / `quit`           — close the connection
@@ -840,6 +843,8 @@ enum CommandReply {
     },
     /// `jingles.play ...`: the chosen jingle path.
     Playing(String),
+    /// `record.*`: the file being recorded, if any.
+    Recording(Option<String>),
 }
 
 impl CommandReply {
@@ -868,6 +873,8 @@ impl CommandReply {
                 }
             }
             CommandReply::Playing(path) => format!("playing {path}"),
+            CommandReply::Recording(Some(path)) => format!("recording to {path}"),
+            CommandReply::Recording(None) => "not recording".into(),
         }
     }
 
@@ -912,6 +919,9 @@ impl CommandReply {
             }
             CommandReply::Playing(path) => {
                 serde_json::json!({ "ok": true, "playing": path }).to_string()
+            }
+            CommandReply::Recording(path) => {
+                serde_json::json!({ "ok": true, "recording": path }).to_string()
             }
         }
     }
@@ -988,6 +998,27 @@ fn dispatch(cmd: &str, ctx: &DispatchCtx, rng: &mut SmallRng) -> CommandResult {
             harbor_connected: ctx.status.harbor_connected(),
         }),
         "uptime" => CommandResult::Reply(CommandReply::Uptime(ctx.status.uptime_seconds())),
+        "record.start" | "record.stop" | "record.status" => {
+            let args = cmd.trim()[verb.len()..].trim();
+            let (mount, path) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+            let Some(recording) = ctx.status.recording(mount) else {
+                return CommandResult::Reply(CommandReply::Err(format!(
+                    "ERROR: {verb} needs the mount of an output.icecast"
+                )));
+            };
+            let reply = match (verb, Some(path.trim()).filter(|p| !p.is_empty())) {
+                ("record.start", Some(path)) => {
+                    recording.start(Path::new(path)).map(|()| recording.path())
+                }
+                ("record.start", None) => Err("usage: record.start <mount> <path>".into()),
+                ("record.stop", _) => recording.stop().map(|()| None),
+                _ => Ok(recording.path()),
+            };
+            CommandResult::Reply(match reply {
+                Ok(path) => CommandReply::Recording(path.map(|p| p.display().to_string())),
+                Err(e) => CommandReply::Err(format!("ERROR: {e}")),
+            })
+        }
         "shutdown" => {
             log::info!("control port: shutdown requested");
             let _ = ctx.tx.send(MixCommand::Shutdown);
@@ -1052,7 +1083,7 @@ fn dispatch(cmd: &str, ctx: &DispatchCtx, rng: &mut SmallRng) -> CommandResult {
 }
 
 fn help_text() -> &'static str {
-    "commands: jingles.list | jingles.play [n|substr] | queue.push <path> | queue.list | queue.clear | queue.skip | skip | status | uptime | shutdown | <custom commands> | json <command> | exit | help"
+    "commands: jingles.list | jingles.play [n|substr] | queue.push <path> | queue.list | queue.clear | queue.skip | skip | status | record.start <mount> <path> | record.stop <mount> | record.status <mount> | uptime | shutdown | <custom commands> | json <command> | exit | help"
 }
 
 fn pick_jingle(jingles: &[PathBuf], arg: &str) -> Result<usize, String> {
@@ -1145,6 +1176,38 @@ mod tests {
             CommandResult::Exit => panic!("skip must reply"),
         }
         assert!(matches!(rx.try_recv(), Ok(MixCommand::Skip)));
+    }
+
+    #[test]
+    fn record_commands_drive_the_recording_of_the_named_mount() {
+        use crate::config::OutputFormat;
+        use crate::output::file::Recording;
+        let path = std::env::temp_dir().join("crabsoup record cmd.aac");
+        let (tx, _rx) = mpsc::channel();
+        let status = StatusHandle::new()
+            .with_recording("/radio.mp3", Recording::new(OutputFormat::Mp3))
+            .with_recording("/radio.aac", Recording::new(OutputFormat::Aac));
+        let event_tx = mpsc::channel().0;
+        let ctx = DispatchCtx {
+            jingles: &[],
+            queue: None,
+            tx: &tx,
+            status: &status,
+            custom: &[],
+            event_tx: &event_tx,
+        };
+        let reply = |cmd: &str| match dispatch(cmd, &ctx, &mut SmallRng::from_entropy()) {
+            CommandResult::Reply(r) => r.text(),
+            CommandResult::Exit => panic!("{cmd} must reply"),
+        };
+
+        reply(&format!("record.start /radio.aac {}", path.display()));
+
+        assert_eq!(reply("record.status /radio.aac"), format!("recording to {}", path.display()));
+        assert_eq!(reply("record.status /radio.mp3"), "not recording");
+        assert_eq!(reply("record.stop /radio.aac"), "not recording");
+        assert!(reply("record.status /other.mp3").starts_with("ERROR"));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -1446,6 +1446,15 @@ API reference + 5 tutorials; ≥100 stars and ≥20 contributors; green CI +
 load tests + fuzzing.
 
 ## Done (cont.)
+- [x] Runtime recording: `record.start <mount> <path>` / `record.stop <mount>` /
+      `record.status <mount>` on the control port copy an `output.icecast`
+      mount's encoded bytes, as sent, to a file (no second encoder). A
+      `Recording` per mount (`src/output/file.rs`) hands the chunks to its own
+      writer thread over a bounded queue, so a slow disk drops chunks with a
+      warning instead of stalling the broadcast. Ogg/Opus mounts are refused
+      (their headers only come at the stream start). Tests: only the bytes
+      between start and stop land in the file, Opus is refused, the commands
+      drive the named mount only.
 - [x] J3 (WebSocket control channel): `server.telnet({ws_port = N})` serves
       the same command surface as telnet/HTTP over WebSocket (RFC 6455) on
       the same host. Hand-rolled framing (`ControlWsServer` in

@@ -8,6 +8,7 @@ use crate::config::{AacProfile, OutputConfig, OutputFormat, OutputProtocol};
 use crate::engine::mixer::StatusHandle;
 use crate::engine::tap::{AudioFrame, interruptible_sleep, recv_frame_or_shutdown};
 use crate::output::encoder::{Encoder, create_encoder};
+use crate::output::file::Recording;
 #[cfg(feature = "aac")]
 use crate::output::encoder::AacEncoder;
 use crate::output::icecast_client::IcecastClient;
@@ -33,6 +34,7 @@ pub struct IcecastOutput {
     last_title: String,
     shutdown: Arc<AtomicBool>,
     status: Option<StatusHandle>,
+    recording: Option<Recording>,
 }
 
 impl IcecastOutput {
@@ -52,6 +54,7 @@ impl IcecastOutput {
             last_title: String::new(),
             shutdown: Arc::new(AtomicBool::new(false)),
             status: None,
+            recording: None,
         }
     }
 
@@ -64,6 +67,11 @@ impl IcecastOutput {
     /// Expose the current track title to the control port via [`StatusHandle`].
     pub fn set_status(&mut self, status: StatusHandle) {
         self.status = Some(status);
+    }
+
+    /// Copy the encoded stream into `recording` while it records.
+    pub fn set_recording(&mut self, recording: Recording) {
+        self.recording = Some(recording);
     }
 
     pub fn reconnect_seconds(&self) -> u64 {
@@ -252,6 +260,9 @@ impl IcecastOutput {
                 // The encoder accumulates internally (LAME needs 1152-sample
                 // frames); nothing to send yet.
                 continue;
+            }
+            if let Some(recording) = &self.recording {
+                recording.write(&encoded);
             }
             self.send_or_reconnect(&encoded);
         }
