@@ -1,6 +1,10 @@
 # Crabsoup roadmap
 
 ## Done (verified end-to-end)
+- [x] **Click-free ducking**: `PriorityMixer` ramps the override gain per
+      sample across each buffer instead of stepping it once per buffer, so
+      a live DJ or jingle fading in/out no longer clicks on loud transients.
+      Verified live on a 24/7 station.
 - [x] **Codec feature gate — `mp3`/`aac` are now default-on opt-out**:
       plain builds still link LAME + fdk-aac, but
       `cargo build --release --no-default-features` drops the system

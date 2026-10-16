@@ -552,11 +552,16 @@ impl AudioSource for PriorityMixer {
         if n_o < out_len {
             self.scratch_o[n_o..out_len].fill(0.0);
         }
-        for (i, out) in buffer.iter_mut().take(out_len).enumerate() {
-            *out = (self.scratch_m[i] as f64 * (1.0 - self.gain)
-                + self.scratch_o[i] as f64 * self.gain) as f32;
-        }
+        // Ramp the gain across the buffer: a per-buffer step clicks on loud transients.
+        let chans = self.target_spec.channels.count();
+        let start = self.gain;
         self.step_gain(out_len);
+        let step = (self.gain - start) / (out_len / chans).max(1) as f64;
+        for (i, out) in buffer.iter_mut().take(out_len).enumerate() {
+            let gain = start + step * (i / chans) as f64;
+            *out = (self.scratch_m[i] as f64 * (1.0 - gain) + self.scratch_o[i] as f64 * gain)
+                as f32;
+        }
         out_len
     }
 
@@ -1067,17 +1072,17 @@ mod tests {
         tx.send(MixCommand::SetLive(Box::new(dj))).unwrap();
 
         let mut buf = vec![0f32; 10 * CHANS];
-        // Buffer 1: gain 0 (stepped after mixing) -> main.
+        // Buffer 1: gain ramps 0 -> 1, frame 0 is main.
         pm.next_buffer(&mut buf);
         assert!((buf[0] - 1.0).abs() < 1e-6);
-        // Buffer 2: gain 1.0; override pulls only 5 frames. Frames 5..9
-        // must be silent (main ducked, override gone) — without the guard
-        // they would repeat the override at 3.0.
+        // Buffer 2: override pulls only 5 frames and ends, so its gain ramps
+        // 1.0 -> 0.0 across the buffer. Frames 5..9 hold only main — without
+        // the guard they would repeat the override at 3.0.
         pm.next_buffer(&mut buf);
         assert!((buf[0] - 3.0).abs() < 1e-6);
-        assert!((buf[9] - 3.0).abs() < 1e-6);
-        assert!((buf[10] - 0.0).abs() < 1e-6);
-        assert!((buf[19] - 0.0).abs() < 1e-6);
+        assert!((buf[9] - (0.4 + 3.0 * 0.6)).abs() < 1e-6);
+        assert!((buf[10] - 0.5).abs() < 1e-6);
+        assert!((buf[19] - 0.9).abs() < 1e-6);
         // Buffer 3: override ended, gain falls back -> main returns.
         pm.next_buffer(&mut buf);
         assert!((buf[0] - 1.0).abs() < 1e-6);
