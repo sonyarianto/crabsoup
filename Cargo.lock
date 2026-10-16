@@ -438,6 +438,7 @@ dependencies = [
  "parking_lot",
  "rand",
  "rcgen",
+ "ring",
  "ringbuf",
  "rustfft",
  "rustls",

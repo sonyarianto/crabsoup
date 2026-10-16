@@ -38,6 +38,8 @@ ogg = "0.9"
 # client's TcpStream (ring provider — pure Rust, no system TLS deps).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "1.0"
+# SHA-256 and HMAC for signing `s3://` requests (AWS Signature Version 4): the ring rustls already builds.
+ring = "0.17"
 # Cross-platform audio device I/O (Part F2: `input.soundcard` /
 # `output.soundcard`). Optional: headless Icecast servers don't need it,
 # and on Linux cpal unconditionally pulls alsa-sys (system libasound2-dev).

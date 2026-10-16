@@ -108,8 +108,34 @@ jr = crossfade(rotate({songs, jingles_src}, {weights = {3, 1}}), {duration = 3.0
 ```
 
 Each `http(s)://` URL is downloaded to a temp file, played, and the file is
-deleted when the track ends — only the current track plus the prefetched
-next one ever touch the disk, whatever the playlist size.
+deleted when the track ends — only the current track ever touches the disk,
+whatever the playlist size. `request.dynamic` downloads a track when it
+starts; a `playlist` or `request.queue` downloads it ahead (below).
+
+## Remote requests (`http(s)://`, `s3://`)
+
+Wherever a source takes a path (`playlist` files, `single`, `queue.push`,
+`request.dynamic`), it also takes an `http://`, `https://` or
+`s3://bucket/key` URL. A `playlist` or `request.queue` starts downloading
+its next remote track in the background as soon as the current one starts,
+so the crossfade finds it on disk. Downloads a previous run left behind are
+deleted at startup.
+
+`s3://` requests are signed (AWS Signature Version 4, path-style) with
+credentials from the environment, never the script:
+
+| Variable | Default | |
+|---|---|---|
+| `S3_ACCESS_KEY_ID` / `AWS_ACCESS_KEY_ID` | required | |
+| `S3_SECRET_ACCESS_KEY` / `AWS_SECRET_ACCESS_KEY` | required | |
+| `S3_SESSION_TOKEN` / `AWS_SESSION_TOKEN` | none | temporary credentials |
+| `S3_REGION` / `AWS_REGION` | `us-east-1` | `auto` on Cloudflare R2 |
+| `S3_ENDPOINT` / `AWS_ENDPOINT` | `https://s3.<region>.amazonaws.com` | `scheme://host[:port]`, e.g. R2, B2, MinIO |
+
+```lua
+shows = playlist({files = {"s3://station-archive/shows/monday.mp3",
+                           "s3://station-archive/shows/tuesday.mp3"}})
+```
 
 ## `input.harbor({...})`
 

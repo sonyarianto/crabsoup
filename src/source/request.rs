@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use symphonia::core::audio::SignalSpec;
 
-use crate::request::{RequestConfig, RequestUri, resolve};
+use crate::request::{RequestConfig, RequestUri, prefetch, resolve};
 use crate::source::AudioSource;
 
 /// Shared FIFO state. Methods used by the control port (`push`/`list`/
@@ -166,7 +166,11 @@ impl AudioSource for RequestQueueSource {
             let Some(uri) = self.queue.pop() else {
                 return 0;
             };
-            match resolve(&uri, &self.request, self.target, self.frames_per_buffer) {
+            let resolved = resolve(&uri, &self.request, self.target, self.frames_per_buffer);
+            if let Some(next) = self.queue.peek() {
+                prefetch(&next, &self.request);
+            }
+            match resolved {
                 Ok(src) => {
                     self.current = Some(src);
                     self.current_uri = Some(uri.clone());

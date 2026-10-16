@@ -1,6 +1,12 @@
 # Crabsoup roadmap
 
 ## Done (verified end-to-end)
+- [x] **`s3://` requests, background prefetch of the next remote track**:
+      `s3://bucket/key` resolves like `http(s)://` through a presigned
+      path-style `GET` (SigV4 over `ring`, checked against Bun's
+      `S3Client.presign`), credentials from `S3_*`/`AWS_*`. `playlist` and
+      `request.queue` download their next remote track on a background thread,
+      off the audio path. Deployed in production (prefetch only; not `s3://`).
 - [x] **Codec feature gate — `mp3`/`aac` are now default-on opt-out**:
       plain builds still link LAME + fdk-aac, but
       `cargo build --release --no-default-features` drops the system

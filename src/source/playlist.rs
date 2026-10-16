@@ -3,13 +3,14 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use symphonia::core::audio::SignalSpec;
 
-use crate::request::{RequestConfig, RequestUri, resolve};
+use crate::request::{RequestConfig, RequestUri, prefetch, resolve};
 use crate::source::{AudioSource, SilenceSource, SourceProvider};
 
-/// A scheduled queue of media requests (local files or `http://` URLs).
+/// A scheduled queue of media requests (local files or remote URLs).
 /// Exposes each item as its own source via [`SourceProvider`], so the mixer
 /// can preload the *next* track for a crossfade while the current one still
-/// plays (a URL download happens inside that preload, on the puller thread).
+/// plays. A remote next track is downloaded in the background as soon as the
+/// current one starts, so that preload finds it on disk.
 #[derive(Clone)]
 pub struct Playlist {
     queue: Vec<RequestUri>,
@@ -95,7 +96,11 @@ impl SourceProvider for Playlist {
         };
 
         let label = uri.display();
-        match resolve(&uri, &self.request, self.target, self.frames_per_buffer) {
+        let resolved = resolve(&uri, &self.request, self.target, self.frames_per_buffer);
+        if let Some(next) = self.queue.get(self.next_index) {
+            prefetch(next, &self.request);
+        }
+        match resolved {
             Ok(source) => {
                 info!("loading track: {} ({})", uri.display(), label);
                 (source, label)

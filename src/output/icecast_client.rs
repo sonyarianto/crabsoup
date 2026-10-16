@@ -374,7 +374,7 @@ fn read_response_head(
 
 /// RFC 3986 percent-encoding (unreserved chars pass through, everything else
 /// becomes uppercase `%XX`).
-fn percent_encode(input: &[u8]) -> String {
+pub(crate) fn percent_encode(input: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(input.len());
     for &b in input {

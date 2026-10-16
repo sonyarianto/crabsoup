@@ -285,5 +285,5 @@ src = crossfade(rotate({songs, jingles}, {weights = {3, 1}}),
 playlist returns a plain sequential source with no preload and no fade —
 the non-crossfading sibling of the default crossfading playlist.
 
-`http://` / `https://` requests are download-then-play with retry/timeout;
+`http://` / `https://` / `s3://` requests are download-then-play with retry/timeout;
 temp files are auto-removed. HTTPS uses rustls (redirects may cross scheme).

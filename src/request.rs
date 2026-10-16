@@ -1,6 +1,8 @@
-//! URI resolution for media requests: local paths play directly, `http://`
-//! and `https://` URLs are downloaded to a temp file first
+//! URI resolution for media requests: local paths play directly, `http://`,
+//! `https://` and `s3://bucket/key` URLs are downloaded to a temp file first
 //! (download-then-play, per the Phase 7 roadmap — no streaming decode yet).
+//! A playlist [`prefetch`]es its next remote track while the current one
+//! plays, so the mixer finds it on disk when the crossfade starts.
 //!
 //! The HTTP client is a minimal protocol-level `GET`: status line + headers,
 //! `Content-Length` or chunked bodies (or connection-close delimited), and
@@ -9,16 +11,19 @@
 //! byte stream through the same parsing — a wrap-the-transport change, not a
 //! rewrite of the HTTP logic.
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use log::warn;
 
+use crate::output::icecast_client::percent_encode;
 use crate::source::cue_cut::CueCutSource;
 
 /// Download settings, configurable through `set("request_timeout", ...)` /
@@ -98,7 +103,8 @@ pub enum RequestUri {
 impl RequestUri {
     pub fn new(uri: &str) -> Self {
         let (bare, cues) = parse_annotate(uri);
-        if bare.starts_with("http://") || bare.starts_with("https://") {
+        if bare.starts_with("http://") || bare.starts_with("https://") || bare.starts_with("s3://")
+        {
             Self::Url(bare.to_string(), cues)
         } else {
             Self::Local(bare.into(), cues)
@@ -480,8 +486,14 @@ pub fn resolve(
             Ok(apply_cues(src, cues.clone(), target))
         }
         RequestUri::Url(url, cues) => {
-            let tmp = temp_path(url);
-            download(url, &tmp, config, None)?;
+            let tmp = match take_prefetched(url) {
+                Some(tmp) => tmp,
+                None => {
+                    let tmp = temp_path(url);
+                    download(url, &tmp, config, None)?;
+                    tmp
+                }
+            };
             let src = open_audio(&tmp, target, frames_per_buffer)?;
             let src = Box::new(DownloadSource::new(src, tmp, uri.display()));
             Ok(apply_cues(src, cues.clone(), target))
@@ -518,6 +530,71 @@ pub fn open_audio(
     }
 }
 
+/// How many remote requests may be downloaded ahead at once: the next track,
+/// and one a queue change made stale before it played.
+const PREFETCHED_MAX: usize = 2;
+
+/// A remote request being downloaded ahead of its turn.
+struct Prefetch {
+    url: String,
+    file: PathBuf,
+    download: std::thread::JoinHandle<Result<(), String>>,
+}
+
+static PREFETCHED: Mutex<VecDeque<Prefetch>> = Mutex::new(VecDeque::new());
+
+const DOWNLOADS_DIR: &str = "crabsoup-requests";
+
+/// Starts downloading a remote request in the background, unless it already
+/// is; a local file needs nothing. The mixer asks for its next track only
+/// seconds before the crossfade, on the audio thread: a download that starts
+/// there holds the stream for as long as it takes.
+pub fn prefetch(uri: &RequestUri, config: &RequestConfig) {
+    let RequestUri::Url(url, _) = uri else {
+        return;
+    };
+    let mut slots = PREFETCHED.lock().unwrap();
+    if slots.iter().any(|slot| slot.url == *url) {
+        return;
+    }
+    if slots.len() >= PREFETCHED_MAX {
+        let stale = slots.pop_front().unwrap();
+        std::thread::spawn(move || {
+            let _ = stale.download.join();
+            let _ = std::fs::remove_file(stale.file);
+        });
+    }
+    let file = temp_path(url);
+    let (from, to, config) = (url.clone(), file.clone(), *config);
+    let download =
+        std::thread::spawn(move || download(&from, &to, &config, None).map_err(|e| e.to_string()));
+    slots.push_back(Prefetch {
+        url: url.clone(),
+        file,
+        download,
+    });
+}
+
+/// A prefetched request's file, waiting for its download to end; `None` when
+/// it was not prefetched or its download failed.
+fn take_prefetched(url: &str) -> Option<PathBuf> {
+    let mut slots = PREFETCHED.lock().unwrap();
+    let at = slots.iter().position(|slot| slot.url == url)?;
+    let slot = slots.remove(at)?;
+    drop(slots);
+    if let Ok(Ok(())) = slot.download.join() {
+        return Some(slot.file);
+    }
+    let _ = std::fs::remove_file(slot.file);
+    None
+}
+
+/// Removes the downloads a previous run left behind: prefetched tracks it
+/// never played are whole episodes.
+pub fn clear_downloads() {
+    let _ = std::fs::remove_dir_all(std::env::temp_dir().join(DOWNLOADS_DIR));
+}
+
 /// FNV-1a hash for a stable temp filename.
 fn hash_url(url: &str) -> u64 {
     let mut h = 0xcbf29ce484222325u64;
@@ -535,7 +612,7 @@ fn temp_path(url: &str) -> PathBuf {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     std::env::temp_dir()
-        .join("crabsoup-requests")
+        .join(DOWNLOADS_DIR)
         .join(format!("{:016x}-{n}.part", hash_url(url)))
 }
 
@@ -553,7 +630,14 @@ fn download(
     }
     let mut last_err: Option<String> = None;
     for attempt in 0..=config.retries {
-        match http_get(url, dest, config.timeout(), tls_roots.as_ref()) {
+        // Signed at each attempt: a retry after the backoff must not carry an expired signature.
+        let fetched = match url.strip_prefix("s3://") {
+            Some(object) => S3Credentials::from_env()
+                .and_then(|credentials| presign_s3(&credentials, object, &amz_now()))
+                .and_then(|signed| http_get(&signed, dest, config.timeout(), tls_roots.as_ref())),
+            None => http_get(url, dest, config.timeout(), tls_roots.as_ref()),
+        };
+        match fetched {
             Ok(()) => return Ok(()),
             Err(e) => {
                 last_err = Some(e.to_string());
@@ -642,6 +726,16 @@ impl HttpUrl {
             path: path.to_string(),
             addrs,
         })
+    }
+
+    /// The `Host` header: the port only when it is not the scheme's default,
+    /// as signed S3 requests expect.
+    fn authority(&self) -> String {
+        if self.port == self.scheme.default_port() {
+            self.host.clone()
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
     }
 
     /// Join a (possibly relative) `Location` header against this URL,
@@ -783,7 +877,8 @@ fn http_get(
         write!(
             stream,
             "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: crabsoup/0.1\r\nConnection: close\r\nAccept: */*\r\n\r\n",
-            target.path, target.host
+            target.path,
+            target.authority()
         )?;
         stream.flush()?;
 
@@ -846,6 +941,115 @@ fn http_get(
         return Ok(());
     }
     Err("too many redirects".into())
+}
+
+/// How long a signed `s3://` download URL stays valid: one attempt.
+const S3_URL_SECONDS: u64 = 900;
+
+/// Credentials for `s3://bucket/key` requests, from the environment under the
+/// names Bun's S3 client reads (`S3_*`, else `AWS_*`), so the station and
+/// crabsoup share one `.env`; never from the script, which is committed.
+struct S3Credentials {
+    access_key_id: String,
+    secret_access_key: String,
+    session_token: Option<String>,
+    region: String,
+    /// `scheme://host[:port]`, without a trailing slash.
+    endpoint: String,
+}
+
+fn s3_env(name: &str) -> Option<String> {
+    std::env::var(format!("S3_{name}"))
+        .or_else(|_| std::env::var(format!("AWS_{name}")))
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
+impl S3Credentials {
+    fn from_env() -> crate::Result<Self> {
+        let missing = |name: &str| {
+            format!("s3:// requests need S3_{name} (or AWS_{name}) in the environment")
+        };
+        // R2 takes us-east-1 as an alias of its own "auto" region.
+        let region = s3_env("REGION").unwrap_or_else(|| "us-east-1".into());
+        Ok(Self {
+            access_key_id: s3_env("ACCESS_KEY_ID").ok_or_else(|| missing("ACCESS_KEY_ID"))?,
+            secret_access_key: s3_env("SECRET_ACCESS_KEY")
+                .ok_or_else(|| missing("SECRET_ACCESS_KEY"))?,
+            session_token: s3_env("SESSION_TOKEN"),
+            endpoint: s3_env("ENDPOINT")
+                .unwrap_or_else(|| format!("https://s3.{region}.amazonaws.com"))
+                .trim_end_matches('/')
+                .to_string(),
+            region,
+        })
+    }
+}
+
+/// The current time as SigV4 writes it, `YYYYMMDDTHHMMSSZ`.
+fn amz_now() -> String {
+    chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string()
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn hmac(key: &[u8], data: &str) -> Vec<u8> {
+    ring::hmac::sign(
+        &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key),
+        data.as_bytes(),
+    )
+    .as_ref()
+    .to_vec()
+}
+
+/// A presigned `GET` URL (AWS Signature Version 4, query string) for
+/// `bucket/key`, path-style — `{endpoint}/{bucket}/{key}` — which S3, R2, B2
+/// and MinIO all serve. `amz_date` is the signing time, `YYYYMMDDTHHMMSSZ`.
+fn presign_s3(credentials: &S3Credentials, object: &str, amz_date: &str) -> crate::Result<String> {
+    let (bucket, key) = object
+        .split_once('/')
+        .filter(|(bucket, key)| !bucket.is_empty() && !key.is_empty())
+        .ok_or_else(|| format!("not an s3://bucket/key URL: s3://{object}"))?;
+    let (_, host) = credentials
+        .endpoint
+        .split_once("://")
+        .ok_or_else(|| format!("bad S3 endpoint: {}", credentials.endpoint))?;
+    let key: Vec<String> = key.split('/').map(|part| percent_encode(part.as_bytes())).collect();
+    let path = format!("/{}/{}", percent_encode(bucket.as_bytes()), key.join("/"));
+    let date = &amz_date[..8];
+    let scope = format!("{date}/{}/s3/aws4_request", credentials.region);
+    let mut query = vec![
+        ("X-Amz-Algorithm", "AWS4-HMAC-SHA256".to_string()),
+        (
+            "X-Amz-Credential",
+            format!("{}/{scope}", credentials.access_key_id),
+        ),
+        ("X-Amz-Date", amz_date.to_string()),
+        ("X-Amz-Expires", S3_URL_SECONDS.to_string()),
+        ("X-Amz-SignedHeaders", "host".to_string()),
+    ];
+    if let Some(token) = &credentials.session_token {
+        query.push(("X-Amz-Security-Token", token.clone()));
+    }
+    query.sort();
+    let query = query
+        .iter()
+        .map(|(name, value)| format!("{name}={}", percent_encode(value.as_bytes())))
+        .collect::<Vec<_>>()
+        .join("&");
+    let canonical_request = format!("GET\n{path}\n{query}\nhost:{host}\n\nhost\nUNSIGNED-PAYLOAD");
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+        hex(ring::digest::digest(&ring::digest::SHA256, canonical_request.as_bytes()).as_ref())
+    );
+    let mut key = format!("AWS4{}", credentials.secret_access_key).into_bytes();
+    for part in [date, credentials.region.as_str(), "s3", "aws4_request"] {
+        key = hmac(&key, part);
+    }
+    let signature = hex(&hmac(&key, &string_to_sign));
+    Ok(format!("{}{path}?{query}&X-Amz-Signature={signature}", credentials.endpoint))
 }
 
 /// One-shot `GET` returning the response body as a UTF-8 string (the Lua
@@ -1872,5 +2076,167 @@ title: None,
         };
         let _ = std::fs::remove_file(&dest);
         assert!(!err.to_string().is_empty());
+    }
+
+    /// The prefetched downloads are one process-wide list: tests that fill it take turns.
+    static PREFETCH_TESTS: Mutex<()> = Mutex::new(());
+
+    fn credentials(endpoint: &str, region: &str) -> S3Credentials {
+        S3Credentials {
+            access_key_id: "AKIDEXAMPLE".into(),
+            secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".into(),
+            session_token: None,
+            region: region.into(),
+            endpoint: endpoint.into(),
+        }
+    }
+
+    fn signature(url: &str) -> &str {
+        url.split("X-Amz-Signature=").nth(1).expect("signed")
+    }
+
+    // Expected URLs from Bun's S3Client.presign with the same credentials and time: a second implementation.
+    #[test]
+    fn an_s3_url_is_signed_as_bun_signs_it() {
+        let signed = presign_s3(
+            &credentials("https://abc123.r2.cloudflarestorage.com", "auto"),
+            "deeper-vibes/Masters At Work - When You Touch Me (G P 's Dub #1).mp3",
+            "20261016T004056Z",
+        )
+        .expect("signed");
+        assert!(signed.starts_with(
+            "https://abc123.r2.cloudflarestorage.com/deeper-vibes/Masters%20At%20Work%20-%20When%20You%20Touch%20Me%20%28G%20P%20%27s%20Dub%20%231%29.mp3?"
+        ));
+        assert_eq!(
+            signature(&signed),
+            "ef1b4ff10e2cc2106d3248360614ac964a9052dcf91254edbbd28cf6c00099c9"
+        );
+    }
+
+    #[test]
+    fn an_s3_endpoint_port_and_non_ascii_key_are_signed_as_bun_signs_them() {
+        let signed = presign_s3(
+            &credentials("http://localhost:9000", "us-east-1"),
+            "deeper-vibes/shows/7f0c/Kerri Chandler - Bar A Thym (2026-10-16, live) & más.aac",
+            "20261016T004056Z",
+        )
+        .expect("signed");
+        assert!(signed.starts_with(
+            "http://localhost:9000/deeper-vibes/shows/7f0c/Kerri%20Chandler%20-%20Bar%20A%20Thym%20%282026-10-16%2C%20live%29%20%26%20m%C3%A1s.aac?"
+        ));
+        assert_eq!(
+            signature(&signed),
+            "74760363b7db548ce64b1efbb41fcfa64d7bac6a1f50cfa4aaf425072a997895"
+        );
+    }
+
+    /// Serve `body` to every GET and count them. Returns the URL and the count.
+    fn serve_counted(body: &'static [u8]) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = hits.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                drain_request(&mut stream);
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = stream.write_all(
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).as_bytes(),
+                );
+                let _ = stream.write_all(body);
+            }
+        });
+        (format!("http://{addr}/episode.mp3"), hits)
+    }
+
+    #[test]
+    fn a_prefetched_request_is_downloaded_once_and_handed_over_from_disk() {
+        let _turn = PREFETCH_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let (url, hits) = serve_counted(b"set");
+        let uri = RequestUri::new(&url);
+        prefetch(&uri, &RequestConfig::default());
+        prefetch(&uri, &RequestConfig::default());
+
+        let file = take_prefetched(&url).expect("downloaded");
+
+        assert_eq!(std::fs::read(&file).expect("on disk"), b"set");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(take_prefetched(&url).is_none());
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn a_failed_prefetch_leaves_the_download_to_resolve() {
+        let _turn = PREFETCH_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let url = serve(
+            "404 Not Found",
+            vec![("Content-Length".into(), "0".into())],
+            b"",
+        );
+        let config = RequestConfig {
+            timeout_secs: 5,
+            retries: 0,
+        };
+        prefetch(&RequestUri::new(&url), &config);
+
+        assert!(take_prefetched(&url).is_none());
+    }
+
+    #[test]
+    fn a_playlist_downloads_its_next_remote_track_when_the_current_one_starts() {
+        let _turn = PREFETCH_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        // Playlist::new sorts its tracks, and the servers' ports decide that order.
+        let (mut a, mut b) = (serve_counted(b"not audio"), serve_counted(b"next"));
+        if b.0 < a.0 {
+            std::mem::swap(&mut a, &mut b);
+        }
+        let ((first, _), (second, hits)) = (a, b);
+        let target = symphonia::core::audio::SignalSpec::new(
+            44100,
+            symphonia::core::audio::Channels::FRONT_LEFT
+                | symphonia::core::audio::Channels::FRONT_RIGHT,
+        );
+        let mut playlist = crate::source::playlist::Playlist::new(
+            vec![RequestUri::new(&first), RequestUri::new(&second)],
+            false,
+            false,
+            RequestConfig::default(),
+            target,
+            1024,
+            None,
+        );
+
+        crate::source::SourceProvider::next_source(&mut playlist);
+
+        let file = take_prefetched(&second).expect("downloaded");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let _ = std::fs::remove_file(file);
+    }
+
+    fn eventually(condition: impl Fn() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !condition() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        condition()
+    }
+
+    #[test]
+    fn a_prefetch_pushed_out_by_newer_ones_is_deleted() {
+        let _turn = PREFETCH_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let urls: Vec<String> = (0..3).map(|_| serve_counted(b"track").0).collect();
+        prefetch(&RequestUri::new(&urls[0]), &RequestConfig::default());
+        let stale = PREFETCHED.lock().unwrap()[0].file.clone();
+        assert!(eventually(|| stale.exists()));
+
+        prefetch(&RequestUri::new(&urls[1]), &RequestConfig::default());
+        prefetch(&RequestUri::new(&urls[2]), &RequestConfig::default());
+
+        assert!(eventually(|| !stale.exists()));
+        assert!(take_prefetched(&urls[0]).is_none());
+        for url in &urls[1..] {
+            let _ = std::fs::remove_file(take_prefetched(url).expect("downloaded"));
+        }
     }
 }

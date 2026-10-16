@@ -68,6 +68,8 @@ fn main() -> crabsoup::Result<()> {
         print_result(&result, cli.preview);
         return Ok(());
     }
+    // Not on --check: a check runs beside the playing process and would delete its downloads.
+    crabsoup::request::clear_downloads();
 
     let spec = result.stream.signal_spec();
     let chans = spec.channels.count();
