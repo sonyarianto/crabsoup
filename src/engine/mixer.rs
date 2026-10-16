@@ -53,6 +53,13 @@ pub struct CrossfadeMixer {
     fade_pos: usize,
     tail: Option<Tail>,
     started: bool,
+    /// A skip is fading the active track out: promote `next` once the fade completes.
+    skipping: bool,
+    /// One-pole low-pass coefficient of the bass-swap crossover; 0 = off.
+    bass_coef: f64,
+    /// Two cascaded low-pass states per channel, outgoing then incoming track.
+    bass_state_a: Vec<[f64; 2]>,
+    bass_state_b: Vec<[f64; 2]>,
     /// Reusable scratch buffers, sized on demand so `next_buffer` never
     /// allocates on the hot path.
     scratch_a: Vec<f32>,
@@ -79,6 +86,8 @@ impl CrossfadeMixer {
             curve_table: (0..=CURVE_TABLE_SIZE)
                 .map(|k| {
                     let t = k as f64 / CURVE_TABLE_SIZE as f64;
+                    let s_curve = 0.5 - 0.5 * (std::f64::consts::PI * t).cos();
+                    let t = t + config.fade_scurve * (s_curve - t);
                     t.powf(config.fade_curve) as f32
                 })
                 .collect(),
@@ -86,6 +95,11 @@ impl CrossfadeMixer {
             fade_pos: 0,
             tail: None,
             started: false,
+            skipping: false,
+            bass_coef: 1.0
+                - (-2.0 * std::f64::consts::PI * config.bass_swap_hz / sample_rate as f64).exp(),
+            bass_state_a: vec![[0.0; 2]; channels],
+            bass_state_b: vec![[0.0; 2]; channels],
             scratch_a: Vec::new(),
             scratch_b: Vec::new(),
         }
@@ -140,6 +154,8 @@ impl CrossfadeMixer {
             self.next_label = Some(label);
             self.fade_pos = 0;
             self.tail = None;
+            self.bass_state_a.fill([0.0; 2]);
+            self.bass_state_b.fill([0.0; 2]);
         }
     }
 
@@ -239,13 +255,24 @@ impl AudioSource for CrossfadeMixer {
                     let t = ((self.fade_pos + f) as f64 / cf).clamp(0.0, 1.0) as f32;
                     let gain_b = self.curve_gain(t);
                     let gain_a = self.curve_gain(1.0 - t);
-                    *out = (self.scratch_a[i] as f64 * gain_a as f64
-                        + self.scratch_b[i] as f64 * gain_b as f64)
-                        as f32;
+                    let (mut a, mut b) = (self.scratch_a[i] as f64, self.scratch_b[i] as f64);
+                    if self.bass_coef > 0.0 {
+                        // The lows hand over around mid-fade so the two kicks never stack.
+                        let handover = ((t as f64 - 0.45) / 0.1).clamp(0.0, 1.0);
+                        let ch = i % chans;
+                        let low_a = low_pass(&mut self.bass_state_a[ch], a, self.bass_coef);
+                        let low_b = low_pass(&mut self.bass_state_b[ch], b, self.bass_coef);
+                        a -= low_a * handover;
+                        b -= low_b * (1.0 - handover);
+                    }
+                    *out = (a * gain_a as f64 + b * gain_b as f64) as f32;
                 }
                 self.fade_pos += frames_out;
 
-                if self.active.is_exhausted() {
+                if self.active.is_exhausted()
+                    || (self.skipping && self.fade_pos >= self.fade_frames)
+                {
+                    self.skipping = false;
                     let promoted = self.next.take().expect("next must exist");
                     self.active = promoted;
                     self.active_label = self.next_label.take().unwrap_or_default();
@@ -294,27 +321,24 @@ impl AudioSource for CrossfadeMixer {
         self.active.crossfade_overrides()
     }
 
-    /// Advance to the next track immediately, abandoning the current one.
-    /// Used by the telnet `skip` command.
+    /// Crossfade into the next track now (telnet `skip`) over the usual window.
     fn skip(&mut self) {
         self.ensure_started();
-        if self.next.is_some() {
-            let promoted = self.next.take().expect("next must exist");
-            self.active = promoted;
-            self.active_label = self.next_label.take().unwrap_or_default();
-        } else if self.provider.has_next() {
-            let (src, label) = self.provider.next_source();
-            log::info!("crossfade: skip to {label}");
-            self.active = src;
-            self.active_label = label;
-        } else {
+        self.preload_next();
+        if self.next.is_none() {
             log::info!("crossfade: skip ignored, nothing next");
             return;
         }
-        self.fade_pos = 0;
-        self.tail = None;
-        log::info!("crossfade: skipped to {}", self.active_label);
+        self.skipping = true;
+        log::info!("crossfade: skipping, fading into the next track");
     }
+}
+
+/// Two cascaded one-pole low-pass stages (12 dB/oct) for the bass-swap crossover.
+fn low_pass(state: &mut [f64; 2], x: f64, coef: f64) -> f64 {
+    state[0] += coef * (x - state[0]);
+    state[1] += coef * (state[0] - state[1]);
+    state[1]
 }
 
 /// Commands sent to the [`PriorityMixer`] from the live harbor / jingle trigger.
@@ -393,6 +417,13 @@ pub struct PriorityMixer {
     falling: bool,
     override_started: bool,
     duck_step_per_frame: f64,
+    duck_level: f64,
+    duck_threshold: f64,
+    duck_ratio: f64,
+    /// Peak envelope of the jingle that keys the music compression.
+    duck_envelope: f64,
+    duck_attack: f64,
+    duck_release: f64,
     target_spec: SignalSpec,
     frames_per_buffer: usize,
     shutdown: bool,
@@ -420,6 +451,12 @@ impl PriorityMixer {
             falling: false,
             override_started: false,
             duck_step_per_frame: 1.0 / (config.duck_seconds * target_spec.rate as f64).max(1.0),
+            duck_level: config.duck_level,
+            duck_threshold: config.duck_threshold,
+            duck_ratio: config.duck_ratio,
+            duck_envelope: 0.0,
+            duck_attack: (-1.0 / (0.030 * target_spec.rate as f64)).exp(),
+            duck_release: (-1.0 / (0.300 * target_spec.rate as f64)).exp(),
             target_spec,
             frames_per_buffer,
             shutdown: false,
@@ -552,11 +589,41 @@ impl AudioSource for PriorityMixer {
         if n_o < out_len {
             self.scratch_o[n_o..out_len].fill(0.0);
         }
-        for (i, out) in buffer.iter_mut().take(out_len).enumerate() {
-            *out = (self.scratch_m[i] as f64 * (1.0 - self.gain)
-                + self.scratch_o[i] as f64 * self.gain) as f32;
-        }
+        // Ramp the gain across the buffer: a per-buffer step clicks on loud transients.
+        let chans = self.target_spec.channels.count();
+        let start = self.gain;
         self.step_gain(out_len);
+        let step = (self.gain - start) / (out_len / chans).max(1) as f64;
+        let floor = if self.live.is_some() {
+            0.0
+        } else {
+            self.duck_level
+        };
+        let keyed = self.jingle.is_some() && self.duck_ratio > 1.0;
+        let mut music = 1.0;
+        for (i, out) in buffer.iter_mut().take(out_len).enumerate() {
+            let gain = start + step * (i / chans) as f64;
+            if i % chans == 0 {
+                music = 1.0 - gain * (1.0 - floor);
+                if keyed {
+                    let peak = self.scratch_o[i..(i + chans).min(out_len)]
+                        .iter()
+                        .fold(0.0f64, |m, s| m.max(s.abs() as f64));
+                    let coef = if peak > self.duck_envelope {
+                        self.duck_attack
+                    } else {
+                        self.duck_release
+                    };
+                    self.duck_envelope = peak + (self.duck_envelope - peak) * coef;
+                    let over =
+                        20.0 * (self.duck_envelope * gain).max(1e-9).log10() - self.duck_threshold;
+                    if over > 0.0 {
+                        music *= 10f64.powf(-over * (1.0 - 1.0 / self.duck_ratio) / 20.0);
+                    }
+                }
+            }
+            *out = (self.scratch_m[i] as f64 * music + self.scratch_o[i] as f64 * gain) as f32;
+        }
         out_len
     }
 
@@ -683,8 +750,8 @@ mod tests {
     fn mixer_config(crossfade: f64) -> MixerConfig {
         MixerConfig {
             crossfade_seconds: crossfade,
-            fade_curve: 1.0,
             duck_seconds: 1.0,
+            ..Default::default()
         }
     }
 
@@ -807,7 +874,7 @@ mod tests {
     }
 
     #[test]
-    fn skip_advances_to_the_next_track() {
+    fn skip_crossfades_into_the_next_track() {
         let provider = Box::new(FakeProvider::new(vec![(1.0, 1000), (2.0, 1000)]));
         let cfg = mixer_config(0.2);
         let mut mix = CrossfadeMixer::new(provider, &cfg, RATE as u32, CHANS);
@@ -816,6 +883,9 @@ mod tests {
         assert!((buf[0] - 1.0).abs() < 1e-6);
 
         mix.skip();
+        mix.next_buffer(&mut buf);
+        assert!((buf[9 * CHANS] - 1.45).abs() < 1e-6);
+        mix.next_buffer(&mut buf);
         mix.next_buffer(&mut buf);
         assert!((buf[0] - 2.0).abs() < 1e-6);
         assert_eq!(mix.label().as_deref(), Some("src(2)"));
@@ -830,6 +900,101 @@ mod tests {
         let mut buf = vec![0f32; 10 * CHANS];
         assert_eq!(mix.next_buffer(&mut buf), 20);
         assert!((buf[0] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn s_curve_crossfade_starts_and_ends_softly_and_crosses_at_half() {
+        let provider = Box::new(FakeProvider::new(vec![(1.0, 1000), (0.0, 1000)]));
+        let cfg = MixerConfig {
+            fade_scurve: 1.0,
+            ..mixer_config(1.0)
+        };
+        let mut mix = CrossfadeMixer::new(provider, &cfg, RATE as u32, CHANS);
+        let mut buf = vec![0f32; 10 * CHANS];
+        let mut outgoing = Vec::new();
+        for _ in 0..100 {
+            mix.next_buffer(&mut buf);
+            outgoing.push(buf[0]);
+        }
+        // Buffers 91, 95 and 99 start at fade frames 10, 50 and 90 of 100.
+        assert!((outgoing[91] - 0.976).abs() < 0.01, "{}", outgoing[91]);
+        assert!((outgoing[95] - 0.5).abs() < 0.01, "{}", outgoing[95]);
+        assert!((outgoing[99] - 0.024).abs() < 0.01, "{}", outgoing[99]);
+    }
+
+    #[test]
+    fn bass_swap_keeps_the_incoming_lows_out_until_mid_fade() {
+        // A constant is all lows to the crossover: before the handover only the
+        // outgoing track sounds, after it only the incoming one.
+        let provider = Box::new(FakeProvider::new(vec![(1.0, 1000), (2.0, 1000)]));
+        let cfg = MixerConfig {
+            bass_swap_hz: 10.0,
+            ..mixer_config(1.0)
+        };
+        let mut mix = CrossfadeMixer::new(provider, &cfg, RATE as u32, CHANS);
+        let mut buf = vec![0f32; 10 * CHANS];
+        let mut fade = Vec::new();
+        for _ in 0..100 {
+            mix.next_buffer(&mut buf);
+            fade.push(buf[9 * CHANS]);
+        }
+        // t = 0.39: outgoing at 0.61, incoming lows held back.
+        assert!((fade[93] - 0.61).abs() < 0.05, "{}", fade[93]);
+        // t = 0.89: incoming at 0.89 x 2.0, outgoing lows gone.
+        assert!((fade[98] - 1.78).abs() < 0.05, "{}", fade[98]);
+    }
+
+    /// Plays a 3 s jingle whose every sample is `value` over music at 1.0 and
+    /// returns a mixed buffer once the duck has settled.
+    fn mix_under_jingle(cfg: MixerConfig, name: &str, value: i16) -> Vec<f32> {
+        let jingle = std::env::temp_dir().join(format!("crabsoup-{name}-jingle.wav"));
+        let wav = crate::analysis::fixtures::wav16_mono(&[value; 300], RATE as u32);
+        std::fs::write(&jingle, wav).unwrap();
+        let main = Box::new(FakeSource {
+            value: 1.0,
+            total_frames: 100_000,
+            pos_frames: 0,
+            fades: None,
+        });
+        let spec = symphonia::core::audio::SignalSpec::new(
+            RATE as u32,
+            symphonia::core::audio::Channels::FRONT_LEFT
+                | symphonia::core::audio::Channels::FRONT_RIGHT,
+        );
+        let (tx, rx) = mpsc::channel();
+        let mut pm = PriorityMixer::new(main, rx, &cfg, spec, 10);
+        tx.send(MixCommand::PlayJingle(jingle)).unwrap();
+        let mut buf = vec![0f32; 10 * CHANS];
+        for _ in 0..5 {
+            pm.next_buffer(&mut buf);
+        }
+        buf
+    }
+
+    #[test]
+    fn music_under_a_jingle_keeps_duck_level() {
+        let cfg = MixerConfig {
+            duck_seconds: 0.1,
+            duck_level: 0.25,
+            ..mixer_config(0.2)
+        };
+        let buf = mix_under_jingle(cfg, "silent", 0);
+        assert!((buf[0] - 0.25).abs() < 1e-6, "{}", buf[0]);
+    }
+
+    #[test]
+    fn a_loud_jingle_compresses_the_music_under_it() {
+        // Jingle at 0.5 (-6 dBFS): 18 dB over the -24 dB threshold at 2:1 -> music down 9 dB.
+        let cfg = MixerConfig {
+            duck_seconds: 0.1,
+            duck_level: 1.0,
+            duck_threshold: -24.0,
+            duck_ratio: 2.0,
+            ..mixer_config(0.2)
+        };
+        let buf = mix_under_jingle(cfg, "loud", 16384);
+        let music = buf[0] as f64 - 0.5;
+        assert!((music - 10f64.powf(-9.0 / 20.0)).abs() < 0.01, "{music}");
     }
 
     #[test]
@@ -849,7 +1014,9 @@ mod tests {
         assert!((buf[0] - 1.0).abs() < 1e-6);
 
         tx.send(MixCommand::Skip).unwrap();
-        pm.next_buffer(&mut buf);
+        for _ in 0..3 {
+            pm.next_buffer(&mut buf);
+        }
         assert!((buf[0] - 2.0).abs() < 1e-6);
     }
 
@@ -1067,17 +1234,17 @@ mod tests {
         tx.send(MixCommand::SetLive(Box::new(dj))).unwrap();
 
         let mut buf = vec![0f32; 10 * CHANS];
-        // Buffer 1: gain 0 (stepped after mixing) -> main.
+        // Buffer 1: gain ramps 0 -> 1, frame 0 is main.
         pm.next_buffer(&mut buf);
         assert!((buf[0] - 1.0).abs() < 1e-6);
-        // Buffer 2: gain 1.0; override pulls only 5 frames. Frames 5..9
-        // must be silent (main ducked, override gone) — without the guard
-        // they would repeat the override at 3.0.
+        // Buffer 2: override pulls only 5 frames and ends, so its gain ramps
+        // 1.0 -> 0.0 across the buffer. Frames 5..9 hold only main — without
+        // the guard they would repeat the override at 3.0.
         pm.next_buffer(&mut buf);
         assert!((buf[0] - 3.0).abs() < 1e-6);
-        assert!((buf[9] - 3.0).abs() < 1e-6);
-        assert!((buf[10] - 0.0).abs() < 1e-6);
-        assert!((buf[19] - 0.0).abs() < 1e-6);
+        assert!((buf[9] - (0.4 + 3.0 * 0.6)).abs() < 1e-6);
+        assert!((buf[10] - 0.5).abs() < 1e-6);
+        assert!((buf[19] - 0.9).abs() < 1e-6);
         // Buffer 3: override ended, gain falls back -> main returns.
         pm.next_buffer(&mut buf);
         assert!((buf[0] - 1.0).abs() < 1e-6);

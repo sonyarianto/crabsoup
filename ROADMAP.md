@@ -1,6 +1,18 @@
 # Crabsoup roadmap
 
 ## Done (verified end-to-end)
+- [x] **Click-free ducking**: `PriorityMixer` ramps the override gain per
+      sample across each buffer instead of stepping it once per buffer, so
+      a live DJ or jingle fading in/out no longer clicks on loud transients.
+      Verified live on a 24/7 station.
+- [x] **Mixer options**: `set("fade_scurve", s)` (0..1) raised-cosine crossfade
+      shape, `set("bass_swap", hz)` hands the lows over mid-crossfade (two
+      one-pole low-passes per track), `set("duck_level", g)` keeps the music
+      under a jingle, `set("duck_threshold", db)` / `set("duck_ratio", r)`
+      compress it further while the jingle is loud (peak envelope, 30 ms
+      attack / 300 ms release). Control `skip` now crossfades into the next
+      track instead of cutting. Verified live on a 24/7 station (the five
+      options); skip fade deployed in production.
 - [x] **Codec feature gate — `mp3`/`aac` are now default-on opt-out**:
       plain builds still link LAME + fdk-aac, but
       `cargo build --release --no-default-features` drops the system

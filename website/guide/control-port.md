@@ -20,7 +20,7 @@ printf 'shutdown\n' | nc localhost 1234
 | `jingles.list` | Index + path per line |
 | `jingles.play [n\|substr]` | Play a random, indexed, or substring-matched jingle |
 | `queue.push <uri>` | Push a request (path or `http(s)://` URL) onto the request queue |
-| `skip` | Skip the current track |
+| `skip` | Crossfade into the next track now |
 | `status` | Current track + uptime |
 | `uptime` | Engine uptime |
 | `shutdown` | Graceful shutdown |

@@ -48,8 +48,18 @@ pub struct MixerConfig {
     pub crossfade_seconds: f64,
     /// Gain curve exponent; 1.0 = linear, 2.0 = equal-ish power.
     pub fade_curve: f64,
+    /// Blend (0..1) toward a raised-cosine S-curve (soft start and end) before the exponent.
+    pub fade_scurve: f64,
     /// Duration (seconds) of the fast fade into/out of a live DJ.
     pub duck_seconds: f64,
+    /// Linear gain the music keeps under a jingle (0.0 = fully ducked).
+    pub duck_level: f64,
+    /// Jingle level (dBFS) above which the music under it is compressed further.
+    pub duck_threshold: f64,
+    /// Ratio of that jingle-keyed compression; 1.0 disables it.
+    pub duck_ratio: f64,
+    /// Crossover (Hz) of the crossfade bass swap: the incoming lows enter mid-fade. 0 disables it.
+    pub bass_swap_hz: f64,
 }
 
 impl Default for MixerConfig {
@@ -57,7 +67,12 @@ impl Default for MixerConfig {
         Self {
             crossfade_seconds: 3.0,
             fade_curve: 1.0,
+            fade_scurve: 0.0,
             duck_seconds: 1.5,
+            duck_level: 0.0,
+            duck_threshold: -24.0,
+            duck_ratio: 1.0,
+            bass_swap_hz: 0.0,
         }
     }
 }

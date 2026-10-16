@@ -51,7 +51,12 @@ over `duck_seconds`; a live DJ always wins over a jingle.
 | `frames_per_buffer` | 4096 | Pull buffer size (~93 ms at 44.1 kHz) |
 | `crossfade_seconds` | 3.0 | Track-to-track overlap window |
 | `fade_curve` | 1.0 | 1.0 linear, 2.0 equal-ish power |
+| `fade_scurve` | 0 | 0..1 blends the crossfade toward an S-curve (soft start and end) before `fade_curve`; 1 = full S-curve |
+| `bass_swap` | 0 | Crossover (Hz) below which the incoming track enters mid-crossfade, so kicks never stack; 0 off |
 | `duck_seconds` | 1.5 | Fade time into/out of a live DJ or jingle |
+| `duck_level` | 0.0 | Linear gain the music keeps under a jingle (a live DJ always ducks it fully) |
+| `duck_threshold` | -24 | Jingle level (dBFS) above which the music under it is compressed further |
+| `duck_ratio` | 1.0 | Ratio of that jingle-keyed compression; 1.0 off |
 | `request_timeout` | | HTTP download connect+read timeout |
 | `request_retries` | | HTTP download retries |
 
